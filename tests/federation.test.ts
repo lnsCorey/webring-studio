@@ -64,7 +64,15 @@ import {
   publicKeyFingerprint,
   type WebringHubRequester,
 } from '../electron/services/webringHubService';
-import { jobNextRunAt, nextRunAt, Scheduler } from '../electron/services/scheduler';
+import {
+  defaultPersonaSchedule,
+  defaultSchedulerConfig,
+  JobResult,
+  jobNextRunAt,
+  nextRunAt,
+  Scheduler,
+} from '../electron/services/scheduler';
+import { AutoPublisher } from '../electron/services/autoPublisher';
 import { publishTo, runScheduledPublish } from '../electron/services/jobs';
 import { isPrivateNetworkAddress } from '../electron/security/networkGuard';
 import { PersonaManager } from '../electron/services/personaManager';
@@ -2161,6 +2169,242 @@ describe('Scheduled Sync & Publish', () => {
       });
       expect(remote.status).toBe('failed');
       expect(remote.message).toMatch(/host and username/);
+    } finally {
+      manager.closeAll();
+    }
+  });
+});
+
+describe('Auto-publish after changes', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-autopublish-'));
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  const ok = (message: string): JobResult => ({ at: new Date().toISOString(), status: 'ok', message });
+
+  /** A scheduler plus an AutoPublisher whose publish is recorded (and can be held open). */
+  const setup = (options: { unpublished?: () => boolean } = {}) => {
+    const scheduler = new Scheduler({
+      configPath: path.join(tempRoot, 'scheduler.json'),
+      listPersonaIds: () => ['a', 'b'],
+      runner: {
+        sync: () => Promise.reject(new Error('unused')),
+        publish: () => Promise.reject(new Error('unused')),
+      },
+    });
+    const publishes: Array<{ personaId: string; destination: string }> = [];
+    let hold: Promise<void> | null = null;
+    const finished: JobResult[] = [];
+    const autoPublisher = new AutoPublisher({
+      scheduler,
+      listPersonaIds: () => ['a', 'b'],
+      hasUnpublishedChanges: async () => (options.unpublished ? options.unpublished() : false),
+      publish: async (personaId, destination) => {
+        publishes.push({ personaId, destination });
+        if (hold) await hold;
+        return ok(`published ${personaId}`);
+      },
+      onFinished: (_id, result) => finished.push(result),
+    });
+    return {
+      scheduler,
+      autoPublisher,
+      publishes,
+      finished,
+      holdPublishes: () => {
+        let release!: () => void;
+        hold = new Promise<void>((r) => (release = r));
+        return () => {
+          hold = null;
+          release();
+        };
+      },
+    };
+  };
+
+  it('does nothing while turned off or paused', async () => {
+    const { scheduler, autoPublisher, publishes } = setup();
+    expect(autoPublisher.noteLocalChange('a', 'post')).toBeNull();
+    scheduler.setPersonaSchedule('a', { autoPublish: { enabled: true, delaySeconds: 30 } });
+    scheduler.setAppSettings({ paused: true });
+    expect(autoPublisher.noteLocalChange('a', 'post')).toBeNull();
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(publishes).toEqual([]);
+    expect(autoPublisher.status('a').state).toBe('idle');
+  });
+
+  it('batches changes within the delay into one publish to the publish destination, without resetting the timer', async () => {
+    const { scheduler, autoPublisher, publishes, finished } = setup();
+    scheduler.setPersonaSchedule('a', {
+      publish: { destination: 'github' },
+      autoPublish: { enabled: true, delaySeconds: 30 },
+    });
+
+    const pending = autoPublisher.noteLocalChange('a', 'post');
+    expect(pending?.state).toBe('pending');
+    await vi.advanceTimersByTimeAsync(20 * 1000);
+    autoPublisher.noteLocalChange('a', 'like');
+    autoPublisher.noteLocalChange('a', 'friend');
+    expect(autoPublisher.status('a').reasons.sort()).toEqual(['friend', 'like', 'post']);
+
+    // Due 30 s after the first change, not 30 s after the last one
+    await vi.advanceTimersByTimeAsync(9 * 1000);
+    expect(publishes).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(publishes).toEqual([{ personaId: 'a', destination: 'github' }]);
+    expect(finished.map((r) => r.message)).toEqual(['Auto-publish: published a']);
+    expect(autoPublisher.status('a')).toMatchObject({ state: 'idle', reasons: [] });
+
+    // Recorded in the history without moving the scheduled publish's anchor
+    const config = scheduler.loadConfig();
+    expect(config.history[0]).toMatchObject({ personaId: 'a', job: 'publish', message: 'Auto-publish: published a' });
+    expect(config.personas.a.publish.lastRunAt).toBeUndefined();
+
+    // Other personas are untouched
+    expect(autoPublisher.status('b').state).toBe('idle');
+  });
+
+  it('runs one follow-up publish for changes made while publishing', async () => {
+    const { scheduler, autoPublisher, publishes, holdPublishes } = setup();
+    scheduler.setPersonaSchedule('a', { autoPublish: { enabled: true, delaySeconds: 30 } });
+    const release = holdPublishes();
+    autoPublisher.noteLocalChange('a', 'post');
+    await vi.advanceTimersByTimeAsync(30 * 1000);
+    expect(autoPublisher.status('a').state).toBe('running');
+
+    autoPublisher.noteLocalChange('a', 'like');
+    autoPublisher.noteLocalChange('a', 'share');
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(autoPublisher.status('a').state).toBe('pending');
+    await vi.advanceTimersByTimeAsync(30 * 1000);
+    expect(publishes).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(publishes).toHaveLength(2);
+  });
+
+  it('waits for the persona lock, so it never overlaps a manual or scheduled run', async () => {
+    const { scheduler, autoPublisher, publishes } = setup();
+    scheduler.setPersonaSchedule('a', { autoPublish: { enabled: true, delaySeconds: 30 } });
+    let releaseManual!: () => void;
+    const manual = scheduler.runExclusive('a', () => new Promise<void>((r) => (releaseManual = r)));
+    autoPublisher.noteLocalChange('a', 'post');
+    await vi.advanceTimersByTimeAsync(30 * 1000);
+    expect(publishes).toEqual([]);
+    releaseManual();
+    await manual;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(publishes).toHaveLength(1);
+  });
+
+  it('publish now, cancel, turning off, and picking up unpublished changes at start-up', async () => {
+    let unpublished = true;
+    const { scheduler, autoPublisher, publishes } = setup({ unpublished: () => unpublished });
+    scheduler.setPersonaSchedule('a', { autoPublish: { enabled: true, delaySeconds: 3600 } });
+
+    // Start-up: changes left from last time get a pending publish (only for personas with it on)
+    await autoPublisher.refresh();
+    expect(autoPublisher.status('a')).toMatchObject({ state: 'pending', reasons: ['unpublished changes'] });
+    expect(autoPublisher.status('b').state).toBe('idle');
+
+    // Publish now doesn't wait for the hour
+    const result = await autoPublisher.publishNow('a');
+    expect(result.status).toBe('ok');
+    expect(publishes).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(publishes).toHaveLength(1);
+
+    // Cancel drops the pending publish
+    autoPublisher.noteLocalChange('a', 'post');
+    autoPublisher.cancel('a');
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(publishes).toHaveLength(1);
+
+    // Turning it off cancels a pending one on refresh
+    autoPublisher.noteLocalChange('a', 'post');
+    scheduler.setPersonaSchedule('a', { autoPublish: { enabled: false } });
+    await autoPublisher.refresh(['a']);
+    expect(autoPublisher.status('a').state).toBe('idle');
+    unpublished = false;
+  });
+
+  it('loads schedule files written before auto-publish existed, and rejects unknown delays', () => {
+    const configPath = path.join(tempRoot, 'scheduler.json');
+    const old = defaultSchedulerConfig();
+    const { autoPublish: _dropped, ...legacy } = defaultPersonaSchedule();
+    fs.writeFileSync(configPath, JSON.stringify({ ...old, personas: { a: legacy } }));
+    const scheduler = new Scheduler({
+      configPath,
+      listPersonaIds: () => ['a'],
+      runner: { sync: () => Promise.reject(new Error('unused')), publish: () => Promise.reject(new Error('unused')) },
+    });
+    expect(scheduler.getPersonaSchedule('a').autoPublish).toEqual({ enabled: false, delaySeconds: 120 });
+    const updated = scheduler.setPersonaSchedule('a', {
+      autoPublish: { enabled: true, delaySeconds: 5 as unknown as 30 },
+    });
+    expect(updated.autoPublish).toEqual({ enabled: true, delaySeconds: 120 });
+    expect(updated.sync).toEqual(legacy.sync);
+  });
+
+  it('MCP: changes friends should see tell the app, and publish waits for the persona lock', async () => {
+    vi.useRealTimers();
+    const manager = new PersonaManager(path.join(tempRoot, 'studio'));
+    try {
+      const ctx = manager.getActiveContext();
+      const exportDir = path.join(tempRoot, 'export');
+      ctx.db.updateProfile({ publishSettings: { ...ctx.db.getProfile().publishSettings, exportPath: exportDir } });
+      const scheduler = new Scheduler({
+        configPath: path.join(tempRoot, 'scheduler.json'),
+        listPersonaIds: () => manager.listPersonaRecords().map((p) => p.id),
+        runner: { sync: () => Promise.reject(new Error('unused')), publish: () => Promise.reject(new Error('unused')) },
+      });
+      const mcp = new WebringMcpServer(manager, tempRoot);
+      mcp.attachScheduler(scheduler);
+      const changes: string[] = [];
+      mcp.attachAppServices({
+        publishPaths: () => ({ userDataDir: tempRoot, tempDir: tempRoot }),
+        deviceLogin: {} as GitHubDeviceLogin,
+        onLocalChange: (personaId, reason) => changes.push(`${personaId}:${reason}`),
+      });
+
+      await mcp.executeToolCall('webring_create_post', { commentary: 'Hello ring' });
+      await mcp.executeToolCall('webring_list_items', {});
+      await mcp.executeToolCall('webring_add_friend', { siteUrl: 'https://friend.ring.test', displayName: 'Friend' });
+      expect(changes).toEqual([`${ctx.persona.id}:post`, `${ctx.persona.id}:friend`]);
+
+      // Settings through MCP
+      const set = await mcp.executeToolCall('webring_set_schedule', { autoPublishEnabled: true, autoPublishDelaySeconds: 600 });
+      expect((set.data as { schedule: { autoPublish: unknown } }).schedule.autoPublish).toEqual({
+        enabled: true,
+        delaySeconds: 600,
+      });
+      expect((await mcp.executeToolCall('webring_set_schedule', { autoPublishDelaySeconds: 5 })).isError).toBe(true);
+
+      // An MCP publish queues behind work already holding the lock
+      const order: string[] = [];
+      let releaseManual!: () => void;
+      const manual = scheduler.runExclusive(ctx.persona.id, async () => {
+        await new Promise<void>((r) => (releaseManual = r));
+        order.push('manual');
+      });
+      const publish = mcp.executeToolCall('webring_publish', { destination: 'local' }).then((r) => {
+        order.push('publish');
+        return r;
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(order).toEqual([]);
+      releaseManual();
+      await manual;
+      expect((await publish).isError).toBeUndefined();
+      expect(order).toEqual(['manual', 'publish']);
     } finally {
       manager.closeAll();
     }

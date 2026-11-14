@@ -4,7 +4,13 @@ import { PersonaManager, ActivePersonaContext } from '../services/personaManager
 import { LocalPreviewServer } from '../services/localPreviewServer';
 import { cleanUpLibrary, deleteAlbumWithFiles, deletePhotoWithFiles, setProfileImageFromFile } from '../services/mediaLibrary';
 import { savePost, unsavePost } from '../services/savedPosts';
-import { jobNextRunAt, Scheduler, SchedulePreset } from '../services/scheduler';
+import {
+  AUTO_PUBLISH_DELAYS_SECONDS,
+  AutoPublishDelaySeconds,
+  jobNextRunAt,
+  Scheduler,
+  SchedulePreset,
+} from '../services/scheduler';
 import { parseProxyUrl } from '../security/proxyAgent';
 import { GitHubDeviceLogin } from '../services/githubAuth';
 import { notifyWebringHubs, publishTo, PublishPaths } from '../services/jobs';
@@ -91,6 +97,30 @@ export const MCP_SERVER_INSTRUCTIONS =
   'call webring_get_setup_status first, or use the "guided-setup" prompt to walk them through connecting GitHub, ' +
   'creating their site and publishing it.';
 
+/**
+ * Tools whose changes friends should see, and the reason shown for the pending auto-publish.
+ * An auto-publish that finds nothing changed (e.g. a declined request) is skipped.
+ */
+const LOCAL_CHANGE_TOOLS: Record<string, string> = {
+  webring_create_post: 'post',
+  webring_interact_with_url: 'interaction',
+  webring_update_item: 'post',
+  webring_delete_item: 'deleted item',
+  webring_create_album: 'album',
+  webring_add_photo: 'photo',
+  webring_delete_album: 'album',
+  webring_delete_photo: 'photo',
+  webring_add_friend: 'friend',
+  webring_update_friend: 'friend',
+  webring_set_friend_visibility: 'friend',
+  webring_delete_friend: 'friend',
+  webring_join_ring: 'webring',
+  webring_create_hosted_ring: 'webring',
+  webring_review_ring_request: 'webring',
+  webring_review_friend_notice: 'friend',
+  webring_set_ring_member: 'webring',
+};
+
 /** What only the running app can provide: publishing (keychain), GitHub sign-in and the browser. */
 export interface McpAppServices {
   publishPaths: () => PublishPaths;
@@ -101,6 +131,13 @@ export interface McpAppServices {
    * host (GitHub Pages) rarely shows a publish by the time `publishTo` makes its first attempt.
    */
   onPublished?: (personaId: string) => void;
+  /**
+   * After a change friends should see (a post, like, photo, friend or ring). The app starts or
+   * joins the persona's pending auto-publish when it's turned on.
+   */
+  onLocalChange?: (personaId: string, reason: string) => void;
+  /** Auto-publish was turned on/off or its delay changed (picks up or cancels a pending publish). */
+  onAutoPublishSettingsChanged?: (personaId: string) => void;
 }
 
 export class WebringMcpServer {
@@ -151,6 +188,23 @@ export class WebringMcpServer {
         },
       })
     );
+  }
+
+  /** Tells the app about a change friends should see, for auto-publish. Never throws. */
+  private noteChange(personaId: string, reason: string): void {
+    try {
+      this.appServices?.onLocalChange?.(personaId, reason);
+    } catch {
+      // The change is saved either way
+    }
+  }
+
+  /**
+   * Runs a sync or publish under the app scheduler's per-persona lock, so it never overlaps a
+   * scheduled run, an auto-publish or the user's own Sync / Publish.
+   */
+  private withPersonaLock<T>(personaId: string, fn: () => Promise<T>): Promise<T> {
+    return this.attachedScheduler ? this.attachedScheduler.runExclusive(personaId, fn) : fn();
   }
 
   public getActivityLog(): McpActivityLogEntry[] {
@@ -958,7 +1012,7 @@ export class WebringMcpServer {
       {
         name: 'webring_set_schedule',
         description:
-          'Set the persona’s schedules. Presets: {"kind":"interval","minutes":15|60|360|720}, {"kind":"daily","time":"HH:MM"}, {"kind":"weekly","weekday":0-6,"time":"HH:MM"}. Publish destinations: local, remote (SFTP/FTP), github. Scheduled publishes skip when nothing changed. Jobs run while Webring Studio is open or in the menu bar.',
+          'Set the persona’s schedules. Presets: {"kind":"interval","minutes":15|60|360|720}, {"kind":"daily","time":"HH:MM"}, {"kind":"weekly","weekday":0-6,"time":"HH:MM"}. Publish destinations: local, remote (SFTP/FTP), github. Scheduled publishes skip when nothing changed. Jobs run while Webring Studio is open or in the menu bar. Auto-publish syncs and publishes (to the publish destination) a set delay after a post, like, share, photo, friend or ring change; changes within the delay go out together.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -977,6 +1031,8 @@ export class WebringMcpServer {
             },
             publishDestination: { type: 'string', enum: ['local', 'remote', 'github'] },
             syncBeforePublish: { type: 'boolean' },
+            autoPublishEnabled: { type: 'boolean' },
+            autoPublishDelaySeconds: { type: 'number', enum: [...AUTO_PUBLISH_DELAYS_SECONDS] },
           },
         },
       },
@@ -1661,7 +1717,9 @@ export class WebringMcpServer {
           const localDirOverride = args.localDirOverride
             ? String(args.localDirOverride)
             : undefined;
-          const res = await ctx.ringCrawler.crawlFriendSite(siteUrl, localDirOverride);
+          const res = await this.withPersonaLock(ctx.persona.id, () =>
+            ctx.ringCrawler.crawlFriendSite(siteUrl, localDirOverride)
+          );
           resultData = res;
           summary = `Crawled ${siteUrl} (verified=${res.verifiedSignature}, items=${res.itemsIndexed})`;
           break;
@@ -1669,9 +1727,11 @@ export class WebringMcpServer {
 
         case 'webring_crawl_all_friends': {
           const ctx = this.resolveContext(args);
-          const results = await ctx.ringCrawler.crawlAllFriends();
-          // Same as the Sync button: send Webring Hub pings that were waiting for the live site
-          const webringHubs = await notifyWebringHubs(ctx);
+          const { results, webringHubs } = await this.withPersonaLock(ctx.persona.id, async () => {
+            const crawled = await ctx.ringCrawler.crawlAllFriends();
+            // Same as the Sync button: send Webring Hub pings that were waiting for the live site
+            return { results: crawled, webringHubs: await notifyWebringHubs(ctx) };
+          });
           resultData = {
             crawledCount: results.length,
             results,
@@ -1943,6 +2003,12 @@ export class WebringMcpServer {
           if (destination !== undefined && !['local', 'remote', 'github'].includes(String(destination))) {
             throw new Error('publishDestination must be local, remote or github');
           }
+          if (
+            args.autoPublishDelaySeconds !== undefined &&
+            !(AUTO_PUBLISH_DELAYS_SECONDS as readonly number[]).includes(Number(args.autoPublishDelaySeconds))
+          ) {
+            throw new Error(`autoPublishDelaySeconds must be one of ${AUTO_PUBLISH_DELAYS_SECONDS.join(', ')}`);
+          }
           const updated = this.getScheduler().setPersonaSchedule(ctx.persona.id, {
             sync: {
               ...(typeof args.syncEnabled === 'boolean' ? { enabled: args.syncEnabled } : {}),
@@ -1956,7 +2022,16 @@ export class WebringMcpServer {
               ...(destination ? { destination: destination as 'local' | 'remote' | 'github' } : {}),
               ...(typeof args.syncBeforePublish === 'boolean' ? { syncFirst: args.syncBeforePublish } : {}),
             },
+            autoPublish: {
+              ...(typeof args.autoPublishEnabled === 'boolean' ? { enabled: args.autoPublishEnabled } : {}),
+              ...(args.autoPublishDelaySeconds !== undefined
+                ? { delaySeconds: Number(args.autoPublishDelaySeconds) as AutoPublishDelaySeconds }
+                : {}),
+            },
           });
+          if (typeof args.autoPublishEnabled === 'boolean' || args.autoPublishDelaySeconds !== undefined) {
+            this.appServices?.onAutoPublishSettingsChanged?.(ctx.persona.id);
+          }
           resultData = { personaId: ctx.persona.id, schedule: updated };
           summary = `Updated schedules for ${ctx.persona.label}`;
           break;
@@ -2096,10 +2171,11 @@ export class WebringMcpServer {
           if (destination !== 'github' && destination !== 'remote' && destination !== 'local') {
             throw new Error('destination must be "github", "remote" or "local".');
           }
-          const res =
+          const res = await this.withPersonaLock(ctx.persona.id, () =>
             destination === 'github'
-              ? await publishGitHubSite(ctx, app.publishPaths())
-              : await publishTo(ctx, destination, app.publishPaths());
+              ? publishGitHubSite(ctx, app.publishPaths())
+              : publishTo(ctx, destination, app.publishPaths())
+          );
           if (!res.success) throw new Error(res.message);
           app.onPublished?.(ctx.persona.id);
           resultData = res;
@@ -2343,6 +2419,10 @@ export class WebringMcpServer {
           throw new Error(`Unknown MCP tool: ${name}`);
       }
 
+      if (LOCAL_CHANGE_TOOLS[name]) {
+        // resolveContext made the tool's persona the active one
+        this.noteChange(this.personaManager.getActivePersonaId(), LOCAL_CHANGE_TOOLS[name]);
+      }
       this.recordActivity('tools/call', summary, true, name);
       return {
         content: [

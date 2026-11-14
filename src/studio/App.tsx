@@ -237,13 +237,42 @@ interface ScheduleJob {
   lastResult?: ScheduleJobResult;
 }
 
+/** Delays offered for auto-publish (seconds); matches AUTO_PUBLISH_DELAYS_SECONDS in the scheduler. */
+const AUTO_PUBLISH_DELAYS: Array<{ seconds: 30 | 120 | 600 | 3600; label: string }> = [
+  { seconds: 30, label: '30 seconds' },
+  { seconds: 120, label: '2 minutes' },
+  { seconds: 600, label: '10 minutes' },
+  { seconds: 3600, label: '1 hour' },
+];
+
+interface AutoPublishSettingsView {
+  enabled: boolean;
+  delaySeconds: 30 | 120 | 600 | 3600;
+}
+
+interface AutoPublishStatusView {
+  state: 'idle' | 'pending' | 'running';
+  dueAt: string | null;
+  reasons: string[];
+  lastResult: ScheduleJobResult | null;
+}
+
+function formatCountdown(dueAt: string, now: number): string {
+  const seconds = Math.max(0, Math.round((new Date(dueAt).getTime() - now) / 1000));
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)} h ${Math.round((seconds % 3600) / 60)} min`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  return `${seconds} s`;
+}
+
 interface PersonaScheduleView {
   personaId: string;
   label: string;
   schedule: {
     sync: ScheduleJob;
     publish: ScheduleJob & { destination: 'local' | 'remote' | 'github'; syncFirst: boolean };
+    autoPublish: AutoPublishSettingsView;
   };
+  autoPublishStatus: AutoPublishStatusView | null;
   nextSyncAt: string | null;
   nextPublishAt: string | null;
   describe: { sync: string; publish: string };
@@ -531,6 +560,8 @@ declare global {
         personaId: string,
         job: 'sync' | 'publish'
       ) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
+      autoPublishNow?: (personaId: string) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
+      autoPublishCancel?: (personaId: string) => Promise<ScheduleOverview>;
       onScheduleUpdated?: (cb: () => void) => () => void;
       chooseExportFolder: () => Promise<string | null>;
       exportLocal: (targetDir?: string) => Promise<{
@@ -1471,11 +1502,13 @@ export const App: React.FC = () => {
     setItemTags('');
     await refreshStudioData();
     notify(
-      itemType === 'post'
-        ? 'Published new Wall Post to your profile & items.json!'
-        : itemType === 'comment'
-        ? 'Published signed Comment to your items.json (friends will see it under the post when synced)!'
-        : `Indexed new ${itemType.toUpperCase()} item in items.json!`
+      afterChangeNote(
+        itemType === 'post'
+          ? 'Wall Post'
+          : itemType === 'comment'
+          ? 'Comment'
+          : itemType.charAt(0).toUpperCase() + itemType.slice(1)
+      )
     );
   };
 
@@ -1506,8 +1539,12 @@ export const App: React.FC = () => {
     await refreshStudioData();
     notify(
       friendVisibility === 'private'
-        ? `Added ${friendName} as Private (Local Crawler Only — hidden from public connections.json)!`
-        : `Added ${friendName} as Public (exported to connections.json)!`
+        ? `Added ${friendName} as Private (Local Crawler Only — hidden from public connections.json).${
+            autoPublish?.enabled ? ' Fetching their site now.' : ''
+          }`
+        : `${afterChangeNote(`Added ${friendName} as Public (connections.json)`)}${
+            autoPublish?.enabled ? ' Fetching their site now.' : ''
+          }`
     );
   };
 
@@ -1880,7 +1917,11 @@ export const App: React.FC = () => {
 
   const handleSetSchedule = async (
     change:
-      | { sync?: Partial<ScheduleJob>; publish?: Partial<PersonaScheduleView['schedule']['publish']> }
+      | {
+          sync?: Partial<ScheduleJob>;
+          publish?: Partial<PersonaScheduleView['schedule']['publish']>;
+          autoPublish?: Partial<AutoPublishSettingsView>;
+        }
       | { app: Partial<ScheduleOverview['app']> }
   ) => {
     if (!window.studioApi) return;
@@ -1900,6 +1941,78 @@ export const App: React.FC = () => {
     } finally {
       setRunningJob(null);
     }
+  };
+
+  // Auto-publish: a countdown while a publish is pending, and its buttons
+  const autoPublish = activeSchedule?.schedule.autoPublish;
+  const autoPublishStatus = activeSchedule?.autoPublishStatus || null;
+  const [countdownNow, setCountdownNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (autoPublishStatus?.state !== 'pending') return;
+    setCountdownNow(Date.now());
+    const timer = setInterval(() => setCountdownNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [autoPublishStatus?.state, autoPublishStatus?.dueAt]);
+
+  /** Toast text after a change: says when it goes out, instead of claiming it's already published. */
+  const afterChangeNote = (what: string) => {
+    if (autoPublish?.enabled && !scheduleOverview?.app.paused) {
+      const delay = AUTO_PUBLISH_DELAYS.find((d) => d.seconds === autoPublish.delaySeconds)?.label || 'a moment';
+      return `${what} saved. Auto-publishing in ${delay}.`;
+    }
+    return `${what} saved. Publish to share it with friends.`;
+  };
+
+  const handleAutoPublishNow = async () => {
+    if (!window.studioApi?.autoPublishNow) return;
+    notify('Publishing now...');
+    const { result, overview } = await window.studioApi.autoPublishNow(activePersonaId);
+    setScheduleOverview(overview);
+    await refreshStudioData();
+    notify(result.message);
+  };
+
+  const handleAutoPublishCancel = async () => {
+    if (!window.studioApi?.autoPublishCancel) return;
+    setScheduleOverview(await window.studioApi.autoPublishCancel(activePersonaId));
+    notify('Auto-publish cancelled. Your changes stay unpublished until you publish.');
+  };
+
+  const renderAutoPublishPill = () => {
+    if (!autoPublishStatus) return null;
+    if (autoPublishStatus.state === 'pending' && autoPublishStatus.dueAt) {
+      return (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs px-3 py-2 rounded-xl bg-indigo-500/15 text-indigo-200 border border-indigo-500/30">
+          <span className="w-full">
+            Changes pending · publishing in {formatCountdown(autoPublishStatus.dueAt, countdownNow)}
+          </span>
+          <button type="button" onClick={handleAutoPublishNow} className="font-semibold hover:text-white">
+            Publish now
+          </button>
+          <button type="button" onClick={handleAutoPublishCancel} className="text-indigo-300/70 hover:text-white">
+            Cancel
+          </button>
+        </div>
+      );
+    }
+    if (autoPublishStatus.state === 'running') {
+      return (
+        <div className="text-xs px-3 py-1.5 rounded-full bg-indigo-500/15 text-indigo-200 border border-indigo-500/30">
+          Syncing &amp; publishing…
+        </div>
+      );
+    }
+    if (autoPublishStatus.lastResult?.status === 'failed') {
+      return (
+        <div
+          className="text-xs px-3 py-1.5 rounded-full bg-rose-500/15 text-rose-200 border border-rose-500/30"
+          title={autoPublishStatus.lastResult.message}
+        >
+          Auto-publish failed ✕
+        </div>
+      );
+    }
+    return null;
   };
 
   const renderPresetPicker = (preset: SchedulePreset, onChange: (preset: SchedulePreset) => void) => {
@@ -2434,6 +2547,7 @@ export const App: React.FC = () => {
 
         {/* Bottom Identity & Quick Export Card */}
         <div className="p-4 border-t border-slate-800 space-y-2.5 bg-slate-900/50">
+          {renderAutoPublishPill()}
           <div className="text-xs space-y-1">
             <div className="flex items-center gap-1.5 text-emerald-400 font-semibold">
               <ShieldCheck className="w-4 h-4" />
@@ -5529,6 +5643,56 @@ export const App: React.FC = () => {
                         {runningJob === 'publish' ? 'Publishing...' : 'Run now'}
                       </button>
                     </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                    <label className="flex items-center gap-2 text-sm font-semibold">
+                      <input
+                        type="checkbox"
+                        checked={activeSchedule.schedule.autoPublish.enabled}
+                        onChange={(e) => handleSetSchedule({ autoPublish: { enabled: e.target.checked } })}
+                        className="accent-indigo-500"
+                      />
+                      Auto-publish after changes
+                    </label>
+                    <p className="text-xs text-slate-400">
+                      After you post, like, share, add photos, add a friend or change a webring, Studio waits,
+                      then syncs and publishes{' '}
+                      {activeSchedule.schedule.publish.destination === 'github'
+                        ? 'to GitHub Pages'
+                        : activeSchedule.schedule.publish.destination === 'remote'
+                          ? 'to your SFTP / FTP host'
+                          : 'to your export folder'}{' '}
+                      (the destination above). Everything you do during the wait goes out in one publish.
+                      Friends see it at their next sync.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                      <span>Wait before publishing:</span>
+                      <select
+                        value={activeSchedule.schedule.autoPublish.delaySeconds}
+                        onChange={(e) =>
+                          handleSetSchedule({
+                            autoPublish: { delaySeconds: Number(e.target.value) as AutoPublishSettingsView['delaySeconds'] },
+                          })
+                        }
+                        className="px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-200"
+                      >
+                        {AUTO_PUBLISH_DELAYS.map((d) => (
+                          <option key={d.seconds} value={d.seconds}>
+                            {d.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    {activeSchedule.autoPublishStatus?.lastResult && (
+                      <p
+                        className={`text-[11px] ${
+                          activeSchedule.autoPublishStatus.lastResult.status === 'failed' ? 'text-rose-300' : 'text-slate-500'
+                        }`}
+                      >
+                        Last: {activeSchedule.autoPublishStatus.lastResult.message}
+                      </p>
+                    )}
                   </div>
 
                   {scheduleOverview.personas.length > 1 && (
