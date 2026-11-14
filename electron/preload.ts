@@ -1,0 +1,146 @@
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import { WebringDeepLinkAction } from '../src/shared/schema';
+
+contextBridge.exposeInMainWorld('studioApi', {
+  getBundle: () => ipcRenderer.invoke('studio:get-bundle'),
+  listPersonas: () => ipcRenderer.invoke('studio:list-personas'),
+  createPersona: (input: unknown) => ipcRenderer.invoke('studio:create-persona', input),
+  switchPersona: (personaId: string) => ipcRenderer.invoke('studio:switch-persona', personaId),
+  updatePersonaLabel: (personaId: string, label: string) =>
+    ipcRenderer.invoke('studio:update-persona-label', personaId, label),
+  deletePersona: (personaId: string, deleteFiles?: boolean) =>
+    ipcRenderer.invoke('studio:delete-persona', personaId, deleteFiles),
+  updateProfile: (updates: unknown) => ipcRenderer.invoke('studio:update-profile', updates),
+  createAlbum: (input: unknown) => ipcRenderer.invoke('studio:create-album', input),
+  deleteAlbum: (albumId: string) => ipcRenderer.invoke('studio:delete-album', albumId),
+  addPhoto: (input: unknown) => ipcRenderer.invoke('studio:add-photo', input),
+  importPhotos: (albumId: string, filePaths?: string[]) =>
+    ipcRenderer.invoke('studio:media-import-photos', albumId, filePaths),
+  replacePhoto: (photoId: string) => ipcRenderer.invoke('studio:media-replace-photo', photoId),
+  importImage: () => ipcRenderer.invoke('studio:media-import-image'),
+  setProfileImage: (kind: 'avatar' | 'banner', filePath?: string) =>
+    ipcRenderer.invoke('studio:profile-set-image', kind, filePath),
+  updatePhoto: (photoId: string, updates: unknown) => ipcRenderer.invoke('studio:media-update-photo', photoId, updates),
+  movePhoto: (photoId: string, direction: 'up' | 'down') =>
+    ipcRenderer.invoke('studio:media-move-photo', photoId, direction),
+  updateAlbum: (albumId: string, updates: unknown) => ipcRenderer.invoke('studio:media-update-album', albumId, updates),
+  getMediaUsage: () => ipcRenderer.invoke('studio:media-usage'),
+  forgetPublishHistory: () => ipcRenderer.invoke('studio:forget-publish-history'),
+  // Dropped files carry no path in a sandboxed window; webUtils recovers it
+  getPathForFile: (file: File) => webUtils.getPathForFile(file),
+  deletePhoto: (photoId: string) => ipcRenderer.invoke('studio:delete-photo', photoId),
+  createItem: (input: unknown) => ipcRenderer.invoke('studio:create-item', input),
+  deleteItem: (itemId: string) => ipcRenderer.invoke('studio:delete-item', itemId),
+  savePost: (canonicalUrl: string) => ipcRenderer.invoke('studio:save-post', canonicalUrl),
+  getFeedAlbumPhotos: (albumUrl: string) => ipcRenderer.invoke('studio:get-feed-album-photos', albumUrl),
+  markFeedAlbumSeen: (albumUrl: string) => ipcRenderer.invoke('studio:mark-feed-album-seen', albumUrl),
+  unsavePost: (savedId: string) => ipcRenderer.invoke('studio:unsave-post', savedId),
+  updateSavedNote: (savedId: string, note: string) => ipcRenderer.invoke('studio:saved-note', savedId, note),
+  setFeedRetention: (days: number) => ipcRenderer.invoke('studio:set-feed-retention', days),
+  updateItem: (itemId: string, updates: unknown) => ipcRenderer.invoke('studio:update-item', itemId, updates),
+  addFriend: (input: unknown) => ipcRenderer.invoke('studio:add-friend', input),
+  updateFriend: (friendId: string, updates: unknown) =>
+    ipcRenderer.invoke('studio:update-friend', friendId, updates),
+  rotateKeys: () => ipcRenderer.invoke('studio:rotate-keys'),
+  trustFriendKey: (friendId: string, newPublicKeyPem?: string) =>
+    ipcRenderer.invoke('studio:trust-friend-key', friendId, newPublicKeyPem),
+  setProxySettings: (input: { enabled?: boolean; proxyUrl?: string }) =>
+    ipcRenderer.invoke('studio:set-proxy-settings', input),
+  setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>
+    ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),
+  deleteFriend: (friendId: string) => ipcRenderer.invoke('studio:delete-friend', friendId),
+  setModeration: (siteUrl: string, action: 'mute' | 'block' | null) =>
+    ipcRenderer.invoke('studio:set-moderation', siteUrl, action),
+  updateWebring: (ringId: string, updates: unknown) =>
+    ipcRenderer.invoke('studio:update-webring', ringId, updates),
+  deleteWebring: (ringId: string) => ipcRenderer.invoke('studio:delete-webring', ringId),
+  crawlFriend: (siteUrl: string, localDirOverride?: string) =>
+    ipcRenderer.invoke('studio:crawl-friend', siteUrl, localDirOverride),
+  crawlAllFriends: () => ipcRenderer.invoke('studio:crawl-all-friends'),
+  onSyncProgress: (callback: (progress: { done: number; total: number }) => void) => {
+    const listener = (_event: unknown, progress: { done: number; total: number }) => callback(progress);
+    ipcRenderer.on('studio:sync-progress', listener);
+    return () => ipcRenderer.removeListener('studio:sync-progress', listener);
+  },
+  requestToJoinRing: (hubUrl: string) => ipcRenderer.invoke('studio:ring-request-join', hubUrl),
+  reviewRingRequest: (link: string) => ipcRenderer.invoke('studio:ring-review-request', link),
+  decideRingRequest: (link: string, decision: 'approve' | 'decline' | 'ban', reason?: string) =>
+    ipcRenderer.invoke('studio:ring-decide-request', link, decision, reason),
+  syncRings: () => ipcRenderer.invoke('studio:ring-sync-all'),
+  listWebringHubs: () => ipcRenderer.invoke('studio:webring-hub-list'),
+  addWebringHub: (url: string) => ipcRenderer.invoke('studio:webring-hub-add', url),
+  removeWebringHub: (url: string) => ipcRenderer.invoke('studio:webring-hub-remove', url),
+  searchWebringHub: (url: string, query: string, options?: { limit?: number; offset?: number }) =>
+    ipcRenderer.invoke('studio:webring-hub-search', url, query, options),
+  setWebringHubListed: (url: string, listed: boolean) =>
+    ipcRenderer.invoke('studio:webring-hub-set-listed', url, listed),
+  checkKeyWithWebringHubs: (siteUrl: string) => ipcRenderer.invoke('studio:webring-hub-check-key', siteUrl),
+  createFriendNotice: (friendSiteUrl: string) => ipcRenderer.invoke('studio:friend-notice-create', friendSiteUrl),
+  reviewFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-review', link),
+  acceptFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-accept', link),
+  dismissFriendNotice: (siteUrl: string) => ipcRenderer.invoke('studio:friend-notice-dismiss', siteUrl),
+  createHostedRing: (input: { name: string; description?: string }) =>
+    ipcRenderer.invoke('studio:hosted-ring-create', input),
+  updateHostedRing: (ringId: string, updates: unknown) =>
+    ipcRenderer.invoke('studio:hosted-ring-update', ringId, updates),
+  hostLegacyRing: (joinedRingId: string) => ipcRenderer.invoke('studio:host-legacy-ring', joinedRingId),
+  previewHostedRing: (ringId: string) => ipcRenderer.invoke('studio:hosted-ring-preview', ringId),
+  updateRingMember: (
+    ringId: string,
+    siteUrl: string,
+    change: { action: 'remove' | 'ban' | 'unban' | 'hide' | 'show' | 'up' | 'down'; reason?: string }
+  ) => ipcRenderer.invoke('studio:hosted-ring-member', ringId, siteUrl, change),
+  chooseExportFolder: () => ipcRenderer.invoke('studio:choose-export-folder'),
+  exportLocal: (targetDir?: string) => ipcRenderer.invoke('studio:export-local', targetDir),
+  testExportPreview: (openInBrowser?: boolean) =>
+    ipcRenderer.invoke('studio:test-export-preview', openInBrowser),
+  openExternal: (url: string) => ipcRenderer.invoke('studio:open-external', url),
+  openMedia: (url: string) => ipcRenderer.invoke('studio:open-media', url),
+  publishRemote: (settings: unknown) => ipcRenderer.invoke('studio:publish-remote', settings),
+  publishGithub: (settings: unknown) => ipcRenderer.invoke('studio:publish-github', settings),
+  checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),
+  getSetupStatus: (options?: { checkGitHub?: boolean }) => ipcRenderer.invoke('studio:setup-status', options),
+  githubLoginAvailable: () => ipcRenderer.invoke('studio:github-login-available'),
+  githubLoginStart: () => ipcRenderer.invoke('studio:github-login-start'),
+  githubLoginPoll: (loginId: string) => ipcRenderer.invoke('studio:github-login-poll', loginId),
+  githubConnectToken: (token: string) => ipcRenderer.invoke('studio:github-connect-token', token),
+  setupConfigureSite: (options?: { repoName?: string; allowAddressChange?: boolean }) =>
+    ipcRenderer.invoke('studio:setup-configure-site', options),
+  setupPublish: () => ipcRenderer.invoke('studio:setup-publish'),
+  setupCheckLive: () => ipcRenderer.invoke('studio:setup-check-live'),
+  setupDismiss: (dismissed: boolean) => ipcRenderer.invoke('studio:setup-dismiss', dismissed),
+  openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
+  getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),
+  callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
+    ipcRenderer.invoke('studio:call-mcp-tool', toolName, args),
+  onMcpActivity: (callback: (entry: unknown) => void) => {
+    const listener = (_event: unknown, entry: unknown) => callback(entry);
+    ipcRenderer.on('studio:mcp-activity', listener);
+    return () => ipcRenderer.removeListener('studio:mcp-activity', listener);
+  },
+  getSchedule: () => ipcRenderer.invoke('studio:get-schedule'),
+  setSchedule: (change: unknown) => ipcRenderer.invoke('studio:set-schedule', change),
+  runJobNow: (personaId: string, job: 'sync' | 'publish') =>
+    ipcRenderer.invoke('studio:run-job-now', personaId, job),
+  onScheduleUpdated: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('studio:schedule-updated', listener);
+    return () => ipcRenderer.removeListener('studio:schedule-updated', listener);
+  },
+  onRingRequestLink: (callback: (link: string) => void) => {
+    const listener = (_event: unknown, link: string) => callback(link);
+    ipcRenderer.on('webring:ring-request', listener);
+    return () => ipcRenderer.removeListener('webring:ring-request', listener);
+  },
+  onFriendNoticeLink: (callback: (link: string) => void) => {
+    const listener = (_event: unknown, link: string) => callback(link);
+    ipcRenderer.on('webring:friend-notice', listener);
+    return () => ipcRenderer.removeListener('webring:friend-notice', listener);
+  },
+  onDeepLink: (callback: (action: WebringDeepLinkAction) => void) => {
+    const listener = (_event: unknown, action: WebringDeepLinkAction) => callback(action);
+    ipcRenderer.on('webring:deep-link', listener);
+    return () => ipcRenderer.removeListener('webring:deep-link', listener);
+  },
+});
+

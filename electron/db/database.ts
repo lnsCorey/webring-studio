@@ -1,0 +1,4010 @@
+import * as path from 'path';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
+import {
+  AdsAddon,
+  AlbumDisplay,
+  AlbumItem,
+  AlbumManifest,
+  Appearance,
+  AppearanceSchema,
+  LayoutBlock,
+  parseLayout,
+  AlbumsDocument,
+  albumDisplay,
+  slugifyAlbumTitle,
+  AnalyticsAddon,
+  buildCanonicalUrl,
+  buildDidDocument,
+  canonicalizeJson,
+  CompleteSiteBundle,
+  ConnectionsDocument,
+  createKeyRotationCertificate,
+  EndorsementItem,
+  FriendConnection,
+  FriendKeyStatus,
+  FriendVisibility,
+  generateIdentityKeyPair,
+  isValidAdSlotId,
+  isUrlWithinSite,
+  isValidGa4MeasurementId,
+  ItemsDocument,
+  KeyRotationCertificate,
+  KeyRotationCertificateSchema,
+  normalizeRingPagePath,
+  computeRingNeighbors,
+  documentFingerprint,
+  ModerationAction,
+  normalizeAdSensePublisherId,
+  PLACEHOLDER_DISPLAY_NAME,
+  PLACEHOLDER_SITE_URL,
+  normalizeSiteUrl,
+  PhotoItem,
+  ProfileDocument,
+  ProfileTheme,
+  SharedItem,
+  SharedItemType,
+  signDocument,
+  siteUrlToDidWeb,
+  verifyKeyRotationChain,
+  WEBRING_SCHEMA_VERSION,
+  publicKeyFingerprint,
+  WebringHubDocument,
+  WebringManifest,
+  WebringMembership,
+  ProfileThemeSchema,
+} from '../../src/shared/schema';
+import { markdownToPlainText } from '../../src/shared/markdown';
+import {
+  isEncryptedKey,
+  KeyCipher,
+  openPrivateKey,
+  openSecret,
+  sealPrivateKey,
+  sealSecret,
+} from '../security/keyVault';
+import {
+  DEMO_PEER_SITE_URL,
+  LEGACY_DEMO_ALBUM,
+  LEGACY_DEMO_FRIEND,
+  LEGACY_DEMO_ITEMS,
+  LEGACY_DEMO_PHOTOS,
+  LEGACY_DEMO_PROFILE,
+  LEGACY_DEMO_WEBRING,
+} from './legacyDemoContent';
+
+/** Publishing credentials, sealed at rest and never returned by getProfile(). */
+const SECRET_PUBLISH_FIELDS = ['password', 'githubToken'] as const;
+type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
+
+/**
+ * What getProfile() shows in place of a stored credential. Sending it back unchanged (e.g. from
+ * the Publish form) keeps the stored value; '' clears it; anything else replaces it.
+ */
+export const STORED_SECRET_PLACEHOLDER = '••••••••';
+
+/** The published files behind a Media Library photo (see electron/services/mediaLibrary.ts). */
+export interface LocalPhotoMedia {
+  url: string;
+  thumbUrl: string;
+  sha256: string;
+  bytes: number;
+  mimeType: string;
+  width: number;
+  height: number;
+  thumbSha256: string;
+  thumbBytes: number;
+  thumbWidth: number;
+  thumbHeight: number;
+  originalPath: string;
+}
+
+/** Reads the stored Site Design columns; anything invalid is dropped rather than failing. */
+function readDesign(row: Record<string, unknown>): { appearance?: Appearance; layout?: LayoutBlock[] } {
+  const parse = (value: unknown) => {
+    try {
+      return value ? JSON.parse(String(value)) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const appearance = AppearanceSchema.parse(parse(row.appearance_json) ?? {});
+  const layoutRaw = parse(row.layout_json);
+  return {
+    ...(Object.keys(appearance).some((k) => appearance[k as keyof Appearance] !== undefined) ? { appearance } : {}),
+    ...(Array.isArray(layoutRaw) ? { layout: parseLayout(layoutRaw) } : {}),
+  };
+}
+
+/** Only the fields that have a value, so empty ones stay out of signed documents. */
+function optionalText<T extends Record<string, string | undefined>>(fields: T): Partial<T> {
+  return Object.fromEntries(Object.entries(fields).filter(([, value]) => value)) as Partial<T>;
+}
+
+/** A Media Library path (media/…) as an absolute URL on the site; https URLs pass through. */
+function absoluteOnSite(url: string | undefined, siteUrl: string): string {
+  const value = (url || '').trim();
+  if (/^https:\/\//i.test(value)) return value;
+  return value.startsWith('media/') ? `${siteUrl}/${value}` : '';
+}
+
+/** Reads a joined ring's stored rotation; anything that isn't a list of strings becomes empty. */
+function parseRotationUrls(value: unknown): string[] {
+  try {
+    const parsed = JSON.parse(String(value || '[]'));
+    return Array.isArray(parsed) ? parsed.filter((url): url is string => typeof url === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+export function albumManifestPath(albumId: string): string {
+  return `media/albums/${albumId.replace(/[^a-zA-Z0-9_-]/g, '')}/manifest.json`;
+}
+
+/** Guided-setup bookkeeping for a persona (see `setupService.ts`). Never exported. */
+export interface SetupState {
+  /** When the user closed the wizard without finishing; it then stops opening by itself */
+  dismissedAt?: string;
+  /** The last live-site check, so the Setup & Health card can show it without a network call */
+  lastLiveCheck?: { at: string; state: string; message: string };
+}
+
+/** An extension a Webring Hub advertises in `/api/info` (see docs/architecture/webring-hub.md). */
+export interface WebringHubExtensionInfo {
+  id: string;
+  version: string;
+  apiVersion: number;
+}
+
+/**
+ * A Webring Hub this persona uses (see `electron/services/webringHubService.ts` and
+ * `docs/architecture/webring-hub.md`). Local only, never exported.
+ */
+export interface WebringHubRecord {
+  /** The hub's base address, e.g. https://hub.example */
+  url: string;
+  /** The hub's own title from `/api/info`, for display only. */
+  title: string;
+  addedAt: string;
+  /** The user chose to list this persona's site here (opt-in; off when added). */
+  listMe: boolean;
+  state: 'not-listed' | 'listed' | 'blocked' | 'key-changed' | 'error';
+  lastListedAt?: string;
+  lastPingAt?: string;
+  /** `updatedAt` of the published manifest the hub should be asked to re-read. */
+  pendingPingFor?: string;
+  pendingSince?: string;
+  lastError?: string;
+  /** Extensions the hub advertised in `/api/info` when last checked. Metadata only. */
+  extensions?: WebringHubExtensionInfo[];
+  infoCheckedAt?: string;
+}
+
+export interface PublishSettings {
+  exportPath: string;
+  protocol: 'sftp' | 'ftp';
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  remotePath: string;
+  atprotoPdsUrl?: string;
+  publishFriendsList?: boolean;
+  stripRelationshipTags?: boolean;
+  publishEndorsements?: boolean;
+  publishWebringHub?: boolean;
+  redactItemSourceAuthors?: boolean;
+  commentProvider?: 'none' | 'giscus' | 'utterances';
+  giscusRepo?: string;
+  giscusRepoId?: string;
+  giscusCategory?: string;
+  giscusCategoryId?: string;
+  // Add-On 1: Google Analytics (GA4)
+  analyticsEnabled?: boolean;
+  analyticsMeasurementId?: string;
+  analyticsRespectDnt?: boolean;
+  analyticsAnonymizeIp?: boolean;
+  analyticsTrackRingInteractions?: boolean;
+  // Add-On 2: Google AdSense / Ads Monetization
+  adsEnabled?: boolean;
+  adsPublisherId?: string;
+  adsEnableAutoAds?: boolean;
+  adsGenerateAdsTxt?: boolean;
+  adsHeaderSlotId?: string;
+  adsInFeedSlotId?: string;
+  adsFooterSlotId?: string;
+  // Add-On 3: GitHub Pages Deploy
+  githubOwner?: string;
+  githubRepo?: string;
+  githubBranch?: string;
+  githubToken?: string;
+  githubCustomDomain?: string;
+  /** Set once the old single webring hub has been converted into a hosted ring. */
+  legacyHubMigrated?: boolean;
+  /** Set once sample content seeded by earlier versions has been cleaned up. */
+  legacyDemoContentRemoved?: boolean;
+  // Snapshot bookkeeping: when the static site was last generated and what it contained
+  lastPublishedAt?: string;
+  lastPublishedCounts?: PublishedCounts;
+  /** Content fingerprint of the last published site, used to skip publishes with no changes. */
+  lastPublishedFingerprint?: string;
+}
+
+export interface PublishedCounts {
+  albumCount: number;
+  photoCount: number;
+  itemCount: number;
+  friendCount: number;
+  webringCount: number;
+  endorsementCount: number;
+}
+
+export interface SiteKey {
+  siteUrl: string;
+  did: string;
+  publicKeyPem: string;
+  keyStatus: 'pinned' | 'changed';
+  firstSeenAt: string;
+}
+
+export type JoinedRingStatus = 'requested' | 'member' | 'removed' | 'closed' | 'legacy';
+
+/** A ring this persona has joined (or asked to join), as tracked locally. */
+export interface JoinedRing {
+  id: string;
+  name: string;
+  hubUrl: string;
+  description: string;
+  status: JoinedRingStatus;
+  maintainerUrl: string;
+  maintainerDid: string;
+  prevSiteUrl?: string;
+  nextSiteUrl?: string;
+  memberCount: number;
+  directoryUrl?: string;
+  /** The other sites in rotation at the last sync, for Random when the hub can't be read. */
+  rotationUrls: string[];
+  hubVerified: boolean;
+  hubUpdatedAt?: string;
+  lastSyncedAt?: string;
+  requestToken?: string;
+  syncWarning?: string;
+  joinedAt: string;
+}
+
+export interface HostedRingMember {
+  siteUrl: string;
+  displayName: string;
+  did: string;
+  keyFingerprint: string;
+  position: number;
+  joinedAt: string;
+  confirmedAt?: string;
+  lastVerifiedAt?: string;
+  failCount: number;
+  hidden: boolean;
+  /** From the member's verified profile.json, for the ring page. */
+  avatarUrl: string;
+  tagline: string;
+}
+
+export interface HostedRingBan {
+  siteUrl: string;
+  did: string;
+  keyFingerprint: string;
+  reason: string;
+  createdAt: string;
+}
+
+/** A ring this persona maintains and publishes. */
+export interface HostedRing {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  hubPath: string;
+  hubUrl: string;
+  directoryPath: string;
+  directoryUrl: string;
+  maintainerIsMember: boolean;
+  status: 'active' | 'closed';
+  /** Ring page design. `rules` is Markdown; `bannerUrl` is a Media Library path or https URL. */
+  tagline: string;
+  rules: string;
+  bannerUrl: string;
+  accent: string;
+  createdAt: string;
+  updatedAt: string;
+  members: HostedRingMember[];
+  bans: HostedRingBan[];
+}
+
+export interface ModerationEntry {
+  siteUrl: string;
+  action: ModerationAction;
+  createdAt: string;
+}
+
+/**
+ * Counts of rows a curated view left out, so the UI can show what moderation is hiding.
+ */
+export interface CuratedExclusions {
+  muted: number;
+  blocked: number;
+  unverified: number;
+}
+
+export interface CuratedView<T> {
+  entries: T[];
+  excluded: CuratedExclusions;
+}
+
+export interface NetworkFeedEntry {
+  id: string;
+  friendSiteUrl: string;
+  friendName: string;
+  friendAvatarUrl: string;
+  friendDid: string;
+  entryType: 'photo' | 'album' | 'post' | 'like' | 'share' | 'recommendation' | 'comment';
+  title: string;
+  canonicalUrl: string;
+  targetUrl: string;
+  commentary: string;
+  mediaUrl: string;
+  tags: string[];
+  /** Album rows: the newest photo's createdAt (or the album's, if it's empty). */
+  createdAt: string;
+  verifiedSignature: boolean;
+  /** Photo rows: the canonical URL of the album they belong to. Photo rows aren't in the main feed. */
+  albumUrl?: string;
+  /** Album rows: how many photos the album has. */
+  photoCount?: number;
+  /** Album rows: photos first seen since the album was last opened. */
+  newCount?: number;
+  /** Album rows: up to 3 absolute thumbnail URLs for the card. */
+  peekUrls?: string[];
+}
+
+/** A friend's post or photo the user saved: a private copy kept outside the feed window. */
+export type FriendNoticeSource = 'link' | 'ring';
+
+/** Someone who added this persona as a friend (database.ts friend_notices). Never exported. */
+export interface FriendNotice {
+  siteUrl: string;
+  displayName: string;
+  avatarUrl: string;
+  /** 'link': they sent a signed link. 'ring': seen in a shared ring member's connections.json. */
+  source: FriendNoticeSource;
+  ringName: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  dismissedAt?: string;
+}
+
+export interface SavedPost {
+  id: string;
+  canonicalUrl: string;
+  friendSiteUrl: string;
+  friendName: string;
+  friendAvatarUrl: string;
+  entryType: NetworkFeedEntry['entryType'];
+  title: string;
+  commentary: string;
+  targetUrl: string;
+  /** The image on the friend's site. */
+  mediaUrl: string;
+  /** Studio's copy of the image (media/saved/...), never published; empty if it couldn't be saved. */
+  localMediaUrl: string;
+  tags: string[];
+  note: string;
+  createdAt: string;
+  savedAt: string;
+  verifiedSignature: boolean;
+}
+
+interface SqlStatementAdapter {
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+  run(...params: unknown[]): unknown;
+}
+
+interface SqlDatabaseAdapter {
+  exec(sql: string): void;
+  prepare(sql: string): SqlStatementAdapter;
+  close(): void;
+}
+
+/**
+ * Opens the database with Node's built-in `node:sqlite` (Node 22.13+, and Electron 45+'s
+ * bundled Node 24), so no native module has to be compiled during install.
+ */
+function openSqliteAdapter(dbPath: string): SqlDatabaseAdapter {
+  let nodeSqlite: { DatabaseSync: new (path: string) => SqlDatabaseAdapter & { prepare(sql: string): SqlStatementAdapter } };
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    nodeSqlite = require('node:sqlite');
+  } catch {
+    throw new Error(
+      `Webring Studio needs Node.js 22.13 or newer (built-in node:sqlite); this is Node ${process.versions.node}.`
+    );
+  }
+  const db = new nodeSqlite.DatabaseSync(dbPath);
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  return {
+    exec: (sql: string) => db.exec(sql),
+    prepare: (sql: string) => {
+      const stmt = db.prepare(sql);
+      return {
+        get: (...params: unknown[]) => stmt.get(...params),
+        all: (...params: unknown[]) => stmt.all(...params),
+        run: (...params: unknown[]) => stmt.run(...params),
+      };
+    },
+    close: () => db.close(),
+  };
+}
+
+export interface StudioDatabaseOptions {
+  /** Seals the private key at rest. Without one, the key is stored and read as plaintext. */
+  keyCipher?: KeyCipher;
+  defaultExportPath?: string;
+  initialProfile?: {
+    siteUrl?: string;
+    handle?: string;
+    displayName?: string;
+    tagline?: string;
+    bio?: string;
+    location?: string;
+    avatarUrl?: string;
+    bannerUrl?: string;
+    interests?: string[];
+    theme?: ProfileTheme;
+    atprotoHandle?: string;
+  };
+}
+
+/** Friends' posts stay in the feed this many days unless the user picks another window (0 = forever). */
+export const DEFAULT_FEED_RETENTION_DAYS = 90;
+
+/** A network_feed row; album fields only on album rows, albumUrl only on photos in an album. */
+function mapNetworkFeedRow(r: Record<string, unknown>): NetworkFeedEntry {
+  const entryType = r.entry_type as NetworkFeedEntry['entryType'];
+  const albumUrl = String(r.album_url || '');
+  return {
+    id: String(r.id),
+    friendSiteUrl: String(r.friend_site_url),
+    friendName: String(r.friend_name),
+    friendAvatarUrl: String(r.friend_avatar_url || ''),
+    friendDid: String(r.friend_did || ''),
+    entryType,
+    title: String(r.title),
+    canonicalUrl: String(r.canonical_url),
+    targetUrl: String(r.target_url),
+    commentary: String(r.commentary || ''),
+    mediaUrl: String(r.media_url || ''),
+    tags: JSON.parse(String(r.tags_json || '[]')),
+    createdAt: String(r.created_at),
+    verifiedSignature: Boolean(r.verified_signature),
+    ...(albumUrl ? { albumUrl } : {}),
+    ...(entryType === 'album'
+      ? {
+          photoCount: Number(r.photo_count || 0),
+          newCount: Number(r.new_count || 0),
+          peekUrls: JSON.parse(String(r.peek_json || '[]')) as string[],
+        }
+      : {}),
+  };
+}
+
+/** A published document's content, ignoring its own `updatedAt` and signature. */
+function publishedContentHash(doc: Record<string, unknown>): string {
+  const { updatedAt: _updatedAt, proof: _proof, ...content } = doc;
+  return crypto.createHash('sha256').update(canonicalizeJson(content)).digest('hex');
+}
+
+/** Sync All skips an unreachable friend for 15 min after a failure, doubling up to a day. */
+const SYNC_BACKOFF_BASE_MS = 15 * 60 * 1000;
+const SYNC_BACKOFF_MAX_MS = 24 * 60 * 60 * 1000;
+
+/** Published items.json keeps the last PUBLISH_WINDOW_DAYS, and never fewer than PUBLISH_MIN_RECENT items. */
+export const PUBLISH_WINDOW_DAYS = 90;
+export const PUBLISH_MIN_RECENT = 50;
+
+/** Splits items (newest first) into the recent ones for items.json and the older ones for archives. */
+export function splitItemsForPublishing(items: SharedItem[], nowMs: number): { recent: SharedItem[]; archived: SharedItem[] } {
+  const sorted = [...items].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const cutoff = new Date(nowMs - PUBLISH_WINDOW_DAYS * 86400000).toISOString();
+  let split = sorted.findIndex((item, index) => index >= PUBLISH_MIN_RECENT && item.createdAt < cutoff);
+  if (split === -1) split = sorted.length;
+  return { recent: sorted.slice(0, split), archived: sorted.slice(split) };
+}
+
+/** An item's title, or one derived from its text when left empty (as when it was created). */
+function defaultItemTitle(type: SharedItemType, title: string | undefined, commentary: string | undefined, targetAuthorName?: string): string {
+  const trimmed = (title || '').trim();
+  if (trimmed) return trimmed;
+  if (type === 'post') {
+    // Posts are Markdown: the title is the first line of their plain text
+    const firstLine = markdownToPlainText(commentary || '').split('\n').find((line) => line.trim()) || 'Wall Post';
+    const line = firstLine.trim();
+    return line.length > 72 ? `${line.slice(0, 69)}...` : line;
+  }
+  if (type === 'comment') return targetAuthorName ? `Comment on ${targetAuthorName}'s post` : 'Comment';
+  return 'Shared Item';
+}
+
+export class StudioDatabase {
+  private db: SqlDatabaseAdapter;
+  private keyCipher?: KeyCipher;
+  public readonly dbPath: string;
+
+  constructor(
+    storageDir: string,
+    dbFileName = 'webring-studio.sqlite',
+    options?: StudioDatabaseOptions
+  ) {
+    if (!fs.existsSync(storageDir)) {
+      fs.mkdirSync(storageDir, { recursive: true });
+    }
+    this.dbPath = path.join(storageDir, dbFileName);
+    this.db = openSqliteAdapter(this.dbPath);
+    this.keyCipher = options?.keyCipher;
+    this.initializeSchema();
+    this.ensureDefaultProfile(options);
+    this.sealPrivateKeyAtRest();
+    this.sealPublishSecretsAtRest();
+    this.migrateLegacyHub();
+    this.removeLegacyDemoContent();
+  }
+
+  /**
+   * Earlier versions seeded sample content (a sample profile, album, posts, the fictional friend
+   * "Maya Lin" and a fake webring) that would otherwise end up on the user's published site.
+   * Removes it once, row by row, only where it still matches what was seeded. Anything the user
+   * edited is kept. Everything crawled from the fictional demo peer goes regardless.
+   */
+  private removeLegacyDemoContent(): void {
+    const stored = this.readStoredPublishSettings();
+    if (stored.legacyDemoContentRemoved) return;
+
+    this.transaction(() => {
+      const run = (sql: string, ...params: unknown[]) => this.db.prepare(sql).run(...params);
+
+      // The fictional friend and everything crawled from her site
+      run(
+        'DELETE FROM friends WHERE id = ? AND site_url = ? AND display_name = ?',
+        LEGACY_DEMO_FRIEND.id,
+        LEGACY_DEMO_FRIEND.siteUrl,
+        LEGACY_DEMO_FRIEND.displayName
+      );
+      run('DELETE FROM network_feed WHERE friend_site_url = ?', DEMO_PEER_SITE_URL);
+      run('DELETE FROM endorsements WHERE author_site_url = ?', DEMO_PEER_SITE_URL);
+      run('DELETE FROM site_keys WHERE site_url = ?', DEMO_PEER_SITE_URL);
+      run('DELETE FROM moderation WHERE site_url = ?', DEMO_PEER_SITE_URL);
+
+      run('DELETE FROM webrings WHERE id = ? AND hub_url = ?', LEGACY_DEMO_WEBRING.id, LEGACY_DEMO_WEBRING.hubUrl);
+      for (const item of LEGACY_DEMO_ITEMS) {
+        run('DELETE FROM items WHERE id = ? AND title = ?', item.id, item.title);
+      }
+      for (const photo of LEGACY_DEMO_PHOTOS) {
+        run('DELETE FROM photos WHERE id = ? AND url = ? AND album_id = ?', photo.id, photo.url, LEGACY_DEMO_ALBUM.id);
+      }
+      run(
+        `DELETE FROM albums WHERE id = ? AND title = ?
+           AND NOT EXISTS (SELECT 1 FROM photos WHERE album_id = albums.id)`,
+        LEGACY_DEMO_ALBUM.id,
+        LEGACY_DEMO_ALBUM.title
+      );
+
+      // Reset sample profile fields the user never changed
+      const legacy = LEGACY_DEMO_PROFILE;
+      const resets: Array<[string, string, string]> = [
+        ['site_url', legacy.siteUrl, PLACEHOLDER_SITE_URL],
+        ['handle', legacy.handle, new URL(PLACEHOLDER_SITE_URL).hostname],
+        ['display_name', legacy.displayName, PLACEHOLDER_DISPLAY_NAME],
+        ['tagline', legacy.tagline, ''],
+        ['bio', legacy.bio, ''],
+        ['location', legacy.location, ''],
+        ['avatar_url', legacy.avatarUrl, ''],
+        ['banner_url', legacy.bannerUrl, ''],
+        ['interests_json', JSON.stringify(legacy.interests), '[]'],
+        ['atproto_handle', legacy.atprotoHandle, ''],
+      ];
+      for (const [column, seeded, replacement] of resets) {
+        run(`UPDATE profile SET ${column} = ? WHERE id = 1 AND ${column} = ?`, replacement, seeded);
+      }
+
+      this.db
+        .prepare('UPDATE profile SET publish_settings_json = ? WHERE id = 1')
+        .run(JSON.stringify({ ...this.readStoredPublishSettings(), legacyDemoContentRemoved: true }));
+    });
+  }
+
+  /**
+   * The old "publish webring hub" setting published an unsigned api/webring-hub.json listing the
+   * user plus their public friends. Convert it, once, into a hosted ring at the same path with the
+   * same members, so existing links keep working.
+   */
+  private migrateLegacyHub(): void {
+    const profile = this.getProfile();
+    if (!profile.publishSettings.publishWebringHub || profile.publishSettings.legacyHubMigrated) {
+      return;
+    }
+    const existing = this.db
+      .prepare("SELECT id FROM hosted_rings WHERE hub_path = 'api/webring-hub.json'")
+      .get();
+    if (!existing) {
+      const ring = this.createHostedRing({
+        name: `${profile.displayName}'s Webring Circle`,
+        description: `Federated friend ring maintained by ${profile.displayName}`,
+        hubPath: 'api/webring-hub.json',
+      });
+      for (const friend of this.getFriends().filter((f) => f.visibility === 'public')) {
+        this.addRingMember(ring.id, {
+          siteUrl: friend.siteUrl,
+          displayName: friend.displayName,
+          did: friend.did || siteUrlToDidWeb(friend.siteUrl),
+          keyFingerprint: friend.pinnedPublicKeyPem ? publicKeyFingerprint(friend.pinnedPublicKeyPem) : '',
+          joinedAt: friend.addedAt,
+        });
+      }
+    }
+    const row = this.db.prepare('SELECT publish_settings_json FROM profile WHERE id = 1').get() as {
+      publish_settings_json: string;
+    };
+    const stored = JSON.parse(String(row.publish_settings_json || '{}'));
+    this.db
+      .prepare('UPDATE profile SET publish_settings_json = ? WHERE id = 1')
+      .run(JSON.stringify({ ...stored, publishWebringHub: false, legacyHubMigrated: true }));
+  }
+
+  /**
+   * Encrypts a plaintext private key (new or from an older build) once a cipher is available.
+   */
+  private sealPrivateKeyAtRest(): void {
+    if (!this.keyCipher?.isAvailable()) return;
+    const row = this.db.prepare('SELECT private_key_pem FROM profile WHERE id = 1').get() as
+      | { private_key_pem: string }
+      | undefined;
+    if (!row || isEncryptedKey(row.private_key_pem)) return;
+    this.db
+      .prepare('UPDATE profile SET private_key_pem = ? WHERE id = 1')
+      .run(sealPrivateKey(row.private_key_pem, this.keyCipher));
+  }
+
+  private readStoredPublishSettings(): Record<string, unknown> {
+    const row = this.db.prepare('SELECT publish_settings_json FROM profile WHERE id = 1').get() as
+      | { publish_settings_json: string }
+      | undefined;
+    return JSON.parse(String(row?.publish_settings_json || '{}'));
+  }
+
+  /** Encrypts plaintext publishing credentials (from older builds or the MCP CLI) once a cipher is available. */
+  private sealPublishSecretsAtRest(): void {
+    if (!this.keyCipher?.isAvailable()) return;
+    const stored = this.readStoredPublishSettings();
+    let changed = false;
+    for (const field of SECRET_PUBLISH_FIELDS) {
+      const value = stored[field];
+      if (typeof value === 'string' && value && !isEncryptedKey(value)) {
+        stored[field] = sealSecret(value, this.keyCipher);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.db
+        .prepare('UPDATE profile SET publish_settings_json = ? WHERE id = 1')
+        .run(JSON.stringify(stored));
+    }
+  }
+
+  /**
+   * The real publishing credentials, decrypted. Only the publisher should call this, right before
+   * connecting. Throws KeyVaultUnavailableError outside the app (where nothing can publish anyway).
+   */
+  public getPublishCredentials(): { password: string; githubToken: string } {
+    const stored = this.readStoredPublishSettings();
+    const open = (field: SecretPublishField) => {
+      const value = stored[field];
+      return typeof value === 'string' && value ? openSecret(value, this.keyCipher) : '';
+    };
+    return { password: open('password'), githubToken: open('githubToken') };
+  }
+
+  /**
+   * Fills placeholder or missing credentials in `settings` with the stored ones, so settings that
+   * came from the (masked) Publish form can be used to connect.
+   */
+  public withStoredCredentials<T extends Partial<PublishSettings>>(settings: T): T {
+    const needsStored = SECRET_PUBLISH_FIELDS.some(
+      (field) => settings[field] === undefined || settings[field] === STORED_SECRET_PLACEHOLDER
+    );
+    if (!needsStored) return settings;
+    const credentials = this.getPublishCredentials();
+    const result = { ...settings };
+    for (const field of SECRET_PUBLISH_FIELDS) {
+      if (result[field] === undefined || result[field] === STORED_SECRET_PLACEHOLDER) {
+        result[field] = credentials[field];
+      }
+    }
+    return result;
+  }
+
+  private initializeSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS profile (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        site_url TEXT NOT NULL,
+        handle TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        tagline TEXT NOT NULL DEFAULT '',
+        bio TEXT NOT NULL DEFAULT '',
+        location TEXT NOT NULL DEFAULT '',
+        avatar_url TEXT NOT NULL DEFAULT '',
+        banner_url TEXT NOT NULL DEFAULT '',
+        interests_json TEXT NOT NULL DEFAULT '[]',
+        custom_links_json TEXT NOT NULL DEFAULT '[]',
+        theme TEXT NOT NULL DEFAULT 'neo-webring',
+        atproto_handle TEXT NOT NULL DEFAULT '',
+        public_key_pem TEXT NOT NULL,
+        private_key_pem TEXT NOT NULL,
+        publish_settings_json TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS albums (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        cover_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS photos (
+        id TEXT PRIMARY KEY,
+        album_id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        thumb_url TEXT NOT NULL,
+        local_source_path TEXT NOT NULL DEFAULT '',
+        caption TEXT NOT NULL DEFAULT '',
+        alt_text TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        width INTEGER,
+        height INTEGER,
+        taken_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS items (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        target_url TEXT NOT NULL,
+        target_author_url TEXT NOT NULL DEFAULT '',
+        target_author_name TEXT NOT NULL DEFAULT '',
+        via_url TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL DEFAULT 'general',
+        commentary TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        rating INTEGER,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS friends (
+        id TEXT PRIMARY KEY,
+        site_url TEXT NOT NULL UNIQUE,
+        did TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL,
+        handle TEXT NOT NULL DEFAULT '',
+        avatar_url TEXT NOT NULL DEFAULT '',
+        bio TEXT NOT NULL DEFAULT '',
+        relationship_json TEXT NOT NULL DEFAULT '["friend"]',
+        visibility TEXT NOT NULL DEFAULT 'private',
+        pinned_public_key_pem TEXT NOT NULL DEFAULT '',
+        key_status TEXT NOT NULL DEFAULT 'unverified',
+        last_crawled_at TEXT,
+        added_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS webrings (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        hub_url TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL DEFAULT '',
+        prev_site_url TEXT NOT NULL DEFAULT '',
+        next_site_url TEXT NOT NULL DEFAULT '',
+        joined_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS endorsements (
+        id TEXT PRIMARY KEY,
+        target_canonical_url TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        author_avatar_url TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        source_item_url TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS network_feed (
+        id TEXT PRIMARY KEY,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL,
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        friend_did TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        canonical_url TEXT NOT NULL UNIQUE,
+        target_url TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS site_keys (
+        site_url TEXT PRIMARY KEY,
+        did TEXT NOT NULL DEFAULT '',
+        public_key_pem TEXT NOT NULL,
+        key_status TEXT NOT NULL DEFAULT 'pinned',
+        first_seen_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS hosted_rings (
+        id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        hub_path TEXT NOT NULL UNIQUE,
+        maintainer_is_member INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ring_members (
+        ring_id TEXT NOT NULL,
+        site_url TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        did TEXT NOT NULL DEFAULT '',
+        key_fingerprint TEXT NOT NULL DEFAULT '',
+        position INTEGER NOT NULL DEFAULT 0,
+        joined_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        last_verified_at TEXT,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        hidden INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (ring_id, site_url)
+      );
+
+      CREATE TABLE IF NOT EXISTS ring_bans (
+        ring_id TEXT NOT NULL,
+        site_url TEXT NOT NULL,
+        did TEXT NOT NULL DEFAULT '',
+        key_fingerprint TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (ring_id, site_url)
+      );
+
+      CREATE TABLE IF NOT EXISTS publish_ledger (
+        destination TEXT NOT NULL,
+        path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        PRIMARY KEY (destination, path)
+      );
+
+      CREATE TABLE IF NOT EXISTS moderation (
+        site_url TEXT PRIMARY KEY,
+        action TEXT NOT NULL CHECK (action IN ('mute', 'block')),
+        created_at TEXT NOT NULL
+      );
+
+      -- Local-only preferences (never exported), e.g. how long friends' posts stay in the feed
+      CREATE TABLE IF NOT EXISTS local_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      -- When each of our published documents last changed, so republishing unchanged content
+      -- gives byte-identical files (stable ETags for friends, nothing to re-upload)
+      CREATE TABLE IF NOT EXISTS published_documents (
+        key TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      -- HTTP validators for friends' JSON files, so unchanged files aren't downloaded again
+      CREATE TABLE IF NOT EXISTS fetch_cache (
+        url TEXT PRIMARY KEY,
+        site_url TEXT NOT NULL,
+        etag TEXT NOT NULL DEFAULT '',
+        last_modified TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        fingerprint TEXT NOT NULL DEFAULT ''
+      );
+
+      -- Friends' posts and photos the user saved: a private copy, kept beyond the feed window
+      CREATE TABLE IF NOT EXISTS saved_posts (
+        id TEXT PRIMARY KEY,
+        canonical_url TEXT NOT NULL UNIQUE,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL DEFAULT '',
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        commentary TEXT NOT NULL DEFAULT '',
+        target_url TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        local_media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        saved_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+
+      -- People who added this persona as a friend (a signed link they sent, or their signed
+      -- connections.json seen while syncing). Local only, never exported.
+      CREATE TABLE IF NOT EXISTS friend_notices (
+        site_url TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        avatar_url TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL CHECK (source IN ('link', 'ring')),
+        ring_name TEXT NOT NULL DEFAULT '',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        dismissed_at TEXT
+      );
+    `);
+
+    // Safe migration for existing databases lacking friends.visibility or TOFU key pinning columns
+    const columns = this.db
+      .prepare('PRAGMA table_info(friends)')
+      .all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === 'visibility')) {
+      this.db.exec(`ALTER TABLE friends ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private';`);
+    }
+    if (!columns.some((c) => c.name === 'pinned_public_key_pem')) {
+      this.db.exec(`ALTER TABLE friends ADD COLUMN pinned_public_key_pem TEXT NOT NULL DEFAULT '';`);
+    }
+    if (!columns.some((c) => c.name === 'key_status')) {
+      this.db.exec(`ALTER TABLE friends ADD COLUMN key_status TEXT NOT NULL DEFAULT 'unverified';`);
+    }
+    // When a friend's verified connections.json last listed this persona (local only, never exported)
+    if (!columns.some((c) => c.name === 'lists_me_at')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN lists_me_at TEXT;');
+    }
+    // Sync backoff for unreachable friends (local only, never exported)
+    if (!columns.some((c) => c.name === 'sync_failures')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN sync_failures INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!columns.some((c) => c.name === 'retry_after')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN retry_after TEXT;');
+    }
+    // Saved copies of friends' small documents (manifest, did.json, profile), used when the host answers 304
+    const fetchCacheColumns = this.db.prepare('PRAGMA table_info(fetch_cache)').all() as Array<{ name: string }>;
+    if (!fetchCacheColumns.some((c) => c.name === 'body')) {
+      this.db.exec("ALTER TABLE fetch_cache ADD COLUMN body TEXT NOT NULL DEFAULT '';");
+    }
+    // Fingerprint of the copy last verified, compared with the friend's manifest `documents`
+    if (!fetchCacheColumns.some((c) => c.name === 'fingerprint')) {
+      this.db.exec("ALTER TABLE fetch_cache ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';");
+    }
+    // Sync prunes by friend and by date; without these each prune scans the whole feed
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_network_feed_friend ON network_feed(friend_site_url);
+      CREATE INDEX IF NOT EXISTS idx_network_feed_created ON network_feed(created_at);
+      CREATE INDEX IF NOT EXISTS idx_endorsements_author ON endorsements(author_site_url);
+    `);
+
+    // Album cards: a friend's album is one row, and its photos are rows linked to it by album_url
+    const feedColumns = this.db.prepare('PRAGMA table_info(network_feed)').all() as Array<{ name: string }>;
+    const addFeedColumn = (name: string, ddl: string) => {
+      if (feedColumns.some((c) => c.name === name)) return false;
+      this.db.exec(`ALTER TABLE network_feed ADD COLUMN ${name} ${ddl};`);
+      return true;
+    };
+    // The next sync reprocesses every friend's albums, turning per-photo rows into album cards
+    if (addFeedColumn('album_url', "TEXT NOT NULL DEFAULT ''")) this.clearFetchCache();
+    addFeedColumn('photo_count', 'INTEGER NOT NULL DEFAULT 0');
+    addFeedColumn('new_count', 'INTEGER NOT NULL DEFAULT 0');
+    addFeedColumn('peek_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_network_feed_album ON network_feed(album_url);');
+
+    // Joined-ring tracking. Rows that predate it become 'legacy' (still published, never auto-removed)
+    const ringColumns = this.db
+      .prepare('PRAGMA table_info(webrings)')
+      .all() as Array<{ name: string }>;
+    const addRingColumn = (name: string, ddl: string) => {
+      if (!ringColumns.some((c) => c.name === name)) {
+        this.db.exec(`ALTER TABLE webrings ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addRingColumn('status', "TEXT NOT NULL DEFAULT 'legacy'");
+    addRingColumn('maintainer_url', "TEXT NOT NULL DEFAULT ''");
+    addRingColumn('maintainer_did', "TEXT NOT NULL DEFAULT ''");
+    addRingColumn('member_count', 'INTEGER NOT NULL DEFAULT 0');
+    addRingColumn('directory_url', "TEXT NOT NULL DEFAULT ''");
+    addRingColumn('rotation_urls', "TEXT NOT NULL DEFAULT '[]'");
+    addRingColumn('hub_verified', 'INTEGER NOT NULL DEFAULT 0');
+    addRingColumn('hub_updated_at', 'TEXT');
+    addRingColumn('last_synced_at', 'TEXT');
+    addRingColumn('request_token', "TEXT NOT NULL DEFAULT ''");
+    addRingColumn('sync_warning', "TEXT NOT NULL DEFAULT ''");
+
+    // Hosted ring pages: a chosen address ('' = rings/<slug>/) and their design
+    const addColumns = (table: string, columns: Array<[string, string]>) => {
+      const existing = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      for (const [name, ddl] of columns) {
+        if (!existing.some((c) => c.name === name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addColumns('hosted_rings', [
+      ['directory_path', "TEXT NOT NULL DEFAULT ''"],
+      ['tagline', "TEXT NOT NULL DEFAULT ''"],
+      ['rules', "TEXT NOT NULL DEFAULT ''"],
+      ['banner_url', "TEXT NOT NULL DEFAULT ''"],
+      ['accent', "TEXT NOT NULL DEFAULT ''"],
+    ]);
+    addColumns('ring_members', [
+      ['avatar_url', "TEXT NOT NULL DEFAULT ''"],
+      ['tagline', "TEXT NOT NULL DEFAULT ''"],
+    ]);
+
+    // Site Design: look & feel options and the page's content blocks (JSON; empty = defaults)
+    const profileColumns = this.db.prepare('PRAGMA table_info(profile)').all() as Array<{ name: string }>;
+    for (const column of ['appearance_json', 'layout_json']) {
+      if (!profileColumns.some((c) => c.name === column)) {
+        this.db.exec(`ALTER TABLE profile ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+      }
+    }
+
+    // Media Library: the exact published files behind each local photo
+    const photoColumns = this.db
+      .prepare('PRAGMA table_info(photos)')
+      .all() as Array<{ name: string }>;
+    const addPhotoColumn = (name: string, ddl: string) => {
+      if (!photoColumns.some((c) => c.name === name)) {
+        this.db.exec(`ALTER TABLE photos ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addPhotoColumn('sha256', "TEXT NOT NULL DEFAULT ''");
+    addPhotoColumn('byte_size', 'INTEGER');
+    addPhotoColumn('mime_type', "TEXT NOT NULL DEFAULT ''");
+    addPhotoColumn('thumb_sha256', "TEXT NOT NULL DEFAULT ''");
+    addPhotoColumn('thumb_byte_size', 'INTEGER');
+    addPhotoColumn('thumb_width', 'INTEGER');
+    addPhotoColumn('thumb_height', 'INTEGER');
+    addPhotoColumn('position', 'INTEGER NOT NULL DEFAULT 0');
+
+    // Album cards: a stable page address plus feed and display settings
+    const albumColumns = this.db.prepare('PRAGMA table_info(albums)').all() as Array<{ name: string }>;
+    const addAlbumColumn = (name: string, ddl: string) => {
+      if (!albumColumns.some((c) => c.name === name)) {
+        this.db.exec(`ALTER TABLE albums ADD COLUMN ${name} ${ddl};`);
+      }
+    };
+    addAlbumColumn('slug', 'TEXT');
+    addAlbumColumn('post_to_feed', 'INTEGER NOT NULL DEFAULT 1');
+    addAlbumColumn('display', "TEXT NOT NULL DEFAULT 'card'");
+    const unslugged = this.db
+      .prepare('SELECT id, title FROM albums WHERE slug IS NULL ORDER BY created_at ASC')
+      .all() as Array<{ id: string; title: string }>;
+    for (const row of unslugged) {
+      this.db.prepare('UPDATE albums SET slug = ? WHERE id = ?').run(this.uniqueAlbumSlug(row.title), row.id);
+    }
+
+    // Edited items keep their id and canonical URL; updated_at records the last edit
+    const itemColumns = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
+    if (!itemColumns.some((c) => c.name === 'updated_at')) {
+      this.db.exec('ALTER TABLE items ADD COLUMN updated_at TEXT;');
+    }
+
+    // One pinned key per site, shared by friends, ring hubs, applicants and members
+    this.db.exec(`
+      INSERT OR IGNORE INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
+      SELECT site_url, did, pinned_public_key_pem,
+             CASE WHEN key_status = 'changed' THEN 'changed' ELSE 'pinned' END, added_at
+      FROM friends WHERE pinned_public_key_pem != '';
+    `);
+
+    this.migrateLegacyAbsoluteCustomLinks();
+  }
+
+  /**
+   * Early builds seeded the default "My Webring Feed" / "DID Identity" custom links as root-absolute
+   * paths (e.g. `/api/manifest.json`). Those 404 once the site is exported to a subfolder (e.g. a
+   * GitHub Pages project site at `username.github.io/repo-name/`), since the browser resolves them
+   * against the domain root instead of the page's own folder. Rewrites them to relative paths
+   * in-place for any already-seeded profile; leaves anything the user customized untouched.
+   */
+  private migrateLegacyAbsoluteCustomLinks(): void {
+    const legacyToFixed: Record<string, string> = {
+      '/api/manifest.json': './api/manifest.json',
+      '/.well-known/did.json': './.well-known/did.json',
+    };
+    const row = this.db
+      .prepare('SELECT custom_links_json FROM profile WHERE id = 1')
+      .get() as { custom_links_json?: string } | undefined;
+    if (!row?.custom_links_json) return;
+
+    let links: Array<{ label: string; url: string }>;
+    try {
+      links = JSON.parse(row.custom_links_json);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(links)) return;
+
+    let changed = false;
+    const fixedLinks = links.map((link) => {
+      if (link && typeof link.url === 'string' && legacyToFixed[link.url]) {
+        changed = true;
+        return { ...link, url: legacyToFixed[link.url] };
+      }
+      return link;
+    });
+
+    if (changed) {
+      this.db
+        .prepare('UPDATE profile SET custom_links_json = ? WHERE id = 1')
+        .run(JSON.stringify(fixedLinks));
+    }
+  }
+
+  private ensureDefaultProfile(options?: StudioDatabaseOptions): void {
+    const existing = this.db.prepare('SELECT id FROM profile WHERE id = 1').get();
+    if (!existing) {
+      const { publicKeyPem, privateKeyPem } = generateIdentityKeyPair();
+      const now = new Date().toISOString();
+      const init = options?.initialProfile;
+
+      // New profiles start empty: a placeholder address the user replaces with their real site
+      const siteUrl = normalizeSiteUrl(init?.siteUrl || PLACEHOLDER_SITE_URL);
+      let defaultHandle = init?.handle || '';
+      if (!defaultHandle) {
+        try {
+          defaultHandle = new URL(siteUrl).hostname;
+        } catch {
+          defaultHandle = new URL(PLACEHOLDER_SITE_URL).hostname;
+        }
+      }
+
+      const defaultInterests = init?.interests || [];
+      // Relative, not root-absolute: these must still resolve correctly when the exported site is
+      // hosted in a subfolder (e.g. a GitHub Pages project site at username.github.io/repo-name/).
+      const defaultLinks = [
+        { label: 'My Webring Feed', url: './api/manifest.json' },
+        { label: 'DID Identity', url: './.well-known/did.json' },
+      ];
+      this.db
+        .prepare(
+          `INSERT INTO profile (
+            id, site_url, handle, display_name, tagline, bio, location,
+            avatar_url, banner_url, interests_json, custom_links_json,
+            theme, atproto_handle, public_key_pem, private_key_pem, publish_settings_json, updated_at
+          ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          siteUrl,
+          defaultHandle,
+          init?.displayName || PLACEHOLDER_DISPLAY_NAME,
+          init?.tagline ?? '',
+          init?.bio ?? '',
+          init?.location ?? '',
+          init?.avatarUrl ?? '',
+          init?.bannerUrl ?? '',
+          JSON.stringify(defaultInterests),
+          JSON.stringify(defaultLinks),
+          init?.theme || 'neo-webring',
+          init?.atprotoHandle ?? '',
+          publicKeyPem,
+          privateKeyPem,
+          JSON.stringify({
+            exportPath: options?.defaultExportPath || '',
+            protocol: 'sftp',
+            host: '',
+            port: 22,
+            username: '',
+            remotePath: '/var/www/html',
+            atprotoPdsUrl: 'https://bsky.social',
+            publishFriendsList: false,
+            stripRelationshipTags: true,
+            publishEndorsements: false,
+            publishWebringHub: false,
+            redactItemSourceAuthors: false,
+          }),
+          now
+        );
+    }
+  }
+
+  public getProfile(): ProfileDocument & { publicKeyPem: string; publishSettings: PublishSettings } {
+    const row = this.db.prepare('SELECT * FROM profile WHERE id = 1').get() as Record<string, unknown>;
+    const siteUrl = normalizeSiteUrl(String(row.site_url));
+    const did = siteUrlToDidWeb(siteUrl);
+    const storedPublish = JSON.parse(String(row.publish_settings_json || '{}'));
+    const publishSettings: PublishSettings = {
+      exportPath: '',
+      protocol: 'sftp',
+      host: '',
+      port: 22,
+      username: '',
+      password: '',
+      remotePath: '/var/www/html',
+      atprotoPdsUrl: 'https://bsky.social',
+      publishFriendsList: false,
+      stripRelationshipTags: true,
+      publishEndorsements: false,
+      publishWebringHub: false,
+      redactItemSourceAuthors: false,
+      commentProvider: 'none',
+      giscusRepo: '',
+      giscusRepoId: '',
+      giscusCategory: 'General',
+      giscusCategoryId: '',
+      analyticsEnabled: false,
+      analyticsMeasurementId: '',
+      analyticsRespectDnt: true,
+      analyticsAnonymizeIp: true,
+      analyticsTrackRingInteractions: true,
+      adsEnabled: false,
+      adsPublisherId: '',
+      adsEnableAutoAds: true,
+      adsGenerateAdsTxt: true,
+      adsHeaderSlotId: '',
+      adsInFeedSlotId: '',
+      adsFooterSlotId: '',
+      githubOwner: '',
+      githubRepo: '',
+      githubBranch: 'gh-pages',
+      githubToken: '',
+      githubCustomDomain: '',
+      ...storedPublish,
+    };
+    // Credentials never leave the database in readable form; see getPublishCredentials()
+    for (const field of SECRET_PUBLISH_FIELDS) {
+      publishSettings[field] = storedPublish[field] ? STORED_SECRET_PLACEHOLDER : '';
+    }
+
+    const commentConfig =
+      publishSettings.commentProvider && publishSettings.commentProvider !== 'none'
+        ? {
+            provider: publishSettings.commentProvider,
+            giscusRepo: publishSettings.giscusRepo || '',
+            giscusRepoId: publishSettings.giscusRepoId || '',
+            giscusCategory: publishSettings.giscusCategory || 'General',
+            giscusCategoryId: publishSettings.giscusCategoryId || '',
+          }
+        : undefined;
+
+    const cleanGa4Id = (publishSettings.analyticsMeasurementId || '').trim().toUpperCase();
+    const analyticsAddon: AnalyticsAddon | undefined =
+      publishSettings.analyticsEnabled && isValidGa4MeasurementId(cleanGa4Id)
+        ? {
+            enabled: true,
+            measurementId: cleanGa4Id,
+            respectDoNotTrack: publishSettings.analyticsRespectDnt !== false,
+            anonymizeIp: publishSettings.analyticsAnonymizeIp !== false,
+            trackRingInteractions: publishSettings.analyticsTrackRingInteractions !== false,
+          }
+        : undefined;
+
+    const cleanPubId = normalizeAdSensePublisherId(publishSettings.adsPublisherId);
+    const adsAddon: AdsAddon | undefined =
+      publishSettings.adsEnabled && cleanPubId
+        ? {
+            enabled: true,
+            publisherId: cleanPubId,
+            enableAutoAds: publishSettings.adsEnableAutoAds !== false,
+            generateAdsTxt: publishSettings.adsGenerateAdsTxt !== false,
+            headerSlotId: isValidAdSlotId(publishSettings.adsHeaderSlotId)
+              ? publishSettings.adsHeaderSlotId!.trim()
+              : '',
+            inFeedSlotId: isValidAdSlotId(publishSettings.adsInFeedSlotId)
+              ? publishSettings.adsInFeedSlotId!.trim()
+              : '',
+            footerSlotId: isValidAdSlotId(publishSettings.adsFooterSlotId)
+              ? publishSettings.adsFooterSlotId!.trim()
+              : '',
+          }
+        : undefined;
+
+    return {
+      schemaVersion: WEBRING_SCHEMA_VERSION,
+      did,
+      siteUrl,
+      handle: String(row.handle),
+      displayName: String(row.display_name),
+      tagline: String(row.tagline || ''),
+      bio: String(row.bio || ''),
+      location: String(row.location || ''),
+      avatarUrl: String(row.avatar_url || ''),
+      bannerUrl: String(row.banner_url || ''),
+      interests: JSON.parse(String(row.interests_json || '[]')),
+      customLinks: JSON.parse(String(row.custom_links_json || '[]')),
+      theme: ProfileThemeSchema.catch('neo-webring').parse(row.theme),
+      ...readDesign(row),
+      atprotoHandle: String(row.atproto_handle || ''),
+      commentConfig,
+      analyticsAddon,
+      adsAddon,
+      updatedAt: String(row.updated_at),
+      publicKeyPem: String(row.public_key_pem),
+      publishSettings,
+    };
+  }
+
+  public getKeys(): { publicKeyPem: string; privateKeyPem: string } {
+    const row = this.db
+      .prepare('SELECT public_key_pem, private_key_pem FROM profile WHERE id = 1')
+      .get() as { public_key_pem: string; private_key_pem: string };
+    return {
+      publicKeyPem: row.public_key_pem,
+      privateKeyPem: openPrivateKey(row.private_key_pem, this.keyCipher),
+    };
+  }
+
+  /**
+   * Signed key rotation certificates for this persona's current site URL, published in did.json
+   * and manifest.json so peers who pinned an earlier key can verify the rotation chain.
+   */
+  public getKeyRotations(): KeyRotationCertificate[] {
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'keyRotationsJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return [];
+    try {
+      const parsed = JSON.parse(row.value);
+      if (!Array.isArray(parsed)) return [];
+      const siteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
+      const did = siteUrlToDidWeb(siteUrl);
+      const valid: KeyRotationCertificate[] = [];
+      for (const item of parsed) {
+        const res = KeyRotationCertificateSchema.safeParse(item);
+        if (res.success && normalizeSiteUrl(res.data.siteUrl) === siteUrl && res.data.did === did) {
+          valid.push(res.data);
+        }
+      }
+      return valid;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Generates a fresh Ed25519 signing keypair for this persona, signs a KeyRotationCertificate
+   * with the previous private key endorsing the new public key, seals the new private key in the
+   * OS keychain, and clears published document stamps so the next publish re-signs everything.
+   */
+  public rotateSigningKeys(): {
+    publicKeyPem: string;
+    publicKeyFingerprint: string;
+    rotationCertificate: KeyRotationCertificate;
+    rotationCount: number;
+  } {
+    const profile = this.getProfile();
+    const { publicKeyPem: oldPublicKeyPem, privateKeyPem: oldPrivateKeyPem } = this.getKeys();
+    const { publicKeyPem: newPublicKeyPem, privateKeyPem: newPrivateKeyPem } =
+      generateIdentityKeyPair();
+    const now = new Date().toISOString();
+
+    const cert = createKeyRotationCertificate({
+      siteUrl: profile.siteUrl,
+      oldPublicKeyPem,
+      oldPrivateKeyPem,
+      newPublicKeyPem,
+      rotatedAt: now,
+    });
+
+    const existing = this.getKeyRotations();
+    const updatedRotations = [...existing, cert].slice(-10);
+    const sealedNewPrivate = sealPrivateKey(newPrivateKeyPem, this.keyCipher);
+
+    this.transaction(() => {
+      this.db
+        .prepare('UPDATE profile SET public_key_pem = ?, private_key_pem = ?, updated_at = ? WHERE id = 1')
+        .run(newPublicKeyPem, sealedNewPrivate, now);
+      this.db
+        .prepare(
+          "INSERT INTO local_settings (key, value) VALUES ('keyRotationsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
+        .run(JSON.stringify(updatedRotations));
+      this.db.exec('DELETE FROM published_documents');
+    });
+
+    return {
+      publicKeyPem: newPublicKeyPem,
+      publicKeyFingerprint: publicKeyFingerprint(newPublicKeyPem),
+      rotationCertificate: cert,
+      rotationCount: updatedRotations.length,
+    };
+  }
+
+  public updateProfile(updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> }): ProfileDocument {
+    const current = this.getProfile();
+    const siteUrl = updates.siteUrl ? normalizeSiteUrl(updates.siteUrl) : current.siteUrl;
+    const now = new Date().toISOString();
+
+    const mergedPublish: Record<string, unknown> = {
+      ...current.publishSettings,
+      ...(updates.publishSettings || {}),
+    };
+    // current.publishSettings carries placeholders; store sealed values instead
+    const storedPublish = this.readStoredPublishSettings();
+    for (const field of SECRET_PUBLISH_FIELDS) {
+      const incoming = updates.publishSettings?.[field];
+      if (incoming === undefined || incoming === STORED_SECRET_PLACEHOLDER) {
+        mergedPublish[field] = storedPublish[field] || '';
+      } else {
+        mergedPublish[field] = incoming ? sealSecret(incoming, this.keyCipher) : '';
+      }
+    }
+
+    this.db
+      .prepare(
+        `UPDATE profile SET
+          site_url = ?,
+          handle = ?,
+          display_name = ?,
+          tagline = ?,
+          bio = ?,
+          location = ?,
+          avatar_url = ?,
+          banner_url = ?,
+          interests_json = ?,
+          custom_links_json = ?,
+          theme = ?,
+          atproto_handle = ?,
+          publish_settings_json = ?,
+          appearance_json = ?,
+          layout_json = ?,
+          updated_at = ?
+        WHERE id = 1`
+      )
+      .run(
+        siteUrl,
+        updates.handle ?? current.handle,
+        updates.displayName ?? current.displayName,
+        updates.tagline ?? current.tagline,
+        updates.bio ?? current.bio,
+        updates.location ?? current.location,
+        updates.avatarUrl ?? current.avatarUrl,
+        updates.bannerUrl ?? current.bannerUrl,
+        JSON.stringify(updates.interests ?? current.interests),
+        JSON.stringify(updates.customLinks ?? current.customLinks),
+        updates.theme ?? current.theme,
+        updates.atprotoHandle ?? current.atprotoHandle ?? '',
+        JSON.stringify(mergedPublish),
+        // Validated here, so whatever the UI or an MCP agent sends, only known, valid options are stored
+        JSON.stringify(
+          updates.appearance !== undefined ? AppearanceSchema.parse(updates.appearance) : current.appearance ?? {}
+        ),
+        updates.layout !== undefined
+          ? JSON.stringify(parseLayout(updates.layout))
+          : current.layout
+            ? JSON.stringify(current.layout)
+            : '',
+        now
+      );
+
+    return this.getProfile();
+  }
+
+  public getAlbums(): AlbumItem[] {
+    const profile = this.getProfile();
+    const albumRows = this.db
+      .prepare('SELECT * FROM albums ORDER BY created_at DESC')
+      .all() as Array<Record<string, unknown>>;
+
+    return albumRows.map((a) => {
+      const albumId = String(a.id);
+      const photoRows = this.db
+        .prepare('SELECT * FROM photos WHERE album_id = ? ORDER BY position ASC, created_at ASC')
+        .all(albumId) as Array<Record<string, unknown>>;
+
+      const photos: PhotoItem[] = photoRows.map((p) => {
+        const photoId = String(p.id);
+        return {
+          id: photoId,
+          canonicalUrl: buildCanonicalUrl(profile.siteUrl, 'photos', photoId),
+          url: String(p.url),
+          thumbUrl: String(p.thumb_url || p.url),
+          caption: String(p.caption || ''),
+          altText: String(p.alt_text || p.caption || ''),
+          tags: JSON.parse(String(p.tags_json || '[]')),
+          width: p.width ? Number(p.width) : undefined,
+          height: p.height ? Number(p.height) : undefined,
+          takenAt: p.taken_at ? String(p.taken_at) : undefined,
+          createdAt: String(p.created_at),
+          ...(p.sha256
+            ? {
+                sha256: String(p.sha256),
+                bytes: p.byte_size ? Number(p.byte_size) : undefined,
+                mimeType: String(p.mime_type || '') || undefined,
+                thumbSha256: String(p.thumb_sha256 || '') || undefined,
+                thumbBytes: p.thumb_byte_size ? Number(p.thumb_byte_size) : undefined,
+                thumbWidth: p.thumb_width ? Number(p.thumb_width) : undefined,
+                thumbHeight: p.thumb_height ? Number(p.thumb_height) : undefined,
+              }
+            : {}),
+        };
+      });
+
+      const coverUrl = String(a.cover_url || '') || (photos[0] ? photos[0].thumbUrl : '');
+
+      return {
+        id: albumId,
+        canonicalUrl: buildCanonicalUrl(profile.siteUrl, 'albums', albumId),
+        title: String(a.title),
+        description: String(a.description || ''),
+        coverUrl,
+        tags: JSON.parse(String(a.tags_json || '[]')),
+        photos,
+        createdAt: String(a.created_at),
+        updatedAt: String(a.updated_at),
+        manifestUrl: albumManifestPath(albumId),
+        slug: String(a.slug),
+        pageUrl: `albums/${String(a.slug)}/`,
+        postToFeed: a.post_to_feed !== 0,
+        display: albumDisplay({ display: String(a.display) }),
+      };
+    });
+  }
+
+  private uniqueAlbumSlug(title: string): string {
+    const base = slugifyAlbumTitle(title);
+    let slug = base;
+    for (let n = 2; this.db.prepare('SELECT 1 FROM albums WHERE slug = ?').get(slug); n++) {
+      slug = `${base}-${n}`;
+    }
+    return slug;
+  }
+
+  public createAlbum(input: {
+    title: string;
+    description?: string;
+    coverUrl?: string;
+    tags?: string[];
+    postToFeed?: boolean;
+    display?: AlbumDisplay;
+  }): AlbumItem {
+    const id = `album-${crypto.randomBytes(4).toString('hex')}`;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO albums (id, title, description, cover_url, tags_json, created_at, updated_at, slug, post_to_feed, display)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.title,
+        input.description || '',
+        input.coverUrl || '',
+        JSON.stringify(input.tags || []),
+        now,
+        now,
+        this.uniqueAlbumSlug(input.title),
+        input.postToFeed ? 1 : 0,
+        albumDisplay(input)
+      );
+
+    return this.getAlbums().find((a) => a.id === id)!;
+  }
+
+  public deleteAlbum(albumId: string): void {
+    this.db.prepare('DELETE FROM albums WHERE id = ?').run(albumId);
+  }
+
+  public addPhotoToAlbum(input: {
+    albumId: string;
+    url: string;
+    thumbUrl?: string;
+    localSourcePath?: string;
+    caption?: string;
+    tags?: string[];
+    width?: number;
+    height?: number;
+    altText?: string;
+    media?: LocalPhotoMedia;
+  }): PhotoItem {
+    const id = `photo-${crypto.randomBytes(4).toString('hex')}`;
+    const now = new Date().toISOString();
+    const media = input.media;
+    const url = media?.url || input.url;
+    const thumb = media?.thumbUrl || input.thumbUrl || url;
+    const next = this.db
+      .prepare('SELECT COALESCE(MAX(position), 0) + 1 AS n FROM photos WHERE album_id = ?')
+      .get(input.albumId) as { n: number };
+
+    this.db
+      .prepare(
+        `INSERT INTO photos (id, album_id, url, thumb_url, local_source_path, caption, alt_text, tags_json, width, height, taken_at, created_at, position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.albumId,
+        url,
+        thumb,
+        media?.originalPath || input.localSourcePath || '',
+        input.caption || '',
+        input.altText || input.caption || '',
+        JSON.stringify(input.tags || []),
+        media?.width ?? input.width ?? null,
+        media?.height ?? input.height ?? null,
+        now,
+        now,
+        next.n
+      );
+    if (media) this.writePhotoMedia(id, media);
+    this.touchAlbum(input.albumId);
+    return this.getPhoto(id)!;
+  }
+
+  public getPhoto(photoId: string): PhotoItem | undefined {
+    for (const album of this.getAlbums()) {
+      const photo = album.photos.find((p) => p.id === photoId);
+      if (photo) return photo;
+    }
+    return undefined;
+  }
+
+  public getPhotoAlbumId(photoId: string): string | undefined {
+    return this.photoAlbumId(photoId);
+  }
+
+  /** Local photos imported before the Media Library (no recorded hash yet). */
+  public getLegacyLocalPhotos(): Array<{ id: string; albumId: string; url: string }> {
+    return (
+      this.db
+        .prepare("SELECT id, album_id, url FROM photos WHERE url LIKE 'media/%' AND sha256 = ''")
+        .all() as Array<{ id: string; album_id: string; url: string }>
+    ).map((r) => ({ id: r.id, albumId: r.album_id, url: r.url }));
+  }
+
+  private photoAlbumId(photoId: string): string | undefined {
+    const row = this.db.prepare('SELECT album_id FROM photos WHERE id = ?').get(photoId) as
+      | { album_id: string }
+      | undefined;
+    return row?.album_id;
+  }
+
+  private touchAlbum(albumId: string | undefined): void {
+    if (!albumId) return;
+    this.db.prepare('UPDATE albums SET updated_at = ? WHERE id = ?').run(new Date().toISOString(), albumId);
+  }
+
+  private writePhotoMedia(photoId: string, media: LocalPhotoMedia): void {
+    this.db
+      .prepare(
+        `UPDATE photos SET url = ?, thumb_url = ?, local_source_path = ?, width = ?, height = ?,
+           sha256 = ?, byte_size = ?, mime_type = ?, thumb_sha256 = ?, thumb_byte_size = ?,
+           thumb_width = ?, thumb_height = ?
+         WHERE id = ?`
+      )
+      .run(
+        media.url,
+        media.thumbUrl,
+        media.originalPath,
+        media.width,
+        media.height,
+        media.sha256,
+        media.bytes,
+        media.mimeType,
+        media.thumbSha256,
+        media.thumbBytes,
+        media.thumbWidth,
+        media.thumbHeight,
+        photoId
+      );
+  }
+
+  /** Swaps a photo's image for a new one, keeping its id, caption and place in the album. */
+  public replacePhotoMedia(photoId: string, media: LocalPhotoMedia): PhotoItem {
+    if (!this.photoAlbumId(photoId)) throw new Error(`Photo "${photoId}" not found.`);
+    this.writePhotoMedia(photoId, media);
+    this.touchAlbum(this.photoAlbumId(photoId));
+    return this.getPhoto(photoId)!;
+  }
+
+  public updatePhotoDetails(
+    photoId: string,
+    updates: { caption?: string; altText?: string; tags?: string[] }
+  ): PhotoItem {
+    const current = this.getPhoto(photoId);
+    if (!current) throw new Error(`Photo "${photoId}" not found.`);
+    this.db
+      .prepare('UPDATE photos SET caption = ?, alt_text = ?, tags_json = ? WHERE id = ?')
+      .run(
+        updates.caption ?? current.caption,
+        updates.altText ?? current.altText,
+        JSON.stringify(updates.tags ?? current.tags),
+        photoId
+      );
+    this.touchAlbum(this.photoAlbumId(photoId));
+    return this.getPhoto(photoId)!;
+  }
+
+  public movePhoto(photoId: string, direction: 'up' | 'down'): void {
+    const albumId = this.photoAlbumId(photoId);
+    const album = this.getAlbums().find((a) => a.id === albumId);
+    if (!album) return;
+    const ids = album.photos.map((p) => p.id);
+    const idx = ids.indexOf(photoId);
+    const swap = direction === 'up' ? idx - 1 : idx + 1;
+    if (idx === -1 || swap < 0 || swap >= ids.length) return;
+    [ids[idx], ids[swap]] = [ids[swap], ids[idx]];
+    this.transaction(() => {
+      ids.forEach((id, i) => this.db.prepare('UPDATE photos SET position = ? WHERE id = ?').run(i + 1, id));
+    });
+    this.touchAlbum(albumId);
+  }
+
+  public updateAlbum(
+    albumId: string,
+    updates: {
+      title?: string;
+      description?: string;
+      tags?: string[];
+      coverUrl?: string;
+      postToFeed?: boolean;
+      display?: AlbumDisplay;
+    }
+  ): AlbumItem {
+    const current = this.getAlbums().find((a) => a.id === albumId);
+    if (!current) throw new Error(`Album "${albumId}" not found.`);
+    const storedCover = (this.db.prepare('SELECT cover_url FROM albums WHERE id = ?').get(albumId) as {
+      cover_url: string;
+    }).cover_url;
+    this.db
+      .prepare(
+        'UPDATE albums SET title = ?, description = ?, tags_json = ?, cover_url = ?, post_to_feed = ?, display = ?, updated_at = ? WHERE id = ?'
+      )
+      .run(
+        updates.title?.trim() || current.title,
+        updates.description ?? current.description,
+        JSON.stringify(updates.tags ?? current.tags),
+        updates.coverUrl ?? storedCover,
+        (updates.postToFeed ?? current.postToFeed) ? 1 : 0,
+        updates.display ?? albumDisplay(current),
+        new Date().toISOString(),
+        albumId
+      );
+    return this.getAlbums().find((a) => a.id === albumId)!;
+  }
+
+  public deletePhoto(photoId: string): void {
+    const albumId = this.photoAlbumId(photoId);
+    const photo = this.getPhoto(photoId);
+    this.db.prepare('DELETE FROM photos WHERE id = ?').run(photoId);
+    // Don't leave the album pointing at a cover that no longer exists
+    if (albumId && photo) {
+      this.db
+        .prepare("UPDATE albums SET cover_url = '' WHERE id = ? AND cover_url IN (?, ?)")
+        .run(albumId, photo.thumbUrl, photo.url);
+    }
+    this.touchAlbum(albumId);
+  }
+
+  /**
+   * Every Media Library file still in use: photos' web copies, thumbnails and originals, plus
+   * post images, album covers and profile images that point at library files.
+   */
+  public getLocalMediaReferences(): { urls: Set<string>; originals: Set<string> } {
+    const rows = this.db.prepare('SELECT url, thumb_url, local_source_path FROM photos').all() as Array<{
+      url: string;
+      thumb_url: string;
+      local_source_path: string;
+    }>;
+    const urls = new Set<string>();
+    const originals = new Set<string>();
+    for (const row of rows) {
+      if (row.url.startsWith('media/')) urls.add(row.url);
+      if (row.thumb_url.startsWith('media/')) urls.add(row.thumb_url);
+      if (row.local_source_path) originals.add(row.local_source_path);
+    }
+    // Post images, album covers and profile images can point at library files too
+    const others = [
+      ...(this.db.prepare("SELECT media_url AS u FROM items WHERE media_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT cover_url AS u FROM albums WHERE cover_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT avatar_url AS u FROM profile WHERE avatar_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT banner_url AS u FROM profile WHERE banner_url LIKE 'media/%'").all() as Array<{ u: string }>),
+      ...(this.db.prepare("SELECT banner_url AS u FROM hosted_rings WHERE banner_url LIKE 'media/%'").all() as Array<{ u: string }>),
+    ];
+    for (const { u } of others) urls.add(u);
+    return { urls, originals };
+  }
+
+  /**
+   * Signed manifests for every album: what's in it and the exact files (with hashes) behind each
+   * photo. Published at media/albums/<id>/manifest.json, next to the photos.
+   */
+  public buildSignedAlbumManifests(): Array<{ path: string; doc: AlbumManifest }> {
+    const albums = this.getAlbums();
+    if (albums.length === 0) return [];
+    const profile = this.getProfile();
+    const siteUrl = normalizeSiteUrl(profile.siteUrl);
+    const did = siteUrlToDidWeb(siteUrl);
+    const { privateKeyPem } = this.getKeys();
+    return albums.map((album) => {
+      const unsigned: AlbumManifest = {
+        schemaVersion: WEBRING_SCHEMA_VERSION,
+        type: 'webring-album-manifest',
+        siteUrl,
+        did,
+        updatedAt: album.updatedAt,
+        album: {
+          id: album.id,
+          canonicalUrl: album.canonicalUrl,
+          title: album.title,
+          description: album.description,
+          coverUrl: album.coverUrl,
+          tags: album.tags,
+          createdAt: album.createdAt,
+        },
+        photos: album.photos.map((p) => ({
+          id: p.id,
+          canonicalUrl: p.canonicalUrl,
+          caption: p.caption,
+          altText: p.altText,
+          tags: p.tags,
+          ...(p.takenAt ? { takenAt: p.takenAt } : {}),
+          createdAt: p.createdAt,
+          image: {
+            url: p.url,
+            ...(p.sha256 ? { sha256: p.sha256 } : {}),
+            ...(p.bytes ? { bytes: p.bytes } : {}),
+            ...(p.mimeType ? { mimeType: p.mimeType } : {}),
+            ...(p.width ? { width: p.width } : {}),
+            ...(p.height ? { height: p.height } : {}),
+          },
+          thumbnail: {
+            url: p.thumbUrl,
+            ...(p.thumbSha256 ? { sha256: p.thumbSha256 } : {}),
+            ...(p.thumbBytes ? { bytes: p.thumbBytes } : {}),
+            ...(p.mimeType ? { mimeType: p.mimeType } : {}),
+            ...(p.thumbWidth ? { width: p.thumbWidth } : {}),
+            ...(p.thumbHeight ? { height: p.thumbHeight } : {}),
+          },
+        })),
+      };
+      return { path: albumManifestPath(album.id), doc: signDocument(unsigned, did, privateKeyPem) };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Publish ledger: what Studio last put at each destination, so publishing can upload only
+  // changes and delete only files it created
+
+  public getPublishLedger(destination: string): Map<string, string> {
+    const rows = this.db
+      .prepare('SELECT path, sha256 FROM publish_ledger WHERE destination = ?')
+      .all(destination) as Array<{ path: string; sha256: string }>;
+    return new Map(rows.map((r) => [r.path, r.sha256]));
+  }
+
+  public setPublishLedgerEntry(destination: string, filePath: string, sha256: string | null): void {
+    if (sha256 === null) {
+      this.db.prepare('DELETE FROM publish_ledger WHERE destination = ? AND path = ?').run(destination, filePath);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO publish_ledger (destination, path, sha256, published_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(destination, path) DO UPDATE SET sha256 = excluded.sha256, published_at = excluded.published_at`
+      )
+      .run(destination, filePath, sha256, new Date().toISOString());
+  }
+
+  /** Forgets every destination's publish history, so the next publish anywhere uploads everything. */
+  public clearAllPublishLedgers(): void {
+    this.db.exec('DELETE FROM publish_ledger');
+  }
+
+  /** Forgets what was published to a destination, so the next publish uploads everything. */
+  public clearPublishLedger(destination: string): void {
+    this.db.prepare('DELETE FROM publish_ledger WHERE destination = ?').run(destination);
+  }
+
+  public getItems(): SharedItem[] {
+    const profile = this.getProfile();
+    const rows = this.db
+      .prepare('SELECT * FROM items ORDER BY created_at DESC')
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map((r) => {
+      const id = String(r.id);
+      const canonicalUrl = buildCanonicalUrl(profile.siteUrl, 'items', id);
+      // A post points at itself; one written before the site URL was set (or changed) still has
+      // its old address, so follow the current one
+      const storedTarget = String(r.target_url);
+      const targetUrl = storedTarget.endsWith(`/api/items.json#item-${id}`) ? canonicalUrl : storedTarget;
+      return {
+        id,
+        canonicalUrl,
+        type: (r.type as SharedItemType) || 'like',
+        title: String(r.title),
+        targetUrl,
+        targetAuthorUrl: r.target_author_url ? String(r.target_author_url) : undefined,
+        targetAuthorName: r.target_author_name ? String(r.target_author_name) : undefined,
+        viaUrl: r.via_url ? String(r.via_url) : undefined,
+        category: String(r.category || 'general'),
+        commentary: String(r.commentary || ''),
+        mediaUrl: String(r.media_url || ''),
+        rating: r.rating ? Number(r.rating) : undefined,
+        tags: JSON.parse(String(r.tags_json || '[]')),
+        createdAt: String(r.created_at),
+        ...(r.updated_at ? { updatedAt: String(r.updated_at) } : {}),
+      };
+    });
+  }
+
+  public createItem(input: {
+    type: SharedItemType;
+    title?: string;
+    targetUrl?: string;
+    targetAuthorUrl?: string;
+    targetAuthorName?: string;
+    viaUrl?: string;
+    category?: string;
+    commentary?: string;
+    mediaUrl?: string;
+    rating?: number;
+    tags?: string[];
+  }): SharedItem {
+    const id = `item-${crypto.randomBytes(4).toString('hex')}`;
+    const now = new Date().toISOString();
+    const profile = this.getProfile();
+    const selfCanonicalUrl = buildCanonicalUrl(profile.siteUrl, 'items', id);
+
+    const resolvedTargetUrl =
+      input.targetUrl && input.targetUrl.trim() ? input.targetUrl.trim() : selfCanonicalUrl;
+
+    const resolvedTitle = defaultItemTitle(input.type, input.title, input.commentary, input.targetAuthorName);
+
+    this.db
+      .prepare(
+        `INSERT INTO items (
+          id, type, title, target_url, target_author_url, target_author_name,
+          via_url, category, commentary, media_url, rating, tags_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.type,
+        resolvedTitle,
+        resolvedTargetUrl,
+        input.targetAuthorUrl || '',
+        input.targetAuthorName || '',
+        input.viaUrl || '',
+        input.category || (input.type === 'post' ? 'status' : input.type === 'comment' ? 'comment' : 'general'),
+        input.commentary || '',
+        input.mediaUrl || '',
+        input.rating ?? null,
+        JSON.stringify(input.tags || []),
+        now
+      );
+
+    return this.getItems().find((i) => i.id === id)!;
+  }
+
+  /**
+   * Edits one of the user's own items. Its id, canonical URL (which friends' likes and comments
+   * point at), type and creation time stay the same; `updatedAt` records the edit.
+   */
+  public updateItem(
+    itemId: string,
+    updates: {
+      title?: string;
+      targetUrl?: string;
+      targetAuthorUrl?: string;
+      targetAuthorName?: string;
+      category?: string;
+      commentary?: string;
+      mediaUrl?: string;
+      rating?: number | null;
+      tags?: string[];
+    }
+  ): SharedItem {
+    const current = this.getItems().find((i) => i.id === itemId);
+    if (!current) throw new Error(`Item "${itemId}" not found.`);
+    const text = (value: string | undefined, fallback: string) => (value === undefined ? fallback : value.trim());
+    const commentary = text(updates.commentary, current.commentary);
+    const targetAuthorName = text(updates.targetAuthorName, current.targetAuthorName || '');
+    // A title that was derived from the text follows the text, unless the user changed it
+    const wasDerived = current.title === defaultItemTitle(current.type, '', current.commentary, current.targetAuthorName);
+    const requestedTitle = text(updates.title, current.title);
+    const title = defaultItemTitle(
+      current.type,
+      wasDerived && requestedTitle === current.title ? '' : requestedTitle,
+      commentary,
+      targetAuthorName
+    );
+    const targetUrl = text(updates.targetUrl, current.targetUrl) || current.canonicalUrl;
+    const rating =
+      updates.rating === undefined ? current.rating ?? null : updates.rating === null ? null : Math.min(5, Math.max(1, Math.round(updates.rating)));
+    const tags = updates.tags === undefined ? current.tags : updates.tags.map((t) => t.trim()).filter(Boolean);
+    this.db
+      .prepare(
+        `UPDATE items SET title = ?, target_url = ?, target_author_url = ?, target_author_name = ?, category = ?,
+          commentary = ?, media_url = ?, rating = ?, tags_json = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(
+        title,
+        targetUrl,
+        text(updates.targetAuthorUrl, current.targetAuthorUrl || ''),
+        targetAuthorName,
+        text(updates.category, current.category) || current.category,
+        commentary,
+        text(updates.mediaUrl, current.mediaUrl),
+        rating,
+        JSON.stringify(tags),
+        new Date().toISOString(),
+        itemId
+      );
+    return this.getItems().find((i) => i.id === itemId)!;
+  }
+
+  public deleteItem(itemId: string): void {
+    this.db.prepare('DELETE FROM items WHERE id = ?').run(itemId);
+  }
+
+  public getFriends(): FriendConnection[] {
+    const rows = this.db
+      .prepare('SELECT * FROM friends ORDER BY added_at DESC')
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToFriend(r));
+  }
+
+  /** One friend by site URL, without reading the whole list (sync does this for every friend). */
+  public getFriendBySiteUrl(siteUrl: string): FriendConnection | undefined {
+    const row = this.db.prepare('SELECT * FROM friends WHERE site_url = ?').get(normalizeSiteUrl(siteUrl)) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.rowToFriend(row) : undefined;
+  }
+
+  private getFriendById(id: string): FriendConnection | undefined {
+    const row = this.db.prepare('SELECT * FROM friends WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.rowToFriend(row) : undefined;
+  }
+
+  private rowToFriend(r: Record<string, unknown>): FriendConnection {
+    return {
+      id: String(r.id),
+      siteUrl: String(r.site_url),
+      did: r.did ? String(r.did) : siteUrlToDidWeb(String(r.site_url)),
+      displayName: String(r.display_name),
+      handle: String(r.handle || ''),
+      avatarUrl: String(r.avatar_url || ''),
+      bio: String(r.bio || ''),
+      relationship: JSON.parse(String(r.relationship_json || '["friend"]')),
+      visibility: (r.visibility === 'public' ? 'public' : 'private') as FriendVisibility,
+      pinnedPublicKeyPem: r.pinned_public_key_pem ? String(r.pinned_public_key_pem) : undefined,
+      keyStatus: (r.key_status === 'pinned' || r.key_status === 'changed'
+        ? r.key_status
+        : 'unverified') as FriendKeyStatus,
+      lastCrawledAt: r.last_crawled_at ? String(r.last_crawled_at) : undefined,
+      addedAt: String(r.added_at),
+    };
+  }
+
+  public addOrUpdateFriend(input: {
+    siteUrl: string;
+    displayName: string;
+    handle?: string;
+    avatarUrl?: string;
+    bio?: string;
+    did?: string;
+    relationship?: string[];
+    visibility?: FriendVisibility;
+    pinnedPublicKeyPem?: string;
+    keyStatus?: FriendKeyStatus;
+    /** Set only by the crawler, so manual edits don't look like a sync. */
+    lastCrawledAt?: string;
+  }): FriendConnection {
+    const normalizedUrl = normalizeSiteUrl(input.siteUrl);
+    const did = input.did || siteUrlToDidWeb(normalizedUrl);
+    const now = new Date().toISOString();
+
+    const existing = this.db
+      .prepare('SELECT id FROM friends WHERE site_url = ?')
+      .get(normalizedUrl) as { id: string } | undefined;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE friends SET
+            display_name = ?,
+            handle = COALESCE(NULLIF(?, ''), handle),
+            avatar_url = COALESCE(NULLIF(?, ''), avatar_url),
+            bio = COALESCE(NULLIF(?, ''), bio),
+            did = ?,
+            relationship_json = COALESCE(?, relationship_json),
+            visibility = COALESCE(?, visibility),
+            pinned_public_key_pem = COALESCE(NULLIF(?, ''), pinned_public_key_pem),
+            key_status = COALESCE(?, key_status),
+            last_crawled_at = COALESCE(?, last_crawled_at)
+          WHERE id = ?`
+        )
+        .run(
+          input.displayName,
+          input.handle || '',
+          input.avatarUrl || '',
+          input.bio || '',
+          did,
+          input.relationship ? JSON.stringify(input.relationship) : null,
+          input.visibility ?? null,
+          input.pinnedPublicKeyPem || '',
+          input.keyStatus ?? null,
+          input.lastCrawledAt ?? null,
+          existing.id
+        );
+      return this.getFriendById(existing.id)!;
+    }
+
+    const id = `friend-${crypto.randomBytes(4).toString('hex')}`;
+    this.db
+      .prepare(
+        `INSERT INTO friends (id, site_url, did, display_name, handle, avatar_url, bio, relationship_json, visibility, pinned_public_key_pem, key_status, last_crawled_at, added_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        normalizedUrl,
+        did,
+        input.displayName,
+        input.handle || new URL(normalizedUrl).hostname,
+        input.avatarUrl || '',
+        input.bio || '',
+        JSON.stringify(input.relationship || ['friend']),
+        input.visibility || 'private',
+        input.pinnedPublicKeyPem || '',
+        input.keyStatus || (input.pinnedPublicKeyPem ? 'pinned' : 'unverified'),
+        input.lastCrawledAt ?? null,
+        now
+      );
+    this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalizedUrl);
+
+    return this.getFriendById(id)!;
+  }
+
+  public setFriendVisibility(friendId: string, visibility: FriendVisibility): FriendConnection | undefined {
+    this.db
+      .prepare('UPDATE friends SET visibility = ? WHERE id = ?')
+      .run(visibility, friendId);
+    return this.getFriends().find((f) => f.id === friendId);
+  }
+
+  /**
+   * Edits a friend's details in place, keeping their id and addedAt. If their website URL changes,
+   * crawled entries and cached validators for the old URL are removed and key status is updated for
+   * the new URL.
+   */
+  public updateFriend(
+    friendId: string,
+    updates: {
+      siteUrl?: string;
+      displayName?: string;
+      handle?: string;
+      avatarUrl?: string;
+      bio?: string;
+      relationship?: string[];
+      visibility?: FriendVisibility;
+    }
+  ): FriendConnection {
+    const current = this.getFriendById(friendId);
+    if (!current) {
+      throw new Error(`Friend "${friendId}" not found.`);
+    }
+    const nextSiteUrl =
+      updates.siteUrl !== undefined && updates.siteUrl.trim()
+        ? normalizeSiteUrl(updates.siteUrl)
+        : current.siteUrl;
+    if (nextSiteUrl !== current.siteUrl) {
+      const taken = this.db
+        .prepare('SELECT id, display_name FROM friends WHERE site_url = ? AND id != ?')
+        .get(nextSiteUrl, friendId) as { id: string; display_name: string } | undefined;
+      if (taken) {
+        throw new Error(`"${taken.display_name}" already uses ${nextSiteUrl}.`);
+      }
+    }
+
+    const displayName =
+      (updates.displayName !== undefined ? updates.displayName.trim() : '') || current.displayName;
+    const oldDefaultHandle = (() => {
+      try {
+        return new URL(current.siteUrl).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    const newDefaultHandle = (() => {
+      try {
+        return new URL(nextSiteUrl).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    const handle =
+      updates.handle !== undefined
+        ? updates.handle.trim() || newDefaultHandle
+        : nextSiteUrl !== current.siteUrl && current.handle === oldDefaultHandle
+        ? newDefaultHandle
+        : current.handle;
+    const avatarUrl = updates.avatarUrl !== undefined ? updates.avatarUrl.trim() : current.avatarUrl;
+    const bio = updates.bio !== undefined ? updates.bio.trim() : current.bio;
+    const relationship =
+      updates.relationship !== undefined
+        ? updates.relationship.map((r) => r.trim()).filter(Boolean)
+        : current.relationship;
+    const visibility: FriendVisibility =
+      updates.visibility === 'public'
+        ? 'public'
+        : updates.visibility === 'private'
+        ? 'private'
+        : current.visibility || 'private';
+
+    this.transaction(() => {
+      if (nextSiteUrl !== current.siteUrl) {
+        this.db.prepare('DELETE FROM network_feed WHERE friend_site_url = ?').run(current.siteUrl);
+        this.db.prepare('DELETE FROM endorsements WHERE author_site_url = ?').run(current.siteUrl);
+        this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(current.siteUrl);
+        this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(nextSiteUrl);
+        const siteKey = this.getSiteKey(nextSiteUrl);
+        const did = siteKey?.did || siteUrlToDidWeb(nextSiteUrl);
+        const pinnedPublicKeyPem = siteKey?.publicKeyPem || '';
+        const keyStatus: FriendKeyStatus = siteKey ? siteKey.keyStatus : 'unverified';
+        this.db
+          .prepare(
+            `UPDATE friends SET
+              site_url = ?,
+              did = ?,
+              display_name = ?,
+              handle = ?,
+              avatar_url = ?,
+              bio = ?,
+              relationship_json = ?,
+              visibility = ?,
+              pinned_public_key_pem = ?,
+              key_status = ?,
+              last_crawled_at = NULL,
+              lists_me_at = NULL,
+              sync_failures = 0,
+              retry_after = NULL
+            WHERE id = ?`
+          )
+          .run(
+            nextSiteUrl,
+            did,
+            displayName,
+            handle,
+            avatarUrl,
+            bio,
+            JSON.stringify(relationship),
+            visibility,
+            pinnedPublicKeyPem,
+            keyStatus,
+            friendId
+          );
+      } else {
+        this.db
+          .prepare(
+            `UPDATE friends SET
+              display_name = ?,
+              handle = ?,
+              avatar_url = ?,
+              bio = ?,
+              relationship_json = ?,
+              visibility = ?
+            WHERE id = ?`
+          )
+          .run(
+            displayName,
+            handle,
+            avatarUrl,
+            bio,
+            JSON.stringify(relationship),
+            visibility,
+            friendId
+          );
+      }
+    });
+
+    return this.getFriendById(friendId)!;
+  }
+
+  /**
+   * Removes a friend along with everything crawled from their site, so their posts and
+   * endorsements don't linger in the feed or the next export.
+   */
+  public deleteFriend(friendId: string): void {
+    const row = this.db.prepare('SELECT site_url FROM friends WHERE id = ?').get(friendId) as
+      | { site_url: string }
+      | undefined;
+    this.transaction(() => {
+      if (row) {
+        this.db.prepare('DELETE FROM network_feed WHERE friend_site_url = ?').run(row.site_url);
+        this.db.prepare('DELETE FROM endorsements WHERE author_site_url = ?').run(row.site_url);
+        this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(row.site_url);
+      }
+      this.db.prepare('DELETE FROM friends WHERE id = ?').run(friendId);
+    });
+  }
+
+  /** Records whether a friend's verified connections.json lists this persona. */
+  public setFriendListsMe(siteUrl: string, listsMe: boolean): void {
+    this.db
+      .prepare('UPDATE friends SET lists_me_at = ? WHERE site_url = ?')
+      .run(listsMe ? new Date().toISOString() : null, normalizeSiteUrl(siteUrl));
+  }
+
+  /** Friends whose verified connections.json lists this persona (shown as "Mutual"). */
+  public getMutualFriendUrls(): string[] {
+    const rows = this.db.prepare('SELECT site_url FROM friends WHERE lists_me_at IS NOT NULL').all() as Array<{
+      site_url: string;
+    }>;
+    return rows.map((r) => r.site_url);
+  }
+
+  /**
+   * Records that a site added this persona as a friend. Ignored for existing friends, blocked sites
+   * and this persona's own site. A dismissed notice comes back only for a new signed link.
+   */
+  public upsertFriendNotice(input: {
+    siteUrl: string;
+    displayName: string;
+    avatarUrl?: string;
+    source: FriendNoticeSource;
+    ringName?: string;
+  }): FriendNotice | undefined {
+    const siteUrl = normalizeSiteUrl(input.siteUrl);
+    if (siteUrl === normalizeSiteUrl(this.getProfile().siteUrl)) return undefined;
+    if (this.getModerationAction(siteUrl) === 'block') return undefined;
+    if (this.db.prepare('SELECT 1 FROM friends WHERE site_url = ?').get(siteUrl)) return undefined;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO friend_notices (site_url, display_name, avatar_url, source, ring_name, first_seen_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(site_url) DO UPDATE SET
+           display_name = excluded.display_name,
+           avatar_url = COALESCE(NULLIF(excluded.avatar_url, ''), avatar_url),
+           source = CASE WHEN excluded.source = 'link' THEN 'link' ELSE source END,
+           ring_name = COALESCE(NULLIF(excluded.ring_name, ''), ring_name),
+           last_seen_at = excluded.last_seen_at,
+           dismissed_at = CASE WHEN excluded.source = 'link' THEN NULL ELSE dismissed_at END`
+      )
+      .run(
+        siteUrl,
+        input.displayName.slice(0, 120),
+        input.avatarUrl || '',
+        input.source,
+        input.ringName || '',
+        now,
+        now
+      );
+    return this.getFriendNotices({ includeDismissed: true }).find((n) => n.siteUrl === siteUrl);
+  }
+
+  /** People who added this persona and haven't been added back, dismissed or blocked. */
+  public getFriendNotices(options: { includeDismissed?: boolean } = {}): FriendNotice[] {
+    const rows = this.db
+      .prepare(
+        `SELECT n.* FROM friend_notices n
+         WHERE NOT EXISTS (SELECT 1 FROM friends f WHERE f.site_url = n.site_url)
+           AND NOT EXISTS (SELECT 1 FROM moderation m WHERE m.site_url = n.site_url AND m.action = 'block')
+           ${options.includeDismissed ? '' : 'AND n.dismissed_at IS NULL'}
+         ORDER BY n.last_seen_at DESC`
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      siteUrl: String(r.site_url),
+      displayName: String(r.display_name || ''),
+      avatarUrl: String(r.avatar_url || ''),
+      source: r.source === 'link' ? 'link' : 'ring',
+      ringName: String(r.ring_name || ''),
+      firstSeenAt: String(r.first_seen_at),
+      lastSeenAt: String(r.last_seen_at),
+      ...(r.dismissed_at ? { dismissedAt: String(r.dismissed_at) } : {}),
+    }));
+  }
+
+  public dismissFriendNotice(siteUrl: string): void {
+    this.db
+      .prepare('UPDATE friend_notices SET dismissed_at = ? WHERE site_url = ?')
+      .run(new Date().toISOString(), normalizeSiteUrl(siteUrl));
+  }
+
+  /** Runs `fn` in one transaction. `fn` must be synchronous: nothing may await inside it. */
+  public transaction(fn: () => void): void {
+    this.db.exec('BEGIN');
+    try {
+      fn();
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Deletes a friend's feed rows that weren't present in their latest verified documents
+   * (i.e. they removed the post or photo). `scope` limits pruning to the document that was fetched.
+   */
+  public pruneFriendFeed(
+    friendSiteUrl: string,
+    scope: 'photos' | 'items',
+    keepCanonicalUrls: string[],
+    /** The friend publishes only items from here on (items.json `archive.since`); older ones are archived, not deleted. */
+    sinceIso?: string
+  ): number {
+    const keep = new Set(keepCanonicalUrls);
+    const rows = this.db
+      .prepare('SELECT id, canonical_url, entry_type, created_at FROM network_feed WHERE friend_site_url = ?')
+      .all(normalizeSiteUrl(friendSiteUrl)) as Array<{ id: string; canonical_url: string; entry_type: string; created_at: string }>;
+    const stale = rows.filter(
+      (r) =>
+        (scope === 'photos') === (r.entry_type === 'photo' || r.entry_type === 'album') &&
+        !keep.has(r.canonical_url) &&
+        (!sinceIso || r.created_at >= sinceIso)
+    );
+    this.transaction(() => {
+      for (const r of stale) {
+        this.db.prepare('DELETE FROM network_feed WHERE id = ?').run(r.id);
+      }
+    });
+    return stale.length;
+  }
+
+  /**
+   * Deletes endorsements from a friend whose source item is no longer in their items.json.
+   */
+  public pruneEndorsementsFrom(authorSiteUrl: string, keepSourceItemUrls: string[], sinceIso?: string): number {
+    const keep = new Set(keepSourceItemUrls);
+    const rows = this.db
+      .prepare('SELECT id, source_item_url, created_at FROM endorsements WHERE author_site_url = ?')
+      .all(normalizeSiteUrl(authorSiteUrl)) as Array<{ id: string; source_item_url: string; created_at: string }>;
+    // Endorsements older than the friend's published window are in their archives, not deleted
+    const stale = rows.filter((r) => !keep.has(r.source_item_url) && (!sinceIso || r.created_at >= sinceIso));
+    this.transaction(() => {
+      for (const r of stale) {
+        this.db.prepare('DELETE FROM endorsements WHERE id = ?').run(r.id);
+      }
+    });
+    return stale.length;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Feed window and fetch cache
+
+  /** How many days friends' posts stay in the feed; 0 = forever. */
+  public getFeedRetentionDays(): number {
+    const row = this.db.prepare("SELECT value FROM local_settings WHERE key = 'feedRetentionDays'").get() as
+      | { value: string }
+      | undefined;
+    const days = row ? Number(row.value) : DEFAULT_FEED_RETENTION_DAYS;
+    return Number.isFinite(days) && days >= 0 ? Math.floor(days) : DEFAULT_FEED_RETENTION_DAYS;
+  }
+
+  /**
+   * Changes the feed window and applies it now. A wider window forgets the fetch cache, so the
+   * next sync downloads friends' files again and brings back the older entries.
+   */
+  public setFeedRetentionDays(days: number): { days: number; pruned: number } {
+    const next = Math.max(0, Math.floor(Number(days) || 0));
+    const previous = this.getFeedRetentionDays();
+    this.db
+      .prepare("INSERT INTO local_settings (key, value) VALUES ('feedRetentionDays', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(String(next));
+    if (next === 0 || (previous !== 0 && next > previous)) this.clearFetchCache();
+    return { days: next, pruned: this.pruneFeedOutsideWindow() };
+  }
+
+  /** Oldest createdAt the feed keeps, or null for forever. */
+  public feedCutoffIso(nowMs = Date.now()): string | null {
+    const days = this.getFeedRetentionDays();
+    return days > 0 ? new Date(nowMs - days * 86400000).toISOString() : null;
+  }
+
+  /**
+   * Removes feed rows older than the window. Saved posts and endorsements aren't touched. An album
+   * in the window (its newest photo is) keeps all its photos, so the album view is never partial.
+   */
+  public pruneFeedOutsideWindow(nowMs = Date.now()): number {
+    const cutoff = this.feedCutoffIso(nowMs);
+    if (!cutoff) return 0;
+    const result = this.db
+      .prepare(
+        `DELETE FROM network_feed WHERE created_at < ?
+           AND NOT (entry_type = 'photo' AND album_url != '' AND album_url IN (
+             SELECT canonical_url FROM network_feed WHERE entry_type = 'album' AND created_at >= ?))`
+      )
+      .run(cutoff, cutoff) as { changes?: number | bigint };
+    return Number(result.changes || 0);
+  }
+
+  public getFetchValidators(url: string): { etag: string; lastModified: string } | null {
+    const row = this.db.prepare('SELECT etag, last_modified FROM fetch_cache WHERE url = ?').get(url) as
+      | { etag: string; last_modified: string }
+      | undefined;
+    return row && (row.etag || row.last_modified) ? { etag: row.etag, lastModified: row.last_modified } : null;
+  }
+
+  /** The saved copy of a document with its validators and fingerprint, when a copy was saved. */
+  public getCachedDocument(url: string): { etag: string; lastModified: string; body: string; fingerprint: string } | null {
+    const row = this.db.prepare('SELECT etag, last_modified, body, fingerprint FROM fetch_cache WHERE url = ?').get(url) as
+      | { etag: string; last_modified: string; body: string; fingerprint: string }
+      | undefined;
+    return row && row.body
+      ? { etag: row.etag, lastModified: row.last_modified, body: row.body, fingerprint: row.fingerprint }
+      : null;
+  }
+
+  /** Fingerprint (`documentFingerprint`) of the copy of this document last verified, if known. */
+  public getFetchedFingerprint(url: string): string {
+    const row = this.db.prepare('SELECT fingerprint FROM fetch_cache WHERE url = ?').get(url) as
+      | { fingerprint: string }
+      | undefined;
+    return row?.fingerprint || '';
+  }
+
+  /**
+   * Remembers a verified document: its validators, its fingerprint, and (`body`) a copy to reuse
+   * after a 304. With none of those it's forgotten, so it's downloaded in full next time.
+   */
+  public setFetchValidators(
+    url: string,
+    siteUrl: string,
+    validators: { etag?: string; lastModified?: string },
+    body = '',
+    fingerprint = ''
+  ): void {
+    if (!validators.etag && !validators.lastModified && !fingerprint) {
+      this.db.prepare('DELETE FROM fetch_cache WHERE url = ?').run(url);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO fetch_cache (url, site_url, etag, last_modified, body, fingerprint) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(url) DO UPDATE SET site_url = excluded.site_url, etag = excluded.etag,
+           last_modified = excluded.last_modified, body = excluded.body, fingerprint = excluded.fingerprint`
+      )
+      .run(url, normalizeSiteUrl(siteUrl), validators.etag || '', validators.lastModified || '', body, fingerprint);
+  }
+
+  /** Friends Sync All should skip for now, with the time each may be tried again. */
+  public getSyncRetryTimes(nowMs = Date.now()): Map<string, string> {
+    const rows = this.db
+      .prepare('SELECT site_url, retry_after FROM friends WHERE retry_after IS NOT NULL AND retry_after > ?')
+      .all(new Date(nowMs).toISOString()) as Array<{ site_url: string; retry_after: string }>;
+    return new Map(rows.map((r) => [r.site_url, r.retry_after]));
+  }
+
+  /**
+   * Records a failed sync of a friend and returns when Sync All may try again: 15 minutes after
+   * the first failure, doubling each time, at most a day.
+   */
+  public recordSyncFailure(siteUrl: string, nowMs = Date.now()): string | undefined {
+    const normalized = normalizeSiteUrl(siteUrl);
+    const row = this.db.prepare('SELECT sync_failures FROM friends WHERE site_url = ?').get(normalized) as
+      | { sync_failures: number }
+      | undefined;
+    if (!row) return undefined;
+    const failures = Number(row.sync_failures || 0) + 1;
+    const waitMs = Math.min(SYNC_BACKOFF_BASE_MS * 2 ** (failures - 1), SYNC_BACKOFF_MAX_MS);
+    const retryAfter = new Date(nowMs + waitMs).toISOString();
+    this.db
+      .prepare('UPDATE friends SET sync_failures = ?, retry_after = ? WHERE site_url = ?')
+      .run(failures, retryAfter, normalized);
+    return retryAfter;
+  }
+
+  public clearSyncFailures(siteUrl: string): void {
+    this.db
+      .prepare('UPDATE friends SET sync_failures = 0, retry_after = NULL WHERE site_url = ? AND sync_failures > 0')
+      .run(normalizeSiteUrl(siteUrl));
+  }
+
+  /** Forgets cached validators (all, or one site's), so the next sync downloads everything. */
+  public clearFetchCache(siteUrl?: string): void {
+    if (siteUrl) this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalizeSiteUrl(siteUrl));
+    else this.db.exec('DELETE FROM fetch_cache');
+  }
+
+  public getModeration(): ModerationEntry[] {
+    const rows = this.db
+      .prepare('SELECT * FROM moderation ORDER BY created_at DESC')
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      siteUrl: String(r.site_url),
+      action: r.action as ModerationAction,
+      createdAt: String(r.created_at),
+    }));
+  }
+
+  public getModerationAction(siteUrl: string): ModerationAction | undefined {
+    const row = this.db
+      .prepare('SELECT action FROM moderation WHERE site_url = ?')
+      .get(normalizeSiteUrl(siteUrl)) as { action: ModerationAction } | undefined;
+    return row?.action;
+  }
+
+  /**
+   * Sets (or with `null`, clears) the mute/block action for a site.
+   */
+  public setModeration(siteUrl: string, action: ModerationAction | null): ModerationEntry[] {
+    const normalized = normalizeSiteUrl(siteUrl);
+    if (action) {
+      this.db
+        .prepare('INSERT OR REPLACE INTO moderation (site_url, action, created_at) VALUES (?, ?, ?)')
+        .run(normalized, action, new Date().toISOString());
+      if (action === 'block') this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalized);
+    } else {
+      this.db.prepare('DELETE FROM moderation WHERE site_url = ?').run(normalized);
+    }
+    // Muting or blocking can hide or drop their entries; download in full next time
+    this.clearFetchCache(normalized);
+    return this.getModeration();
+  }
+
+  /**
+   * The rings published in connections.json: rings this persona is a confirmed member of
+   * (plus pre-redesign 'legacy' rows), and hosted rings the maintainer belongs to, built from
+   * local tables so the maintainer never has to fetch their own hub.
+   */
+  public getWebrings(): WebringMembership[] {
+    const joined: WebringMembership[] = this.getJoinedRings()
+      .filter((r) => r.status === 'member' || r.status === 'legacy')
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        hubUrl: r.hubUrl,
+        description: r.description,
+        prevSiteUrl: r.prevSiteUrl,
+        nextSiteUrl: r.nextSiteUrl,
+        joinedAt: r.joinedAt,
+        ...(r.memberCount ? { memberCount: r.memberCount } : {}),
+        ...(r.directoryUrl ? { directoryUrl: r.directoryUrl } : {}),
+        ...(r.rotationUrls.length ? { rotationUrls: r.rotationUrls } : {}),
+      }));
+    const mySiteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
+    const hosted: WebringMembership[] = this.getHostedRings()
+      .filter((ring) => ring.status === 'active' && ring.maintainerIsMember)
+      .map((ring) => {
+        const members = this.hubMembersFor(ring);
+        const neighbors = computeRingNeighbors(members, mySiteUrl);
+        return {
+          id: ring.id,
+          name: ring.name,
+          hubUrl: ring.hubUrl,
+          description: ring.description,
+          prevSiteUrl: neighbors.prevSiteUrl,
+          nextSiteUrl: neighbors.nextSiteUrl,
+          joinedAt: ring.createdAt,
+          memberCount: neighbors.memberCount,
+          directoryUrl: ring.directoryUrl,
+          ...(neighbors.rotationUrls.length ? { rotationUrls: neighbors.rotationUrls } : {}),
+        };
+      });
+    return [...hosted, ...joined];
+  }
+
+  public getJoinedRings(): JoinedRing[] {
+    const rows = this.db
+      .prepare('SELECT * FROM webrings ORDER BY joined_at DESC')
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      name: String(r.name),
+      hubUrl: String(r.hub_url),
+      description: String(r.description || ''),
+      status: (String(r.status || 'legacy') as JoinedRingStatus),
+      maintainerUrl: String(r.maintainer_url || ''),
+      maintainerDid: String(r.maintainer_did || ''),
+      prevSiteUrl: r.prev_site_url ? String(r.prev_site_url) : undefined,
+      nextSiteUrl: r.next_site_url ? String(r.next_site_url) : undefined,
+      memberCount: Number(r.member_count || 0),
+      directoryUrl: r.directory_url ? String(r.directory_url) : undefined,
+      rotationUrls: parseRotationUrls(r.rotation_urls),
+      hubVerified: Boolean(r.hub_verified),
+      hubUpdatedAt: r.hub_updated_at ? String(r.hub_updated_at) : undefined,
+      lastSyncedAt: r.last_synced_at ? String(r.last_synced_at) : undefined,
+      requestToken: r.request_token ? String(r.request_token) : undefined,
+      syncWarning: r.sync_warning ? String(r.sync_warning) : undefined,
+      joinedAt: String(r.joined_at),
+    }));
+  }
+
+  /**
+   * Inserts or updates a joined ring by hub URL. Unlike the old INSERT OR REPLACE, the row's id
+   * and joined_at survive re-syncs. Only the fields passed are changed on update.
+   */
+  public upsertJoinedRing(input: {
+    hubUrl: string;
+    name?: string;
+    description?: string;
+    status?: JoinedRingStatus;
+    maintainerUrl?: string;
+    maintainerDid?: string;
+    prevSiteUrl?: string | null;
+    nextSiteUrl?: string | null;
+    memberCount?: number;
+    directoryUrl?: string;
+    rotationUrls?: string[];
+    hubVerified?: boolean;
+    hubUpdatedAt?: string;
+    lastSyncedAt?: string;
+    requestToken?: string;
+    syncWarning?: string;
+  }): JoinedRing {
+    const hubUrl = input.hubUrl.trim();
+    const existing = this.getJoinedRings().find((r) => r.hubUrl === hubUrl);
+    if (!existing) {
+      this.db
+        .prepare(
+          `INSERT INTO webrings (id, name, hub_url, description, prev_site_url, next_site_url, joined_at, status)
+           VALUES (?, ?, ?, ?, '', '', ?, ?)`
+        )
+        .run(
+          `ring-${crypto.randomBytes(4).toString('hex')}`,
+          input.name || hubUrl,
+          hubUrl,
+          input.description || '',
+          new Date().toISOString(),
+          input.status || 'requested'
+        );
+    }
+    const columns: Array<[string, unknown]> = [
+      ['name', input.name],
+      ['description', input.description],
+      ['status', input.status],
+      ['maintainer_url', input.maintainerUrl],
+      ['maintainer_did', input.maintainerDid],
+      ['prev_site_url', input.prevSiteUrl === null ? '' : input.prevSiteUrl],
+      ['next_site_url', input.nextSiteUrl === null ? '' : input.nextSiteUrl],
+      ['member_count', input.memberCount],
+      ['directory_url', input.directoryUrl],
+      ['rotation_urls', input.rotationUrls === undefined ? undefined : JSON.stringify(input.rotationUrls)],
+      ['hub_verified', input.hubVerified === undefined ? undefined : input.hubVerified ? 1 : 0],
+      ['hub_updated_at', input.hubUpdatedAt],
+      ['last_synced_at', input.lastSyncedAt],
+      ['request_token', input.requestToken],
+      ['sync_warning', input.syncWarning],
+    ];
+    const changed = columns.filter(([, value]) => value !== undefined);
+    if (changed.length > 0) {
+      this.db
+        .prepare(
+          `UPDATE webrings SET ${changed.map(([col]) => `${col} = ?`).join(', ')} WHERE hub_url = ?`
+        )
+        .run(...changed.map(([, value]) => value), hubUrl);
+    }
+    return this.getJoinedRings().find((r) => r.hubUrl === hubUrl)!;
+  }
+
+  /** Manual edits, only offered for pre-redesign 'legacy' rings. */
+  public updateWebring(
+    ringId: string,
+    updates: {
+      name?: string;
+      hubUrl?: string;
+      description?: string;
+      prevSiteUrl?: string;
+      nextSiteUrl?: string;
+    }
+  ): JoinedRing {
+    const current = this.getJoinedRings().find((w) => w.id === ringId);
+    if (!current) {
+      throw new Error(`Webring membership "${ringId}" not found.`);
+    }
+    const merged = { ...current, ...updates };
+    this.db
+      .prepare(
+        `UPDATE webrings SET name = ?, hub_url = ?, description = ?, prev_site_url = ?, next_site_url = ?
+         WHERE id = ?`
+      )
+      .run(
+        merged.name,
+        merged.hubUrl.trim(),
+        merged.description || '',
+        merged.prevSiteUrl || '',
+        merged.nextSiteUrl || '',
+        ringId
+      );
+    return this.getJoinedRings().find((w) => w.id === ringId)!;
+  }
+
+  public deleteWebring(ringId: string): void {
+    this.db.prepare('DELETE FROM webrings WHERE id = ?').run(ringId);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Site keys (trust on first use, one key per site)
+
+  public getSiteKey(siteUrl: string): SiteKey | undefined {
+    const row = this.db
+      .prepare('SELECT * FROM site_keys WHERE site_url = ?')
+      .get(normalizeSiteUrl(siteUrl)) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      siteUrl: String(row.site_url),
+      did: String(row.did || ''),
+      publicKeyPem: String(row.public_key_pem),
+      keyStatus: row.key_status === 'changed' ? 'changed' : 'pinned',
+      firstSeenAt: String(row.first_seen_at),
+    };
+  }
+
+  /**
+   * Pins a site's key the first time it's seen. If a different key is presented later, verifies
+   * whether `keyRotations` carries a valid Ed25519-signed rotation chain from the pinned key to
+   * the new key; if so, advances the pinned key to the new one. Otherwise reports 'changed' and
+   * keeps the original key pinned.
+   */
+  public pinSiteKey(
+    siteUrl: string,
+    did: string,
+    publicKeyPem: string,
+    keyRotations?: KeyRotationCertificate[]
+  ): 'pinned' | 'changed' {
+    const normalized = normalizeSiteUrl(siteUrl);
+    const existing = this.getSiteKey(normalized);
+    const existingFriend = this.getFriendBySiteUrl(normalized);
+    const priorPinnedPem = existing?.publicKeyPem || existingFriend?.pinnedPublicKeyPem || '';
+
+    if (!existing && !priorPinnedPem) {
+      this.db
+        .prepare(
+          'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+        )
+        .run(normalized, did, publicKeyPem, 'pinned', new Date().toISOString());
+      return 'pinned';
+    }
+
+    if (priorPinnedPem.trim() === publicKeyPem.trim()) {
+      if (!existing) {
+        this.db
+          .prepare(
+            'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+          )
+          .run(normalized, did, publicKeyPem, 'pinned', new Date().toISOString());
+      } else {
+        this.db.prepare('UPDATE site_keys SET key_status = ? WHERE site_url = ?').run('pinned', normalized);
+      }
+      return 'pinned';
+    }
+
+    const effectiveDid = did || existing?.did || siteUrlToDidWeb(normalized);
+    const rotationVerified = verifyKeyRotationChain({
+      pinnedPublicKeyPem: priorPinnedPem,
+      targetPublicKeyPem: publicKeyPem,
+      did: effectiveDid,
+      siteUrl: normalized,
+      certificates: keyRotations,
+    });
+
+    if (rotationVerified) {
+      this.transaction(() => {
+        if (!existing) {
+          this.db
+            .prepare(
+              'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+            )
+            .run(normalized, effectiveDid, publicKeyPem, 'pinned', new Date().toISOString());
+        } else {
+          this.db
+            .prepare('UPDATE site_keys SET did = ?, public_key_pem = ?, key_status = ? WHERE site_url = ?')
+            .run(effectiveDid, publicKeyPem, 'pinned', normalized);
+        }
+        this.db
+          .prepare('UPDATE friends SET pinned_public_key_pem = ?, key_status = ? WHERE site_url = ?')
+          .run(publicKeyPem, 'pinned', normalized);
+        this.db
+          .prepare('UPDATE ring_members SET key_fingerprint = ? WHERE site_url = ?')
+          .run(publicKeyFingerprint(publicKeyPem), normalized);
+      });
+      return 'pinned';
+    }
+
+    if (!existing) {
+      this.db
+        .prepare(
+          'INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at) VALUES (?, ?, ?, ?, ?)'
+        )
+        .run(normalized, effectiveDid, priorPinnedPem, 'changed', new Date().toISOString());
+    } else {
+      this.db.prepare('UPDATE site_keys SET key_status = ? WHERE site_url = ?').run('changed', normalized);
+    }
+    return 'changed';
+  }
+
+  /**
+   * Manually resets or replaces a friend's pinned Ed25519 key (for emergency key recovery when
+   * the friend lost their previous private key and could not sign a KeyRotationCertificate).
+   * If `newPublicKeyPem` is omitted, clears the pinned key so the next sync pins their live key.
+   */
+  public trustNewFriendKey(friendId: string, newPublicKeyPem?: string): FriendConnection {
+    const current = this.getFriendById(friendId);
+    if (!current) {
+      throw new Error(`Friend "${friendId}" not found.`);
+    }
+    const normalized = normalizeSiteUrl(current.siteUrl);
+    const cleanKey = newPublicKeyPem?.trim() || '';
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalized);
+      if (cleanKey) {
+        const did = current.did || siteUrlToDidWeb(normalized);
+        this.db
+          .prepare(
+            `INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
+             VALUES (?, ?, ?, 'pinned', ?)
+             ON CONFLICT(site_url) DO UPDATE SET did = excluded.did, public_key_pem = excluded.public_key_pem, key_status = 'pinned'`
+          )
+          .run(normalized, did, cleanKey, new Date().toISOString());
+        this.db
+          .prepare(
+            "UPDATE friends SET pinned_public_key_pem = ?, key_status = 'pinned', sync_failures = 0, retry_after = NULL WHERE id = ?"
+          )
+          .run(cleanKey, friendId);
+      } else {
+        this.db.prepare('DELETE FROM site_keys WHERE site_url = ?').run(normalized);
+        this.db
+          .prepare(
+            "UPDATE friends SET pinned_public_key_pem = '', key_status = 'unverified', sync_failures = 0, retry_after = NULL WHERE id = ?"
+          )
+          .run(friendId);
+      }
+    });
+    return this.getFriendById(friendId)!;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-persona outbound proxy settings (local only, never exported)
+
+  public getProxySettings(): { enabled: boolean; proxyUrl: string } {
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'proxySettingsJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return { enabled: false, proxyUrl: '' };
+    try {
+      const parsed = JSON.parse(row.value) as { enabled?: unknown; proxyUrl?: unknown };
+      return {
+        enabled: Boolean(parsed.enabled && typeof parsed.proxyUrl === 'string' && parsed.proxyUrl.trim()),
+        proxyUrl: typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '',
+      };
+    } catch {
+      return { enabled: false, proxyUrl: '' };
+    }
+  }
+
+  public setProxySettings(input: { enabled?: boolean; proxyUrl?: string }): {
+    enabled: boolean;
+    proxyUrl: string;
+  } {
+    const current = this.getProxySettings();
+    const nextUrl = input.proxyUrl !== undefined ? input.proxyUrl.trim() : current.proxyUrl;
+    if (nextUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(nextUrl);
+      } catch {
+        throw new Error(
+          'Invalid proxy URL. Expected socks5h://127.0.0.1:9050, socks5://host:port, or http://host:port.'
+        );
+      }
+      const proto = parsed.protocol.toLowerCase();
+      if (proto !== 'socks5:' && proto !== 'socks5h:' && proto !== 'http:') {
+        throw new Error(
+          `Unsupported proxy protocol "${parsed.protocol}". Use socks5h:// (recommended for Tor), socks5://, or http://.`
+        );
+      }
+      const port = Number(parsed.port);
+      if (!parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error('Proxy URL must include a valid hostname and port (e.g. socks5h://127.0.0.1:9050).');
+      }
+    }
+    const nextEnabled =
+      input.enabled !== undefined ? Boolean(input.enabled && nextUrl) : Boolean(current.enabled && nextUrl);
+    const next = { enabled: nextEnabled, proxyUrl: nextUrl };
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('proxySettingsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(next));
+    if (next.enabled !== current.enabled || next.proxyUrl !== current.proxyUrl) {
+      this.clearFetchCache();
+    }
+    return next;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Webring Hubs this persona uses (local only, never exported). Search results are never
+  // stored; only the hub addresses and this persona's listing state are.
+
+  /**
+   * One-time move of the setting saved before the rename to Webring Hubs (`directoriesJson`).
+   * Copies it to `webringHubsJson` only when that key doesn't exist yet, then drops the old key.
+   */
+  private migrateLegacyWebringHubsSetting(): void {
+    const legacy = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'directoriesJson'")
+      .get() as { value: string } | undefined;
+    if (!legacy) return;
+    // No transaction (callers may already be in one). Safe to repeat: if the delete never ran,
+    // the next call finds the new key in place and only deletes the old one.
+    this.db
+      .prepare("INSERT INTO local_settings (key, value) VALUES ('webringHubsJson', ?) ON CONFLICT(key) DO NOTHING")
+      .run(legacy.value);
+    this.db.prepare("DELETE FROM local_settings WHERE key = 'directoriesJson'").run();
+  }
+
+  public getWebringHubs(): WebringHubRecord[] {
+    this.migrateLegacyWebringHubsSetting();
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'webringHubsJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return [];
+    try {
+      const parsed = JSON.parse(row.value) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (d): d is WebringHubRecord =>
+          Boolean(d) && typeof d === 'object' && typeof (d as WebringHubRecord).url === 'string'
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  public saveWebringHubs(hubs: WebringHubRecord[]): void {
+    this.migrateLegacyWebringHubsSetting();
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('webringHubsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(hubs));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Guided setup (local only, never exported). Progress itself is read from the real settings;
+  // this only remembers whether the wizard was dismissed and the last live-site check.
+
+  public getSetupState(): SetupState {
+    const row = this.db
+      .prepare("SELECT value FROM local_settings WHERE key = 'setupStateJson'")
+      .get() as { value: string } | undefined;
+    if (!row?.value) return {};
+    try {
+      const parsed = JSON.parse(row.value) as SetupState;
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  public updateSetupState(changes: Partial<SetupState>): SetupState {
+    const next: SetupState = { ...this.getSetupState(), ...changes };
+    for (const key of Object.keys(next) as Array<keyof SetupState>) {
+      if (next[key] === undefined) delete next[key];
+    }
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('setupStateJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(next));
+    return next;
+  }
+
+  /** `updatedAt` of the manifest at the last publish, to tell a live copy that's out of date. */
+  public getPublishedManifestUpdatedAt(): string | undefined {
+    const row = this.db.prepare("SELECT updated_at FROM published_documents WHERE key = 'manifest'").get() as
+      | { updated_at: string }
+      | undefined;
+    return row?.updated_at || undefined;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hosted rings (this persona is the maintainer)
+
+  public getHostedRings(): HostedRing[] {
+    const siteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
+    const rows = this.db
+      .prepare('SELECT * FROM hosted_rings ORDER BY created_at ASC')
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => {
+      const id = String(r.id);
+      const slug = String(r.slug);
+      const hubPath = String(r.hub_path);
+      const directoryPath = String(r.directory_path || '') || `rings/${slug}/index.html`;
+      const members = (
+        this.db
+          .prepare('SELECT * FROM ring_members WHERE ring_id = ? ORDER BY position ASC, joined_at ASC')
+          .all(id) as Array<Record<string, unknown>>
+      ).map((m) => ({
+        siteUrl: String(m.site_url),
+        displayName: String(m.display_name),
+        did: String(m.did || ''),
+        keyFingerprint: String(m.key_fingerprint || ''),
+        position: Number(m.position || 0),
+        joinedAt: String(m.joined_at),
+        confirmedAt: m.confirmed_at ? String(m.confirmed_at) : undefined,
+        lastVerifiedAt: m.last_verified_at ? String(m.last_verified_at) : undefined,
+        failCount: Number(m.fail_count || 0),
+        hidden: Boolean(m.hidden),
+        avatarUrl: String(m.avatar_url || ''),
+        tagline: String(m.tagline || ''),
+      }));
+      const bans = (
+        this.db
+          .prepare('SELECT * FROM ring_bans WHERE ring_id = ? ORDER BY created_at DESC')
+          .all(id) as Array<Record<string, unknown>>
+      ).map((b) => ({
+        siteUrl: String(b.site_url),
+        did: String(b.did || ''),
+        keyFingerprint: String(b.key_fingerprint || ''),
+        reason: String(b.reason || ''),
+        createdAt: String(b.created_at),
+      }));
+      return {
+        id,
+        slug,
+        name: String(r.name),
+        description: String(r.description || ''),
+        hubPath,
+        hubUrl: `${siteUrl}/${hubPath}`,
+        directoryPath,
+        directoryUrl: `${siteUrl}/${directoryPath.replace(/index\.html$/, '')}`,
+        maintainerIsMember: Boolean(r.maintainer_is_member),
+        status: r.status === 'closed' ? 'closed' : 'active',
+        tagline: String(r.tagline || ''),
+        rules: String(r.rules || ''),
+        bannerUrl: String(r.banner_url || ''),
+        accent: String(r.accent || ''),
+        createdAt: String(r.created_at),
+        updatedAt: String(r.updated_at),
+        members,
+        bans,
+      };
+    });
+  }
+
+  public getHostedRing(ringId: string): HostedRing {
+    const ring = this.getHostedRings().find((r) => r.id === ringId);
+    if (!ring) throw new Error(`Hosted ring "${ringId}" not found.`);
+    return ring;
+  }
+
+  public createHostedRing(input: {
+    name: string;
+    description?: string;
+    hubPath?: string;
+    directoryPath?: string;
+  }): HostedRing {
+    const base =
+      input.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40) || 'ring';
+    let slug = base;
+    for (let n = 2; this.db.prepare('SELECT 1 FROM hosted_rings WHERE slug = ?').get(slug); n++) {
+      slug = `${base}-${n}`;
+    }
+    const directoryPath = input.directoryPath ? this.checkRingPagePath(input.directoryPath) : '';
+    const id = `hosted-${crypto.randomBytes(4).toString('hex')}`;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO hosted_rings (id, slug, name, description, hub_path, directory_path, maintainer_is_member, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)`
+      )
+      .run(
+        id,
+        slug,
+        input.name.trim(),
+        input.description?.trim() || '',
+        input.hubPath || `api/rings/${slug}.json`,
+        directoryPath,
+        now,
+        now
+      );
+    return this.getHostedRing(id);
+  }
+
+  /** A usable ring page path that no other hosted ring already has. */
+  private checkRingPagePath(input: string, ringId?: string): string {
+    const directoryPath = normalizeRingPagePath(input);
+    const taken = this.getHostedRings().find((r) => r.id !== ringId && r.directoryPath === directoryPath);
+    if (taken) throw new Error(`"${taken.name}" already uses /${directoryPath.replace(/\/index\.html$/, '')}.`);
+    return directoryPath;
+  }
+
+  public updateHostedRing(
+    ringId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      maintainerIsMember?: boolean;
+      status?: 'active' | 'closed';
+      directoryPath?: string;
+      tagline?: string;
+      rules?: string;
+      bannerUrl?: string;
+      accent?: string;
+    }
+  ): HostedRing {
+    const current = this.getHostedRing(ringId);
+    const accent = updates.accent?.trim();
+    if (accent && !/^#[0-9a-f]{6}$/i.test(accent)) {
+      throw new Error('The accent colour must be a hex colour, such as #6366f1.');
+    }
+    const bannerUrl = updates.bannerUrl?.trim();
+    if (bannerUrl && !bannerUrl.startsWith('media/') && !/^https:\/\//i.test(bannerUrl)) {
+      throw new Error('The banner must be a Media Library image or an https:// address.');
+    }
+    this.db
+      .prepare(
+        `UPDATE hosted_rings SET name = ?, description = ?, maintainer_is_member = ?, status = ?,
+           directory_path = ?, tagline = ?, rules = ?, banner_url = ?, accent = ? WHERE id = ?`
+      )
+      .run(
+        updates.name?.trim() || current.name,
+        updates.description ?? current.description,
+        (updates.maintainerIsMember ?? current.maintainerIsMember) ? 1 : 0,
+        updates.status ?? current.status,
+        updates.directoryPath === undefined ? current.directoryPath : this.checkRingPagePath(updates.directoryPath, ringId),
+        (updates.tagline ?? current.tagline).trim().slice(0, 200),
+        (updates.rules ?? current.rules).slice(0, 10000),
+        bannerUrl ?? current.bannerUrl,
+        accent ?? current.accent,
+        ringId
+      );
+    this.touchHostedRing(ringId);
+    return this.getHostedRing(ringId);
+  }
+
+  /**
+   * Turns a pre-redesign ring entry that points at this persona's own site into a ring it hosts,
+   * with its page at the old address, so links people already have start working once published.
+   */
+  public hostLegacyRing(joinedRingId: string): HostedRing {
+    const legacy = this.getJoinedRings().find((r) => r.id === joinedRingId);
+    if (!legacy || legacy.status !== 'legacy') {
+      throw new Error('Only older ring entries can be converted.');
+    }
+    const siteUrl = normalizeSiteUrl(this.getProfile().siteUrl);
+    if (!isUrlWithinSite(legacy.hubUrl, siteUrl)) {
+      throw new Error(`${legacy.hubUrl} isn't on your site (${siteUrl}), so it can't be hosted here.`);
+    }
+    // The old address becomes the ring page, unless it pointed at a JSON file
+    const sitePath = new URL(siteUrl).pathname.replace(/\/+$/, '');
+    const pagePath = new URL(legacy.hubUrl).pathname.slice(sitePath.length);
+    let ring!: HostedRing;
+    this.transaction(() => {
+      ring = this.createHostedRing({
+        name: legacy.name,
+        description: legacy.description,
+        ...(/\.json$/i.test(pagePath) ? {} : { directoryPath: pagePath }),
+      });
+      this.deleteWebring(legacy.id);
+    });
+    return ring;
+  }
+
+  private touchHostedRing(ringId: string): void {
+    this.db
+      .prepare('UPDATE hosted_rings SET updated_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), ringId);
+  }
+
+  public addRingMember(
+    ringId: string,
+    input: { siteUrl: string; displayName: string; did: string; keyFingerprint: string; joinedAt?: string }
+  ): HostedRing {
+    const siteUrl = normalizeSiteUrl(input.siteUrl);
+    const next = this.db
+      .prepare('SELECT COALESCE(MAX(position), 0) + 1 AS n FROM ring_members WHERE ring_id = ?')
+      .get(ringId) as { n: number };
+    this.db
+      .prepare(
+        `INSERT INTO ring_members (ring_id, site_url, display_name, did, key_fingerprint, position, joined_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ring_id, site_url) DO UPDATE SET display_name = excluded.display_name,
+           did = excluded.did, key_fingerprint = excluded.key_fingerprint`
+      )
+      .run(
+        ringId,
+        siteUrl,
+        input.displayName.slice(0, 120),
+        input.did,
+        input.keyFingerprint,
+        next.n,
+        input.joinedAt || new Date().toISOString()
+      );
+    this.touchHostedRing(ringId);
+    return this.getHostedRing(ringId);
+  }
+
+  public removeRingMember(ringId: string, siteUrl: string): HostedRing {
+    this.db
+      .prepare('DELETE FROM ring_members WHERE ring_id = ? AND site_url = ?')
+      .run(ringId, normalizeSiteUrl(siteUrl));
+    this.touchHostedRing(ringId);
+    return this.getHostedRing(ringId);
+  }
+
+  public banRingMember(
+    ringId: string,
+    input: { siteUrl: string; did?: string; keyFingerprint?: string; reason?: string }
+  ): HostedRing {
+    const siteUrl = normalizeSiteUrl(input.siteUrl);
+    const member = this.getHostedRing(ringId).members.find((m) => m.siteUrl === siteUrl);
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO ring_bans (ring_id, site_url, did, key_fingerprint, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        ringId,
+        siteUrl,
+        input.did || member?.did || '',
+        input.keyFingerprint || member?.keyFingerprint || '',
+        input.reason || '',
+        new Date().toISOString()
+      );
+    return this.removeRingMember(ringId, siteUrl);
+  }
+
+  public unbanRingMember(ringId: string, siteUrl: string): HostedRing {
+    this.db
+      .prepare('DELETE FROM ring_bans WHERE ring_id = ? AND site_url = ?')
+      .run(ringId, normalizeSiteUrl(siteUrl));
+    return this.getHostedRing(ringId);
+  }
+
+  /** A ban matches by site URL, DID or key, so moving to a new domain doesn't get around it. */
+  public findRingBan(
+    ringId: string,
+    applicant: { siteUrl: string; did?: string; keyFingerprint?: string }
+  ): HostedRingBan | undefined {
+    const siteUrl = normalizeSiteUrl(applicant.siteUrl);
+    return this.getHostedRing(ringId).bans.find(
+      (b) =>
+        b.siteUrl === siteUrl ||
+        (Boolean(applicant.did) && b.did === applicant.did) ||
+        (Boolean(applicant.keyFingerprint) && b.keyFingerprint === applicant.keyFingerprint)
+    );
+  }
+
+  public setRingMemberHidden(ringId: string, siteUrl: string, hidden: boolean): HostedRing {
+    this.db
+      .prepare('UPDATE ring_members SET hidden = ? WHERE ring_id = ? AND site_url = ?')
+      .run(hidden ? 1 : 0, ringId, normalizeSiteUrl(siteUrl));
+    this.touchHostedRing(ringId);
+    return this.getHostedRing(ringId);
+  }
+
+  public moveRingMember(ringId: string, siteUrl: string, direction: 'up' | 'down'): HostedRing {
+    const members = this.getHostedRing(ringId).members;
+    const idx = members.findIndex((m) => m.siteUrl === normalizeSiteUrl(siteUrl));
+    const swapWith = direction === 'up' ? idx - 1 : idx + 1;
+    if (idx === -1 || swapWith < 0 || swapWith >= members.length) {
+      return this.getHostedRing(ringId);
+    }
+    const reordered = [...members];
+    [reordered[idx], reordered[swapWith]] = [reordered[swapWith], reordered[idx]];
+    this.transaction(() => {
+      reordered.forEach((m, i) => {
+        this.db
+          .prepare('UPDATE ring_members SET position = ? WHERE ring_id = ? AND site_url = ?')
+          .run(i + 1, ringId, m.siteUrl);
+      });
+    });
+    this.touchHostedRing(ringId);
+    return this.getHostedRing(ringId);
+  }
+
+  /** Records the outcome of a verified check of a member's own site. */
+  public recordRingMemberCheck(
+    ringId: string,
+    siteUrl: string,
+    result:
+      | { ok: true; listsRing: boolean; displayName?: string; avatarUrl?: string; tagline?: string }
+      | { ok: false }
+  ): void {
+    const normalized = normalizeSiteUrl(siteUrl);
+    const now = new Date().toISOString();
+    if (!result.ok) {
+      this.db
+        .prepare('UPDATE ring_members SET fail_count = fail_count + 1 WHERE ring_id = ? AND site_url = ?')
+        .run(ringId, normalized);
+      return;
+    }
+    this.db
+      .prepare(
+        `UPDATE ring_members SET fail_count = 0, last_verified_at = ?,
+           confirmed_at = CASE WHEN ? THEN COALESCE(confirmed_at, ?) ELSE confirmed_at END,
+           display_name = COALESCE(?, display_name),
+           avatar_url = COALESCE(?, avatar_url), tagline = COALESCE(?, tagline)
+         WHERE ring_id = ? AND site_url = ?`
+      )
+      .run(
+        now,
+        result.listsRing ? 1 : 0,
+        now,
+        result.displayName?.slice(0, 120) ?? null,
+        result.avatarUrl?.slice(0, 2000) ?? null,
+        result.tagline?.slice(0, 200) ?? null,
+        ringId,
+        normalized
+      );
+  }
+
+  /**
+   * Members as published in the hub: the maintainer first (when they're a member), then everyone
+   * else in order. Hidden members stay listed but are skipped by navigation.
+   */
+  public hubMembersFor(ring: HostedRing): WebringHubDocument['members'] {
+    if (ring.status === 'closed') return [];
+    const profile = this.getProfile();
+    const maintainer = ring.maintainerIsMember
+      ? [
+          {
+            siteUrl: normalizeSiteUrl(profile.siteUrl),
+            displayName: profile.displayName,
+            did: siteUrlToDidWeb(profile.siteUrl),
+            joinedAt: ring.createdAt,
+            ...optionalText({
+              avatarUrl: absoluteOnSite(profile.avatarUrl, normalizeSiteUrl(profile.siteUrl)),
+              tagline: profile.tagline,
+            }),
+          },
+        ]
+      : [];
+    return [
+      ...maintainer,
+      ...ring.members
+        .filter((m) => m.siteUrl !== normalizeSiteUrl(profile.siteUrl))
+        .map((m) => ({
+          siteUrl: m.siteUrl,
+          displayName: m.displayName,
+          did: m.did || undefined,
+          joinedAt: m.joinedAt,
+          ...(m.hidden ? { inRotation: false } : {}),
+          ...optionalText({ avatarUrl: m.avatarUrl, tagline: m.tagline }),
+        })),
+    ];
+  }
+
+  /**
+   * Signed hub documents for every hosted ring. Closed rings are still published (with no
+   * members) so members learn the ring closed, even on hosts where old files never get deleted.
+   */
+  public buildSignedHubDocuments(): Array<{ ring: HostedRing; doc: WebringHubDocument }> {
+    const profile = this.getProfile();
+    const siteUrl = normalizeSiteUrl(profile.siteUrl);
+    const did = siteUrlToDidWeb(siteUrl);
+    const rings = this.getHostedRings();
+    if (rings.length === 0) return [];
+    const { privateKeyPem } = this.getKeys();
+    return rings.map((ring) => {
+      const unsigned: WebringHubDocument = {
+        schemaVersion: WEBRING_SCHEMA_VERSION,
+        name: ring.name,
+        description: ring.description,
+        hubUrl: ring.hubUrl,
+        maintainerUrl: siteUrl,
+        maintainerDid: did,
+        status: ring.status,
+        directoryUrl: ring.directoryUrl,
+        ...optionalText({
+          tagline: ring.tagline,
+          rules: ring.rules,
+          bannerUrl: absoluteOnSite(ring.bannerUrl, siteUrl),
+          accent: ring.accent,
+        }),
+        updatedAt: ring.updatedAt,
+        members: this.hubMembersFor(ring),
+      };
+      return { ring, doc: signDocument(unsigned, did, privateKeyPem) };
+    });
+  }
+
+  public getEndorsements(): EndorsementItem[] {
+    const rows = this.db
+      .prepare('SELECT * FROM endorsements ORDER BY created_at DESC')
+      .all() as Array<Record<string, unknown>>;
+
+    return rows.map((r) => ({
+      id: String(r.id),
+      targetCanonicalUrl: String(r.target_canonical_url),
+      authorSiteUrl: String(r.author_site_url),
+      authorName: String(r.author_name),
+      authorAvatarUrl: String(r.author_avatar_url || ''),
+      type: (r.type as SharedItemType) || 'like',
+      commentary: String(r.commentary || ''),
+      sourceItemUrl: String(r.source_item_url),
+      createdAt: String(r.created_at),
+      verifiedSignature: Boolean(r.verified_signature),
+    }));
+  }
+
+  public upsertEndorsement(input: Omit<EndorsementItem, 'id'>): void {
+    const id = `end-${crypto.createHash('sha1').update(input.sourceItemUrl).digest('hex').slice(0, 10)}`;
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO endorsements (
+          id, target_canonical_url, author_site_url, author_name, author_avatar_url,
+          type, commentary, source_item_url, created_at, verified_signature
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.targetCanonicalUrl,
+        input.authorSiteUrl,
+        input.authorName,
+        input.authorAvatarUrl || '',
+        input.type,
+        input.commentary || '',
+        input.sourceItemUrl,
+        input.createdAt,
+        input.verifiedSignature ? 1 : 0
+      );
+  }
+
+  /** The main feed: posts, endorsements and album cards. An album's photos are in getFeedAlbumPhotos. */
+  public getNetworkFeed(): NetworkFeedEntry[] {
+    const rows = this.db
+      .prepare("SELECT * FROM network_feed WHERE entry_type != 'photo' ORDER BY created_at DESC LIMIT 200")
+      .all() as Array<Record<string, unknown>>;
+    return rows.map(mapNetworkFeedRow);
+  }
+
+  /** A friend album's photos, in album order. */
+  public getFeedAlbumPhotos(albumUrl: string): NetworkFeedEntry[] {
+    const rows = this.db
+      .prepare("SELECT * FROM network_feed WHERE album_url = ? AND entry_type = 'photo' ORDER BY created_at ASC")
+      .all(albumUrl) as Array<Record<string, unknown>>;
+    return rows.map(mapNetworkFeedRow);
+  }
+
+  /**
+   * What sync needs to count an album's new photos: the stored album card's newCount (null if
+   * there's no card yet) and the canonical URLs of the photos already stored for it.
+   */
+  public getFeedAlbumSyncState(albumUrl: string): { newCount: number | null; photoUrls: Set<string> } {
+    const card = this.db
+      .prepare("SELECT new_count FROM network_feed WHERE canonical_url = ? AND entry_type = 'album'")
+      .get(albumUrl) as { new_count: number } | undefined;
+    const photos = this.db
+      .prepare("SELECT canonical_url FROM network_feed WHERE album_url = ? AND entry_type = 'photo'")
+      .all(albumUrl) as Array<{ canonical_url: string }>;
+    return { newCount: card ? Number(card.new_count) : null, photoUrls: new Set(photos.map((p) => p.canonical_url)) };
+  }
+
+  /** The user opened the album: its card no longer shows new photos. */
+  public markFeedAlbumSeen(albumUrl: string): void {
+    this.db.prepare("UPDATE network_feed SET new_count = 0 WHERE canonical_url = ? AND entry_type = 'album'").run(albumUrl);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Saved posts (private: never exported or published)
+
+  /** Saves a copy of a feed entry; saving it again keeps the existing copy and note. */
+  public saveFeedEntry(canonicalUrl: string, note = ''): SavedPost {
+    const existing = this.getSavedPosts().find((s) => s.canonicalUrl === canonicalUrl);
+    if (existing) return existing;
+    const entry = this.db.prepare('SELECT * FROM network_feed WHERE canonical_url = ?').get(canonicalUrl) as
+      | Record<string, unknown>
+      | undefined;
+    if (!entry) throw new Error('That post is no longer in your feed.');
+    const id = `saved-${crypto.randomBytes(4).toString('hex')}`;
+    this.db
+      .prepare(
+        `INSERT INTO saved_posts (id, canonical_url, friend_site_url, friend_name, friend_avatar_url, entry_type, title,
+          commentary, target_url, media_url, tags_json, note, created_at, saved_at, verified_signature)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        canonicalUrl,
+        String(entry.friend_site_url),
+        String(entry.friend_name || ''),
+        String(entry.friend_avatar_url || ''),
+        String(entry.entry_type),
+        String(entry.title || ''),
+        String(entry.commentary || ''),
+        String(entry.target_url || ''),
+        String(entry.media_url || ''),
+        String(entry.tags_json || '[]'),
+        note.slice(0, 2000),
+        String(entry.created_at),
+        new Date().toISOString(),
+        entry.verified_signature ? 1 : 0
+      );
+    return this.getSavedPosts().find((s) => s.id === id)!;
+  }
+
+  public getSavedPosts(): SavedPost[] {
+    const rows = this.db.prepare('SELECT * FROM saved_posts ORDER BY saved_at DESC').all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      canonicalUrl: String(r.canonical_url),
+      friendSiteUrl: String(r.friend_site_url),
+      friendName: String(r.friend_name || ''),
+      friendAvatarUrl: String(r.friend_avatar_url || ''),
+      entryType: r.entry_type as SavedPost['entryType'],
+      title: String(r.title || ''),
+      commentary: String(r.commentary || ''),
+      targetUrl: String(r.target_url || ''),
+      mediaUrl: String(r.media_url || ''),
+      localMediaUrl: String(r.local_media_url || ''),
+      tags: JSON.parse(String(r.tags_json || '[]')),
+      note: String(r.note || ''),
+      createdAt: String(r.created_at),
+      savedAt: String(r.saved_at),
+      verifiedSignature: Boolean(r.verified_signature),
+    }));
+  }
+
+  public setSavedLocalMedia(savedId: string, localMediaUrl: string): void {
+    this.db.prepare('UPDATE saved_posts SET local_media_url = ? WHERE id = ?').run(localMediaUrl, savedId);
+  }
+
+  public updateSavedNote(savedId: string, note: string): void {
+    this.db.prepare('UPDATE saved_posts SET note = ? WHERE id = ?').run(String(note || '').slice(0, 2000), savedId);
+  }
+
+  public deleteSavedPost(savedId: string): void {
+    this.db.prepare('DELETE FROM saved_posts WHERE id = ?').run(savedId);
+  }
+
+  /** Library files saved posts use; kept by clean-up but never published. */
+  public getSavedMediaReferences(): Set<string> {
+    const rows = this.db.prepare("SELECT local_media_url AS u FROM saved_posts WHERE local_media_url LIKE 'media/%'").all() as Array<{ u: string }>;
+    return new Set(rows.map((r) => r.u));
+  }
+
+  /**
+   * The feed as the user has curated it: muted and blocked sites removed. Unverified entries
+   * stay (they're badged in the UI) but are counted so the user can see how many there are.
+   */
+  public getCuratedNetworkFeed(): CuratedView<NetworkFeedEntry> {
+    const moderation = new Map(this.getModeration().map((m) => [m.siteUrl, m.action]));
+    const excluded: CuratedExclusions = { muted: 0, blocked: 0, unverified: 0 };
+    const entries = this.getNetworkFeed().filter((entry) => {
+      const action = moderation.get(entry.friendSiteUrl);
+      if (action === 'block') {
+        excluded.blocked++;
+        return false;
+      }
+      if (action === 'mute') {
+        excluded.muted++;
+        return false;
+      }
+      if (!entry.verifiedSignature) excluded.unverified++;
+      return true;
+    });
+    return { entries, excluded };
+  }
+
+  /**
+   * Endorsements with blocked sites removed. With `forExport`, unverified endorsements are
+   * also dropped so the published site only carries signatures we could check. Muting is a
+   * local-reading preference and doesn't affect what's published.
+   */
+  public getCuratedEndorsements(options: { forExport?: boolean } = {}): CuratedView<EndorsementItem> {
+    const moderation = new Map(this.getModeration().map((m) => [m.siteUrl, m.action]));
+    const excluded: CuratedExclusions = { muted: 0, blocked: 0, unverified: 0 };
+    const entries = this.getEndorsements().filter((e) => {
+      const action = moderation.get(normalizeSiteUrl(e.authorSiteUrl));
+      if (action === 'block') {
+        excluded.blocked++;
+        return false;
+      }
+      if (action === 'mute' && !options.forExport) {
+        excluded.muted++;
+        return false;
+      }
+      if (options.forExport && !e.verifiedSignature) {
+        excluded.unverified++;
+        return false;
+      }
+      return true;
+    });
+    return { entries, excluded };
+  }
+
+  /**
+   * Records a successful static-site generation without bumping the profile's `updated_at`
+   * (which would make the profile look "changed since publish").
+   */
+  private getPublishedDocumentStamps(): Map<string, { contentHash: string; updatedAt: string }> {
+    const rows = this.db.prepare('SELECT key, content_hash, updated_at FROM published_documents').all() as Array<{
+      key: string;
+      content_hash: string;
+      updated_at: string;
+    }>;
+    return new Map(rows.map((r) => [r.key, { contentHash: r.content_hash, updatedAt: r.updated_at }]));
+  }
+
+  /** Remembers what each published document contained and when it changed (see `buildSignedSiteBundle`). */
+  public recordPublishedDocuments(bundle: CompleteSiteBundle): void {
+    const docs: Array<[string, Record<string, unknown> & { updatedAt: string }]> = [
+      ['manifest', bundle.manifest],
+      ['profile', bundle.profile],
+      ['albums', bundle.albums],
+      ['items', bundle.items],
+      ['connections', bundle.connections],
+    ];
+    const upsert = this.db.prepare(
+      `INSERT INTO published_documents (key, content_hash, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET content_hash = excluded.content_hash, updated_at = excluded.updated_at`
+    );
+    this.transaction(() => {
+      for (const [key, doc] of docs) upsert.run(key, publishedContentHash(doc), doc.updatedAt);
+    });
+  }
+
+  public recordPublished(publishedAt: string, counts: PublishedCounts, fingerprint?: string): void {
+    const row = this.db.prepare('SELECT publish_settings_json FROM profile WHERE id = 1').get() as {
+      publish_settings_json: string;
+    };
+    const stored = JSON.parse(String(row.publish_settings_json || '{}'));
+    this.db
+      .prepare('UPDATE profile SET publish_settings_json = ? WHERE id = 1')
+      .run(
+        JSON.stringify({
+          ...stored,
+          lastPublishedAt: publishedAt,
+          lastPublishedCounts: counts,
+          ...(fingerprint ? { lastPublishedFingerprint: fingerprint } : {}),
+        })
+      );
+  }
+
+  /**
+   * How many of the user's own items, photos, albums and profile edits are newer than the last publish.
+   */
+  public countChangesSince(sinceIso: string | undefined): number {
+    if (!sinceIso) return 0;
+    const count = (sql: string, params = 1) =>
+      (this.db.prepare(sql).get(...Array(params).fill(sinceIso)) as { n: number }).n;
+    return (
+      count('SELECT COUNT(*) AS n FROM items WHERE created_at > ? OR updated_at > ?', 2) +
+      count('SELECT COUNT(*) AS n FROM photos WHERE created_at > ?') +
+      count('SELECT COUNT(*) AS n FROM albums WHERE updated_at > ?') +
+      count('SELECT COUNT(*) AS n FROM profile WHERE updated_at > ?') +
+      count('SELECT COUNT(*) AS n FROM hosted_rings WHERE updated_at > ?')
+    );
+  }
+
+  public upsertNetworkFeedEntry(entry: Omit<NetworkFeedEntry, 'id'>): void {
+    const id = `feed-${crypto.createHash('sha1').update(entry.canonicalUrl).digest('hex').slice(0, 10)}`;
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO network_feed (
+          id, friend_site_url, friend_name, friend_avatar_url, friend_did,
+          entry_type, title, canonical_url, target_url, commentary,
+          media_url, tags_json, created_at, verified_signature,
+          album_url, photo_count, new_count, peek_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        entry.friendSiteUrl,
+        entry.friendName,
+        entry.friendAvatarUrl,
+        entry.friendDid,
+        entry.entryType,
+        entry.title,
+        entry.canonicalUrl,
+        entry.targetUrl,
+        entry.commentary,
+        entry.mediaUrl,
+        JSON.stringify(entry.tags || []),
+        entry.createdAt,
+        entry.verifiedSignature ? 1 : 0,
+        entry.albumUrl || '',
+        entry.photoCount || 0,
+        entry.newCount || 0,
+        JSON.stringify(entry.peekUrls || [])
+      );
+  }
+
+  /**
+   * The signed site. Studio uses it with all items; with `publish`, items.json holds only the
+   * recent window and older items go to signed monthly archives (`bundle.archives`).
+   */
+  public buildSignedSiteBundle(options: { publish?: boolean } = {}): CompleteSiteBundle {
+    const rawProfile = this.getProfile();
+    const publishSettings = rawProfile.publishSettings;
+    const { publicKeyPem, privateKeyPem } = this.getKeys();
+    const siteUrl = normalizeSiteUrl(rawProfile.siteUrl);
+    const did = siteUrlToDidWeb(siteUrl);
+    const now = new Date().toISOString();
+    // Each document keeps the time its content last changed, and is signed with it, so republishing
+    // leaves unchanged files byte-identical: hosts keep their ETags and friends skip them
+    const stamps = this.getPublishedDocumentStamps();
+    const signStable = <T extends Record<string, unknown> & { updatedAt: string }>(key: string, unsigned: T) => {
+      const previous = stamps.get(key);
+      const updatedAt = previous?.contentHash === publishedContentHash(unsigned) ? previous.updatedAt : now;
+      return signDocument({ ...unsigned, updatedAt }, did, privateKeyPem, updatedAt);
+    };
+
+    const keyRotations = this.getKeyRotations();
+    const didDocument = buildDidDocument(
+      siteUrl,
+      publicKeyPem,
+      rawProfile.atprotoHandle || rawProfile.handle,
+      publishSettings?.atprotoPdsUrl,
+      keyRotations
+    );
+
+    const profileUnsigned: ProfileDocument = {
+      schemaVersion: WEBRING_SCHEMA_VERSION,
+      did,
+      siteUrl,
+      handle: rawProfile.handle,
+      displayName: rawProfile.displayName,
+      tagline: rawProfile.tagline,
+      bio: rawProfile.bio,
+      location: rawProfile.location,
+      avatarUrl: rawProfile.avatarUrl,
+      bannerUrl: rawProfile.bannerUrl,
+      interests: rawProfile.interests,
+      customLinks: rawProfile.customLinks,
+      theme: rawProfile.theme,
+      ...(rawProfile.appearance && Object.keys(rawProfile.appearance).length ? { appearance: rawProfile.appearance } : {}),
+      ...(rawProfile.layout ? { layout: rawProfile.layout } : {}),
+      atprotoHandle: rawProfile.atprotoHandle,
+      ...(rawProfile.commentConfig ? { commentConfig: rawProfile.commentConfig } : {}),
+      ...(rawProfile.analyticsAddon ? { analyticsAddon: rawProfile.analyticsAddon } : {}),
+      ...(rawProfile.adsAddon ? { adsAddon: rawProfile.adsAddon } : {}),
+      updatedAt: now,
+    };
+    const profile = signStable('profile', profileUnsigned);
+
+    const albumList = this.getAlbums();
+    const albumsUnsigned: AlbumsDocument = {
+      schemaVersion: WEBRING_SCHEMA_VERSION,
+      siteUrl,
+      did,
+      updatedAt: now,
+      albums: albumList,
+    };
+    const albums = signStable('albums', albumsUnsigned);
+
+    const rawItems = this.getItems();
+    const exportedItems: SharedItem[] = publishSettings?.redactItemSourceAuthors
+      ? rawItems.map((item) => ({
+          ...item,
+          targetAuthorUrl: undefined,
+          targetAuthorName: undefined,
+          viaUrl: undefined,
+        }))
+      : rawItems;
+
+    const { recent, archived } = options.publish
+      ? splitItemsForPublishing(exportedItems, Date.now())
+      : { recent: exportedItems, archived: [] as SharedItem[] };
+    const archives: Array<{ path: string; doc: ItemsDocument }> = [];
+    const byMonth = new Map<string, SharedItem[]>();
+    for (const item of archived) {
+      const month = item.createdAt.slice(0, 7);
+      byMonth.set(month, [...(byMonth.get(month) || []), item]);
+    }
+    for (const [month, monthItems] of [...byMonth.entries()].sort((a, b) => b[0].localeCompare(a[0]))) {
+      // Signed at the month's last change, so an unchanged month is byte-identical every publish
+      const lastChange = monthItems.map((i) => i.updatedAt || i.createdAt).sort().pop()!;
+      const doc: ItemsDocument = { schemaVersion: WEBRING_SCHEMA_VERSION, siteUrl, did, updatedAt: lastChange, items: monthItems };
+      archives.push({ path: `api/archive/items-${month}.json`, doc: signDocument(doc, did, privateKeyPem, lastChange) });
+    }
+
+    const itemsUnsigned: ItemsDocument = {
+      schemaVersion: WEBRING_SCHEMA_VERSION,
+      siteUrl,
+      did,
+      updatedAt: now,
+      items: recent,
+      ...(archives.length
+        ? {
+            archive: {
+              since: recent.length ? recent[recent.length - 1].createdAt : archived[0].createdAt,
+              months: archives.map(({ path: archivePath, doc }) => ({
+                month: archivePath.slice(-12, -5),
+                url: `/${archivePath}`,
+                count: doc.items.length,
+                sha256: documentFingerprint(doc),
+              })),
+            },
+          }
+        : {}),
+    };
+    const items = signStable('items', itemsUnsigned);
+
+    const allFriends = this.getFriends();
+    const exportedFriends: FriendConnection[] = publishSettings?.publishFriendsList
+      ? allFriends
+          .filter((f) => f.visibility === 'public')
+          .map(({ pinnedPublicKeyPem: _pk, keyStatus: _ks, ...f }) => ({
+            ...f,
+            relationship: publishSettings?.stripRelationshipTags !== false ? [] : f.relationship,
+          }))
+      : [];
+
+    const webringList = this.getWebrings();
+    const exportedEndorsements: EndorsementItem[] = publishSettings?.publishEndorsements
+      ? this.getCuratedEndorsements({ forExport: true }).entries
+      : [];
+
+    const connectionsUnsigned: ConnectionsDocument = {
+      schemaVersion: WEBRING_SCHEMA_VERSION,
+      siteUrl,
+      did,
+      updatedAt: now,
+      friends: exportedFriends,
+      webrings: webringList,
+      endorsements: exportedEndorsements,
+    };
+    const connections = signStable('connections', connectionsUnsigned);
+
+    const totalPhotos = albumList.reduce((acc, a) => acc + a.photos.length, 0);
+    const manifestUnsigned: WebringManifest = {
+      schemaVersion: WEBRING_SCHEMA_VERSION,
+      siteUrl,
+      did,
+      updatedAt: now,
+      endpoints: {
+        did: '/.well-known/did.json',
+        profile: '/api/profile.json',
+        albums: '/api/albums.json',
+        items: '/api/items.json',
+        connections: '/api/connections.json',
+      },
+      stats: {
+        albumCount: albumList.length,
+        photoCount: totalPhotos,
+        itemCount: exportedItems.length,
+        friendCount: exportedFriends.length,
+        webringCount: webringList.length,
+      },
+      documents: {
+        did: { sha256: documentFingerprint(didDocument) },
+        profile: { sha256: documentFingerprint(profile) },
+        albums: { sha256: documentFingerprint(albums) },
+        items: { sha256: documentFingerprint(items) },
+        connections: { sha256: documentFingerprint(connections) },
+      },
+      ...(keyRotations.length > 0 ? { keyRotations } : {}),
+    };
+    const manifest = signStable('manifest', manifestUnsigned);
+
+    return {
+      didDocument,
+      manifest,
+      profile,
+      albums,
+      items,
+      connections,
+      ...(options.publish ? { archives } : {}),
+    };
+  }
+
+  public close(): void {
+    this.db.close();
+  }
+}
