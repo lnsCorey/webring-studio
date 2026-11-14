@@ -122,6 +122,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   setSchedule: (change: unknown) => ipcRenderer.invoke('studio:set-schedule', change),
   runJobNow: (personaId: string, job: 'sync' | 'publish') =>
     ipcRenderer.invoke('studio:run-job-now', personaId, job),
+  autoPublishNow: (personaId: string) => ipcRenderer.invoke('studio:auto-publish-now', personaId),
+  autoPublishCancel: (personaId: string) => ipcRenderer.invoke('studio:auto-publish-cancel', personaId),
   onScheduleUpdated: (callback: () => void) => {
     const listener = () => callback();
     ipcRenderer.on('studio:schedule-updated', listener);

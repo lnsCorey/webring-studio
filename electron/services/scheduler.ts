@@ -35,9 +35,42 @@ export interface JobSchedule {
   lastResult?: JobResult;
 }
 
+/** Delays offered for auto-publish; changes made within the window go out together. */
+export const AUTO_PUBLISH_DELAYS_SECONDS = [30, 120, 600, 3600] as const;
+export type AutoPublishDelaySeconds = (typeof AUTO_PUBLISH_DELAYS_SECONDS)[number];
+
+/**
+ * Sync and publish automatically a short while after a local change (a post, like, share,
+ * photo import, new friend or ring). Uses the publish job's destination.
+ */
+export interface AutoPublishSettings {
+  enabled: boolean;
+  delaySeconds: AutoPublishDelaySeconds;
+}
+
 export interface PersonaSchedule {
   sync: JobSchedule;
   publish: JobSchedule & { destination: PublishDestination; syncFirst: boolean };
+  autoPublish: AutoPublishSettings;
+}
+
+export function defaultAutoPublish(): AutoPublishSettings {
+  return { enabled: false, delaySeconds: 120 };
+}
+
+export function normalizeAutoPublish(value: unknown): AutoPublishSettings {
+  const input = (value && typeof value === 'object' ? value : {}) as Partial<AutoPublishSettings>;
+  const delay = Number(input.delaySeconds);
+  return {
+    enabled: input.enabled === true,
+    delaySeconds: (AUTO_PUBLISH_DELAYS_SECONDS as readonly number[]).includes(delay)
+      ? (delay as AutoPublishDelaySeconds)
+      : defaultAutoPublish().delaySeconds,
+  };
+}
+
+export function describeAutoPublishDelay(seconds: number): string {
+  return seconds < 60 ? `${seconds} s` : seconds < 3600 ? `${seconds / 60} min` : `${seconds / 3600} h`;
 }
 
 export interface SchedulerConfig {
@@ -63,6 +96,7 @@ export function defaultPersonaSchedule(now = new Date()): PersonaSchedule {
       destination: 'local',
       syncFirst: true,
     },
+    autoPublish: defaultAutoPublish(),
   };
 }
 
@@ -177,7 +211,12 @@ export class Scheduler {
     }
     const known = new Set(this.options.listPersonaIds());
     for (const id of Object.keys(config.personas)) {
-      if (!known.has(id)) delete config.personas[id];
+      if (!known.has(id)) {
+        delete config.personas[id];
+        continue;
+      }
+      // Files written before auto-publish existed have no setting for it
+      config.personas[id] = { ...config.personas[id], autoPublish: normalizeAutoPublish(config.personas[id].autoPublish) };
     }
     return config;
   }
@@ -203,6 +242,7 @@ export class Scheduler {
     patch: {
       sync?: Partial<Pick<JobSchedule, 'enabled' | 'preset' | 'jitterMinutes'>>;
       publish?: Partial<Pick<PersonaSchedule['publish'], 'enabled' | 'preset' | 'destination' | 'syncFirst' | 'jitterMinutes'>>;
+      autoPublish?: Partial<AutoPublishSettings>;
     }
   ): PersonaSchedule {
     const config = this.loadConfig();
@@ -227,9 +267,20 @@ export class Scheduler {
     config.personas[personaId] = {
       sync: apply<JobSchedule>(current.sync, patch.sync),
       publish: apply<PersonaSchedule['publish']>(current.publish, patch.publish),
+      autoPublish: normalizeAutoPublish({ ...current.autoPublish, ...(patch.autoPublish || {}) }),
     };
     this.saveConfig(config);
     return config.personas[personaId];
+  }
+
+  /**
+   * Adds a run that happened outside the schedule (an auto-publish) to the history, without
+   * moving the scheduled job's anchor.
+   */
+  public recordHistory(personaId: string, job: ScheduledJobKind, result: JobResult): void {
+    const config = this.loadConfig();
+    config.history = [{ ...result, personaId, job }, ...config.history].slice(0, HISTORY_LIMIT);
+    this.saveConfig(config);
   }
 
   public setAppSettings(

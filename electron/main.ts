@@ -18,7 +18,7 @@ import {
 import * as path from 'path';
 import * as fs from 'fs';
 import { pathToFileURL } from 'url';
-import { PersonaManager } from './services/personaManager';
+import { ActivePersonaContext, PersonaManager } from './services/personaManager';
 import { buildEditContextMenu } from './editContextMenu';
 import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
@@ -28,6 +28,7 @@ import { isRingMemberFlagged } from './services/ringService';
 import {
   describePreset,
   jobNextRunAt,
+  JobResult,
   PersonaSchedule,
   PublishDestination,
   ScheduledJobKind,
@@ -35,6 +36,7 @@ import {
   SchedulerConfig,
 } from './services/scheduler';
 import { notifyWebringHubs, publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
+import { AutoPublisher } from './services/autoPublisher';
 import { parseProxyUrl } from './security/proxyAgent';
 import { GitHubDeviceLogin } from './services/githubAuth';
 import {
@@ -76,6 +78,7 @@ let localPreviewServer: LocalPreviewServer;
 let webringMcpServer: WebringMcpServer;
 let mcpHttpServer: McpHttpServer;
 let scheduler: Scheduler;
+let autoPublisher: AutoPublisher;
 let tray: Tray | null = null;
 let isQuitting = false;
 let startupComplete = false;
@@ -164,6 +167,46 @@ function scheduleWebringHubFollowUp(personaId: string): void {
   webringHubFollowUps.set(personaId, timers);
 }
 
+/** After a scheduled job or an auto-publish: hub follow-ups, failure notice, tray and UI refresh. */
+function handleJobFinished(personaId: string, job: ScheduledJobKind, result: JobResult, title: string): void {
+  if (job === 'publish' && result.status === 'ok') scheduleWebringHubFollowUp(personaId);
+  const config = scheduler.loadConfig();
+  if (result.status === 'failed' && config.notifyOnFailure && Notification.isSupported()) {
+    new Notification({
+      title: `${title} failed: ${personaLabel(personaId)}`,
+      body: result.message.slice(0, 200),
+    }).show();
+  }
+  refreshTrayMenu();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('studio:schedule-updated', { personaId, job, result });
+  }
+}
+
+/**
+ * A local change that friends should see: starts (or joins) the persona's pending auto-publish
+ * when it's turned on. Never throws, so it can't fail the change itself.
+ */
+function noteLocalChange(personaId: string, reason: string): void {
+  try {
+    autoPublisher?.noteLocalChange(personaId, reason);
+  } catch {
+    // Auto-publish is a convenience; the change is saved either way
+  }
+}
+
+const noteActiveChange = (reason: string) => noteLocalChange(personaManager.getActivePersonaId(), reason);
+
+/** Runs a pull (one friend, joined rings) in the background under the persona's lock, then refreshes the UI. */
+function pullInBackground(personaId: string, fn: (ctx: ActivePersonaContext) => Promise<unknown>): void {
+  void scheduler
+    .runExclusive(personaId, () => personaManager.withPersonaContext(personaId, fn))
+    .catch(() => undefined)
+    .then(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:schedule-updated');
+    });
+}
+
 /** Every persona's schedule with its next run, for the UI, tray and MCP. */
 function scheduleOverview() {
   const config = scheduler.loadConfig();
@@ -175,6 +218,7 @@ function scheduleOverview() {
       personaId: record.id,
       label: record.label,
       schedule,
+      autoPublishStatus: autoPublisher ? autoPublisher.status(record.id) : null,
       nextSyncAt: next('sync'),
       nextPublishAt: next('publish'),
       describe: {
@@ -230,6 +274,7 @@ function refreshTrayMenu() {
         label: overview.app.paused ? 'Resume schedules' : 'Pause schedules',
         click: () => {
           scheduler.setAppSettings({ paused: !overview.app.paused });
+          void autoPublisher.refresh();
           refreshTrayMenu();
           mainWindow?.webContents.send('studio:schedule-updated');
           if (overview.app.paused) void scheduler.tick();
@@ -298,22 +343,29 @@ async function initServices() {
           runScheduledPublish(ctx, destination, syncFirst, publishPaths())
         ),
     },
-    onJobFinished: (personaId, job, result) => {
-      if (job === 'publish' && result.status === 'ok') scheduleWebringHubFollowUp(personaId);
-      const config = scheduler.loadConfig();
-      if (result.status === 'failed' && config.notifyOnFailure && Notification.isSupported()) {
-        new Notification({
-          title: `Scheduled ${job} failed: ${personaLabel(personaId)}`,
-          body: result.message.slice(0, 200),
-        }).show();
-      }
-      refreshTrayMenu();
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('studio:schedule-updated', { personaId, job, result });
-      }
-    },
+    onJobFinished: (personaId, job, result) => handleJobFinished(personaId, job, result, `Scheduled ${job}`),
   });
   applyLoginItem(scheduler.loadConfig());
+
+  autoPublisher = new AutoPublisher({
+    scheduler,
+    listPersonaIds: () => personaManager.listPersonaRecords().map((p) => p.id),
+    publish: (personaId, destination) =>
+      personaManager.withPersonaContext(personaId, (ctx) =>
+        runScheduledPublish(ctx, destination, true, publishPaths())
+      ),
+    hasUnpublishedChanges: (personaId) =>
+      personaManager.withPersonaContext(personaId, async (ctx) => {
+        // Only personas that have published before: a first publish is the user's call
+        const published = ctx.db.getProfile().publishSettings.lastPublishedFingerprint;
+        return Boolean(published) && ctx.siteGenerator.contentFingerprint() !== published;
+      }),
+    onStatusChange: () => {
+      refreshTrayMenu();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:schedule-updated');
+    },
+    onFinished: (personaId, result) => handleJobFinished(personaId, 'publish', result, 'Auto-publish'),
+  });
 
   // Older versions generated a fictional demo friend's site here; it's no longer used
   fs.rmSync(path.join(userDataDir, DEMO_PEER_FOLDER_NAME), { recursive: true, force: true });
@@ -325,6 +377,8 @@ async function initServices() {
       if (/^https:\/\/github\.com\//i.test(url)) void shell.openExternal(url);
     },
     onPublished: scheduleWebringHubFollowUp,
+    onLocalChange: noteLocalChange,
+    onAutoPublishSettingsChanged: (personaId) => void autoPublisher.refresh([personaId]),
   });
 
   mcpHttpServer = new McpHttpServer(webringMcpServer, {
@@ -480,6 +534,8 @@ if (!gotTheLock) {
     }
     createTray();
     scheduler.start();
+    // Changes left unpublished when the app last quit get their auto-publish back
+    void autoPublisher.refresh();
     // Catch up after sleep; the 60-second tick handles everything else
     powerMonitor.on('resume', () => void scheduler.tick());
     powerMonitor.on('unlock-screen', () => void scheduler.tick());
@@ -512,6 +568,7 @@ app.on('activate', () => {
 app.on('before-quit', () => {
   isQuitting = true;
   scheduler?.stop();
+  autoPublisher?.dispose();
 });
 
 function registerIpcHandlers() {
@@ -643,16 +700,20 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:delete-album', (_e, albumId: string) => {
     const ctx = personaManager.getActiveContext();
     deleteAlbumWithFiles(ctx.db, ctx.mediaLibrary, albumId);
+    noteActiveChange('album');
     return { ok: true };
   });
 
   ipcMain.handle('studio:add-photo', (_e, input) => {
-    return personaManager.getActiveContext().db.addPhotoToAlbum(input);
+    const photo = personaManager.getActiveContext().db.addPhotoToAlbum(input);
+    noteActiveChange('photo');
+    return photo;
   });
 
   ipcMain.handle('studio:delete-photo', (_e, photoId: string) => {
     const ctx = personaManager.getActiveContext();
     deletePhotoWithFiles(ctx.db, ctx.mediaLibrary, photoId);
+    noteActiveChange('photo');
     return { ok: true };
   });
 
@@ -671,7 +732,9 @@ function registerIpcHandlers() {
       files = result.filePaths;
     }
     const ctx = personaManager.getActiveContext();
-    return importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
+    const imported = importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
+    if (imported.added.length > 0) noteActiveChange('photos');
+    return imported;
   });
 
   // A single image for a wall post: same optimizing, metadata-stripping pipeline as album photos
@@ -697,25 +760,31 @@ function registerIpcHandlers() {
     if (result.canceled || result.filePaths.length === 0) return { replaced: false };
     const ctx = personaManager.getActiveContext();
     replacePhotoImage(ctx.db, ctx.mediaLibrary, photoId, result.filePaths[0]);
+    noteActiveChange('photo');
     return { replaced: true };
   });
 
   ipcMain.handle(
     'studio:media-update-photo',
     (_e, photoId: string, updates: { caption?: string; altText?: string; tags?: string[] }) => {
-      return personaManager.getActiveContext().db.updatePhotoDetails(photoId, updates);
+      const photo = personaManager.getActiveContext().db.updatePhotoDetails(photoId, updates);
+      noteActiveChange('photo');
+      return photo;
     }
   );
 
   ipcMain.handle('studio:media-move-photo', (_e, photoId: string, direction: 'up' | 'down') => {
     personaManager.getActiveContext().db.movePhoto(photoId, direction);
+    noteActiveChange('album');
     return { ok: true };
   });
 
   ipcMain.handle(
     'studio:media-update-album',
     (_e, albumId: string, updates: { title?: string; description?: string; tags?: string[]; coverUrl?: string; postToFeed?: boolean; display?: 'card' | 'expanded' }) => {
-      return personaManager.getActiveContext().db.updateAlbum(albumId, updates);
+      const album = personaManager.getActiveContext().db.updateAlbum(albumId, updates);
+      noteActiveChange('album');
+      return album;
     }
   );
 
@@ -731,13 +800,16 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:create-item', (_e, input) => {
-    return personaManager.getActiveContext().db.createItem(input);
+    const item = personaManager.getActiveContext().db.createItem(input);
+    noteActiveChange(String(item?.type || 'post'));
+    return item;
   });
 
   ipcMain.handle('studio:update-item', (_e, itemId: string, updates) => {
     const ctx = personaManager.getActiveContext();
     const item = ctx.db.updateItem(itemId, updates);
     cleanUpLibrary(ctx.db, ctx.mediaLibrary); // a replaced or removed post image
+    noteActiveChange(String(item?.type || 'post'));
     return item;
   });
 
@@ -745,11 +817,19 @@ function registerIpcHandlers() {
     const ctx = personaManager.getActiveContext();
     ctx.db.deleteItem(itemId);
     cleanUpLibrary(ctx.db, ctx.mediaLibrary);
+    noteActiveChange('deleted item');
     return { ok: true };
   });
 
   ipcMain.handle('studio:add-friend', (_e, input) => {
-    return personaManager.getActiveContext().db.addOrUpdateFriend(input);
+    const personaId = personaManager.getActivePersonaId();
+    const friend = personaManager.getActiveContext().db.addOrUpdateFriend(input);
+    if (scheduler.getPersonaSchedule(personaId).autoPublish.enabled && friend?.siteUrl) {
+      // Pull the new friend's site straight away so their posts show up without a Sync All
+      pullInBackground(personaId, (ctx) => ctx.ringCrawler.crawlFriendSite(friend.siteUrl));
+    }
+    noteLocalChange(personaId, 'friend');
+    return friend;
   });
 
   ipcMain.handle('studio:update-friend', (_e, friendId: string, updates) => {
@@ -778,11 +858,14 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:set-friend-visibility', (_e, friendId: string, visibility: 'private' | 'public') => {
-    return personaManager.getActiveContext().db.setFriendVisibility(friendId, visibility);
+    const friend = personaManager.getActiveContext().db.setFriendVisibility(friendId, visibility);
+    noteActiveChange('friend');
+    return friend;
   });
 
   ipcMain.handle('studio:delete-friend', (_e, friendId: string) => {
     personaManager.getActiveContext().db.deleteFriend(friendId);
+    noteActiveChange('friend');
     return { ok: true };
   });
 
@@ -799,13 +882,15 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
-  ipcMain.handle('studio:crawl-friend', async (_e, siteUrl: string, localDirOverride?: string) => {
-    return await personaManager.getActiveContext().ringCrawler.crawlFriendSite(siteUrl, localDirOverride);
-  });
-
   // Manual syncs and publishes share the scheduler's per-persona lock, so they never overlap a scheduled run
   const withActiveLock = <T>(fn: () => Promise<T>) =>
     scheduler.runExclusive(personaManager.getActivePersonaId(), fn);
+
+  ipcMain.handle('studio:crawl-friend', async (_e, siteUrl: string, localDirOverride?: string) => {
+    return withActiveLock(() =>
+      personaManager.getActiveContext().ringCrawler.crawlFriendSite(siteUrl, localDirOverride)
+    );
+  });
 
   ipcMain.handle('studio:crawl-all-friends', async (event) => {
     return withActiveLock(async () => {
@@ -849,7 +934,14 @@ function registerIpcHandlers() {
   );
 
   ipcMain.handle('studio:ring-request-join', async (_e, hubUrl: string) => {
-    return await personaManager.getActiveContext().ringService.requestToJoin(hubUrl);
+    const personaId = personaManager.getActivePersonaId();
+    const request = await personaManager.getActiveContext().ringService.requestToJoin(hubUrl);
+    if (scheduler.getPersonaSchedule(personaId).autoPublish.enabled) {
+      // Pick up the ring's member list as soon as the maintainer has published it
+      pullInBackground(personaId, (ctx) => ctx.ringService.syncJoinedRings());
+    }
+    noteLocalChange(personaId, 'webring');
+    return request;
   });
 
   ipcMain.handle('studio:ring-review-request', async (_e, link: string) => {
@@ -859,7 +951,10 @@ function registerIpcHandlers() {
   ipcMain.handle(
     'studio:ring-decide-request',
     async (_e, link: string, decision: 'approve' | 'decline' | 'ban', reason?: string) => {
-      return await personaManager.getActiveContext().ringService.decideRequest(link, decision, reason);
+      const outcome = await personaManager.getActiveContext().ringService.decideRequest(link, decision, reason);
+      // An approval only reaches the new member once the ring's files are published
+      noteActiveChange('webring');
+      return outcome;
     }
   );
 
@@ -871,7 +966,10 @@ function registerIpcHandlers() {
     return await personaManager.getActiveContext().ringService.reviewFriendNotice(String(link));
   });
   ipcMain.handle('studio:friend-notice-accept', async (_e, link: string) => {
-    return await personaManager.getActiveContext().ringService.acceptFriendNotice(String(link));
+    const personaId = personaManager.getActivePersonaId();
+    const accepted = await personaManager.getActiveContext().ringService.acceptFriendNotice(String(link));
+    noteLocalChange(personaId, 'friend');
+    return accepted;
   });
   ipcMain.handle('studio:friend-notice-dismiss', (_e, siteUrl: string) => {
     personaManager.getActiveContext().db.dismissFriendNotice(String(siteUrl));
@@ -892,20 +990,29 @@ function registerIpcHandlers() {
 
   ipcMain.handle(
     'studio:set-schedule',
-    (
+    async (
       _e,
       change:
-        | { personaId: string; sync?: Record<string, unknown>; publish?: Record<string, unknown> }
+        | {
+            personaId: string;
+            sync?: Record<string, unknown>;
+            publish?: Record<string, unknown>;
+            autoPublish?: Record<string, unknown>;
+          }
         | { app: Partial<Pick<SchedulerConfig, 'runInBackground' | 'startAtLogin' | 'paused' | 'notifyOnFailure'>> }
     ) => {
       if ('app' in change) {
         const config = scheduler.setAppSettings(change.app);
         applyLoginItem(config);
+        if (change.app.paused !== undefined) await autoPublisher.refresh();
       } else {
         scheduler.setPersonaSchedule(change.personaId, {
           sync: change.sync as Parameters<Scheduler['setPersonaSchedule']>[1]['sync'],
           publish: change.publish as Parameters<Scheduler['setPersonaSchedule']>[1]['publish'],
+          autoPublish: change.autoPublish as Parameters<Scheduler['setPersonaSchedule']>[1]['autoPublish'],
         });
+        // Turning auto-publish on picks up changes already waiting; turning it off cancels a pending one
+        if (change.autoPublish) await autoPublisher.refresh([change.personaId]);
       }
       refreshTrayMenu();
       return scheduleOverview();
@@ -917,8 +1024,20 @@ function registerIpcHandlers() {
     return { result, overview: scheduleOverview() };
   });
 
+  ipcMain.handle('studio:auto-publish-now', async (_e, personaId: string) => {
+    const result = await autoPublisher.publishNow(String(personaId));
+    return { result, overview: scheduleOverview() };
+  });
+
+  ipcMain.handle('studio:auto-publish-cancel', (_e, personaId: string) => {
+    autoPublisher.cancel(String(personaId));
+    return scheduleOverview();
+  });
+
   ipcMain.handle('studio:hosted-ring-create', (_e, input: { name: string; description?: string }) => {
-    return personaManager.getActiveContext().db.createHostedRing(input);
+    const ring = personaManager.getActiveContext().db.createHostedRing(input);
+    noteActiveChange('webring');
+    return ring;
   });
 
   ipcMain.handle('studio:hosted-ring-update', (_e, ringId: string, updates) => {
