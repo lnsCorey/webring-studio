@@ -6233,3 +6233,142 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
     }
   });
 });
+
+describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-sec-p3-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('pins SFTP host key fingerprints on first use and fails closed on change', async () => {
+    const { verifyOrPinSftpHostKey } = await import('../electron/services/publisher');
+    const db = new StudioDatabase(tempRoot, 'sftp.sqlite');
+    try {
+      expect(verifyOrPinSftpHostKey(db, 'files.example', 22, 'aabbcc').accepted).toBe(true);
+      expect(verifyOrPinSftpHostKey(db, 'files.example', 22, 'AABBCC').accepted).toBe(true);
+      const changed = verifyOrPinSftpHostKey(db, 'files.example', 22, '112233');
+      expect(changed.accepted).toBe(false);
+      expect(changed.reason).toContain('changed');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('isolates MCP personaId calls without switching the app active persona and redacts proxy credentials', async () => {
+    const manager = new PersonaManager(path.join(tempRoot, 'iso'));
+    const created = manager.createPersona({
+      label: 'Alt',
+      displayName: 'Alt Persona',
+      siteUrl: 'https://alt.sec.test',
+    });
+    manager.switchPersona('default');
+    const mcp = new WebringMcpServer(manager, tempRoot);
+    try {
+      const res = await mcp.executeToolCall('webring_get_profile', { personaId: created.created.id });
+      expect(res.isError).toBeUndefined();
+      expect((res.data as { displayName: string }).displayName).toBe('Alt Persona');
+      expect(manager.getActivePersonaId()).toBe('default');
+
+      const proxyRes = await mcp.executeToolCall('webring_set_proxy', {
+        personaId: created.created.id,
+        enabled: true,
+        proxyUrl: 'socks5h://user:supersecret@127.0.0.1:9050',
+      });
+      expect(JSON.stringify(proxyRes.data)).not.toContain('supersecret');
+      expect(JSON.stringify(mcp.getActivityLog())).not.toContain('supersecret');
+    } finally {
+      manager.closeAll();
+    }
+  });
+
+  it('inlines compiled Tailwind CSS, avoids dicebear, and omits unused comment CSP hosts', () => {
+    const db = new StudioDatabase(tempRoot, 'gen.sqlite');
+    try {
+      db.updateProfile({ siteUrl: 'https://clean.sec.test', displayName: 'Clean Site' });
+      const outDir = path.join(tempRoot, 'out');
+      new StaticSiteGenerator(db).generateToDirectory(outDir);
+      const html = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+      const csp = html.match(/http-equiv="Content-Security-Policy"[^>]*>/)?.[0] || '';
+      expect(html).not.toContain('cdn.tailwindcss.com');
+      expect(html).not.toContain('api.dicebear.com');
+      expect(csp).not.toContain('https://giscus.app');
+      expect(csp).not.toContain('https://utteranc.es');
+      expect(fs.existsSync(path.join(outDir, '.webring-studio'))).toBe(true);
+
+      const nonStudioDir = path.join(tempRoot, 'foreign');
+      fs.mkdirSync(nonStudioDir);
+      fs.writeFileSync(path.join(nonStudioDir, 'important.txt'), 'keep me');
+      expect(() => new StaticSiteGenerator(db).generateToDirectory(nonStudioDir)).toThrow(/marker/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('prevents document rollback, requires manifest proof, and isolates feed/endorsement row ownership', async () => {
+    const myDb = new StudioDatabase(path.join(tempRoot, 'my'), 'my.sqlite');
+    const friendDb = new StudioDatabase(path.join(tempRoot, 'friend'), 'friend.sqlite');
+    try {
+      expect(myDb.checkDocumentFreshness('https://f.test/api/profile.json', '2026-11-16T12:00:00.000Z', true)).toBe(true);
+      expect(myDb.checkDocumentFreshness('https://f.test/api/profile.json', '2026-11-16T11:00:00.000Z', true)).toBe(false);
+
+      // Feed & endorsement ownership protection
+      myDb.upsertNetworkFeedEntry({
+        friendSiteUrl: 'https://alice.sec.test',
+        friendName: 'Alice',
+        friendAvatarUrl: '',
+        friendDid: 'did:web:alice.sec.test',
+        entryType: 'post',
+        title: 'Alice Post',
+        canonicalUrl: 'https://alice.sec.test/posts/1',
+        targetUrl: '',
+        commentary: 'Verified content',
+        mediaUrl: '',
+        tags: [],
+        createdAt: '2026-11-16T10:00:00.000Z',
+        verifiedSignature: true,
+      });
+      // Another friend or unverified fetch cannot overwrite it
+      myDb.upsertNetworkFeedEntry({
+        friendSiteUrl: 'https://mallory.sec.test',
+        friendName: 'Mallory',
+        friendAvatarUrl: '',
+        friendDid: 'did:web:mallory.sec.test',
+        entryType: 'post',
+        title: 'Hijacked',
+        canonicalUrl: 'https://alice.sec.test/posts/1',
+        targetUrl: '',
+        commentary: 'Tampered',
+        mediaUrl: '',
+        tags: [],
+        createdAt: '2026-11-16T11:00:00.000Z',
+        verifiedSignature: true,
+      });
+      myDb.upsertNetworkFeedEntry({
+        friendSiteUrl: 'https://alice.sec.test',
+        friendName: 'Alice',
+        friendAvatarUrl: '',
+        friendDid: 'did:web:alice.sec.test',
+        entryType: 'post',
+        title: 'Unverified',
+        canonicalUrl: 'https://alice.sec.test/posts/1',
+        targetUrl: '',
+        commentary: 'Downgraded',
+        mediaUrl: '',
+        tags: [],
+        createdAt: '2026-11-16T11:00:00.000Z',
+        verifiedSignature: false,
+      });
+      const feed = myDb.getNetworkFeed();
+      expect(feed).toHaveLength(1);
+      expect(feed[0].commentary).toBe('Verified content');
+    } finally {
+      myDb.close();
+      friendDb.close();
+    }
+  });
+});

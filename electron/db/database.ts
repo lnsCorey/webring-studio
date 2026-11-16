@@ -188,6 +188,9 @@ export interface PublishSettings {
   port: number;
   username: string;
   password?: string;
+  sftpPrivateKeyPath?: string;
+  sftpUseAgent?: boolean;
+  ftpAllowInsecure?: boolean;
   remotePath: string;
   atprotoPdsUrl?: string;
   publishFriendsList?: boolean;
@@ -3015,9 +3018,11 @@ export class StudioDatabase {
     if (!row?.value) return { enabled: false, proxyUrl: '' };
     try {
       const parsed = JSON.parse(row.value) as { enabled?: unknown; proxyUrl?: unknown };
+      const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
+      const unsealed = raw ? openSecret(raw, this.keyCipher).trim() : '';
       return {
-        enabled: Boolean(parsed.enabled && typeof parsed.proxyUrl === 'string' && parsed.proxyUrl.trim()),
-        proxyUrl: typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '',
+        enabled: Boolean(parsed.enabled && unsealed),
+        proxyUrl: unsealed,
       };
     } catch {
       return { enabled: false, proxyUrl: '' };
@@ -3052,16 +3057,62 @@ export class StudioDatabase {
     }
     const nextEnabled =
       input.enabled !== undefined ? Boolean(input.enabled && nextUrl) : Boolean(current.enabled && nextUrl);
+    const storedUrl = nextUrl ? sealSecret(nextUrl, this.keyCipher) : '';
     const next = { enabled: nextEnabled, proxyUrl: nextUrl };
     this.db
       .prepare(
         "INSERT INTO local_settings (key, value) VALUES ('proxySettingsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
       )
-      .run(JSON.stringify(next));
+      .run(JSON.stringify({ enabled: nextEnabled, proxyUrl: storedUrl }));
     if (next.enabled !== current.enabled || next.proxyUrl !== current.proxyUrl) {
       this.clearFetchCache();
     }
     return next;
+  }
+
+  /**
+   * Checks whether `updatedAt` is at least as new as the last verified timestamp for `docUrl`.
+   * If `record` is true and the check passes, saves the new timestamp.
+   */
+  public checkDocumentFreshness(docUrl: string, updatedAt?: string, record = false): boolean {
+    if (!updatedAt) return true;
+    const nextTs = Date.parse(updatedAt);
+    if (!Number.isFinite(nextTs)) return false;
+    const key = `doc_updated_at:${docUrl}`;
+    const row = this.db.prepare('SELECT value FROM local_settings WHERE key = ?').get(key) as
+      | { value: string }
+      | undefined;
+    if (row?.value) {
+      const prevTs = Date.parse(row.value);
+      if (Number.isFinite(prevTs) && nextTs < prevTs) {
+        return false;
+      }
+    }
+    if (record) {
+      this.db
+        .prepare(
+          'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        )
+        .run(key, updatedAt);
+    }
+    return true;
+  }
+
+  public getSftpHostKeyFingerprint(host: string, port: number): string | null {
+    const key = `sftp_host_key:${host.trim().toLowerCase()}:${port}`;
+    const row = this.db
+      .prepare('SELECT value FROM local_settings WHERE key = ?')
+      .get(key) as { value: string } | undefined;
+    return row ? row.value : null;
+  }
+
+  public setSftpHostKeyFingerprint(host: string, port: number, fingerprint: string): void {
+    const key = `sftp_host_key:${host.trim().toLowerCase()}:${port}`;
+    this.db
+      .prepare(
+        'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+      )
+      .run(key, fingerprint);
   }
 
   // ---------------------------------------------------------------------------
@@ -3577,13 +3628,31 @@ export class StudioDatabase {
   }
 
   public upsertEndorsement(input: Omit<EndorsementItem, 'id'>): void {
-    const id = `end-${crypto.createHash('sha1').update(input.sourceItemUrl).digest('hex').slice(0, 10)}`;
+    const id = `end-${crypto
+      .createHash('sha256')
+      .update(`${input.authorSiteUrl}\0${input.sourceItemUrl}`)
+      .digest('hex')}`;
+    const existing = this.db
+      .prepare('SELECT author_site_url, verified_signature FROM endorsements WHERE id = ? OR source_item_url = ?')
+      .get(id, input.sourceItemUrl) as { author_site_url: string; verified_signature: number } | undefined;
+    if (existing) {
+      if (existing.author_site_url !== input.authorSiteUrl) return;
+      if (existing.verified_signature && !input.verifiedSignature) return;
+    }
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO endorsements (
+        `INSERT INTO endorsements (
           id, target_canonical_url, author_site_url, author_name, author_avatar_url,
           type, commentary, source_item_url, created_at, verified_signature
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          target_canonical_url = excluded.target_canonical_url,
+          author_name = excluded.author_name,
+          author_avatar_url = excluded.author_avatar_url,
+          type = excluded.type,
+          commentary = excluded.commentary,
+          created_at = excluded.created_at,
+          verified_signature = excluded.verified_signature`
       )
       .run(
         id,
@@ -3827,15 +3896,41 @@ export class StudioDatabase {
   }
 
   public upsertNetworkFeedEntry(entry: Omit<NetworkFeedEntry, 'id'>): void {
-    const id = `feed-${crypto.createHash('sha1').update(entry.canonicalUrl).digest('hex').slice(0, 10)}`;
+    const id = `feed-${crypto
+      .createHash('sha256')
+      .update(`${entry.friendSiteUrl}\0${entry.canonicalUrl}`)
+      .digest('hex')}`;
+    const existing = this.db
+      .prepare('SELECT friend_site_url, verified_signature FROM network_feed WHERE id = ? OR canonical_url = ?')
+      .get(id, entry.canonicalUrl) as { friend_site_url: string; verified_signature: number } | undefined;
+    if (existing) {
+      if (existing.friend_site_url !== entry.friendSiteUrl) return;
+      if (existing.verified_signature && !entry.verifiedSignature) return;
+    }
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO network_feed (
+        `INSERT INTO network_feed (
           id, friend_site_url, friend_name, friend_avatar_url, friend_did,
           entry_type, title, canonical_url, target_url, commentary,
           media_url, tags_json, created_at, verified_signature,
           album_url, photo_count, new_count, peek_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          friend_name = excluded.friend_name,
+          friend_avatar_url = excluded.friend_avatar_url,
+          friend_did = excluded.friend_did,
+          entry_type = excluded.entry_type,
+          title = excluded.title,
+          target_url = excluded.target_url,
+          commentary = excluded.commentary,
+          media_url = excluded.media_url,
+          tags_json = excluded.tags_json,
+          created_at = excluded.created_at,
+          verified_signature = excluded.verified_signature,
+          album_url = excluded.album_url,
+          photo_count = excluded.photo_count,
+          new_count = excluded.new_count,
+          peek_json = excluded.peek_json`
       )
       .run(
         id,

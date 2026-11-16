@@ -10,8 +10,9 @@
   "scripts": {
     "dev:vite": "vite",
     "build:vite": "vite build",
+    "build:site-css": "tailwindcss -i src/index.css -o electron/assets/site.css --content \"electron/services/siteGenerator.ts,electron/services/siteTemplates.ts\" --minify",
     "build:electron": "tsc -p tsconfig.electron.json",
-    "build": "npm run build:vite && npm run build:electron",
+    "build": "npm run build:vite && npm run build:site-css && npm run build:electron",
     "dev": "npm run build && node scripts/brand-dev-electron.mjs && electron .",
     "start": "npm run build && node scripts/brand-dev-electron.mjs && electron .",
     "mcp": "npm run build:electron && ELECTRON_RUN_AS_NODE=1 electron dist-electron/electron/mcp/cli.js",

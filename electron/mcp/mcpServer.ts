@@ -350,14 +350,15 @@ export class WebringMcpServer {
     method: string,
     summary: string,
     success: boolean,
-    toolName?: string
+    toolName?: string,
+    personaId?: string
   ): void {
     const entry: McpActivityLogEntry = {
       id: `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       timestamp: new Date().toISOString(),
       method,
       toolName,
-      personaId: this.personaManager.getActivePersonaId(),
+      personaId: personaId || this.personaManager.getActivePersonaId(),
       summary,
       success,
     };
@@ -370,20 +371,13 @@ export class WebringMcpServer {
     }
   }
 
+  private scopedContext: ActivePersonaContext | null = null;
+
   /**
-   * Resolves the target persona context. If `personaId` is provided and differs from
-   * the currently active persona, switches to it so operations run in the requested compartment.
+   * Resolves the target persona context without mutating the app's active persona.
    */
-  private resolveContext(args?: Record<string, unknown>): ActivePersonaContext {
-    const requestedPersonaId =
-      typeof args?.personaId === 'string' ? args.personaId.trim() : '';
-    if (
-      requestedPersonaId &&
-      requestedPersonaId !== this.personaManager.getActivePersonaId()
-    ) {
-      this.personaManager.switchPersona(requestedPersonaId);
-    }
-    return this.personaManager.getActiveContext();
+  private resolveContext(_args?: Record<string, unknown>): ActivePersonaContext {
+    return this.scopedContext || this.personaManager.getActiveContext();
   }
 
   public getTools(): McpToolDefinition[] {
@@ -1544,10 +1538,16 @@ export class WebringMcpServer {
         }
       }
 
-      let resultData: unknown;
-      let summary = `Called ${name}`;
+      const requestedPersonaId =
+        typeof args.personaId === 'string' ? args.personaId.trim() : '';
+      const activeId = this.personaManager.getActivePersonaId();
+      const targetPersonaId = requestedPersonaId || activeId;
 
-      switch (name) {
+      const runTool = async (): Promise<{ resultData: unknown; summary: string }> => {
+        let resultData: unknown;
+        let summary = `Called ${name}`;
+
+        switch (name) {
         case 'webring_list_personas': {
           resultData = this.personaManager.listPersonas();
           summary = `Listed ${
@@ -2251,8 +2251,22 @@ export class WebringMcpServer {
             enabled: typeof args.enabled === 'boolean' ? args.enabled : undefined,
             proxyUrl: rawUrl,
           });
-          resultData = updated;
-          summary = `Updated proxy settings for ${ctx.persona.displayName} (${updated.enabled ? updated.proxyUrl : 'disabled'})`;
+          const redactProxy = (u: string): string => {
+            if (!u) return '';
+            try {
+              const p = new URL(u);
+              if (p.username || p.password) {
+                p.username = p.username ? '***' : '';
+                p.password = p.password ? '***' : '';
+              }
+              return p.toString();
+            } catch {
+              return u.replace(/\/\/[^@]+@/, '//***@');
+            }
+          };
+          const safeProxy = redactProxy(updated.proxyUrl);
+          resultData = { enabled: updated.enabled, proxyUrl: safeProxy };
+          summary = `Updated proxy settings for ${ctx.persona.displayName} (${updated.enabled ? safeProxy : 'disabled'})`;
           break;
         }
 
@@ -2384,9 +2398,15 @@ export class WebringMcpServer {
             ctx.persona.id === 'default'
               ? 'exported-profile-site'
               : `exported-profile-site-${ctx.persona.id}`;
+          const savedExportPath = profile.publishSettings?.exportPath;
+          const requestedDir = typeof args.targetDir === 'string' ? args.targetDir.trim() : '';
+          if (enforcePolicy && requestedDir && savedExportPath && path.resolve(requestedDir) !== path.resolve(savedExportPath)) {
+            throw new Error(
+              'MCP cannot change the export folder; use the folder picker in Webring Studio.'
+            );
+          }
           const outDir =
-            (typeof args.targetDir === 'string' && args.targetDir.trim()) ||
-            profile.publishSettings?.exportPath ||
+            (enforcePolicy ? savedExportPath : requestedDir || savedExportPath) ||
             path.join(this.userDataDir, defaultFolder);
 
           const pubRes = ctx.sitePublisher.publishToLocalDirectory(outDir);
@@ -2604,12 +2624,32 @@ export class WebringMcpServer {
         default:
           throw new Error(`Unknown MCP tool: ${name}`);
       }
+      return { resultData, summary };
+      };
+
+      let resultData: unknown;
+      let summary: string;
+      if (requestedPersonaId && requestedPersonaId !== activeId) {
+        const out = await this.personaManager.withPersonaContext(requestedPersonaId, async (ctx) => {
+          this.scopedContext = ctx;
+          try {
+            return await runTool();
+          } finally {
+            this.scopedContext = null;
+          }
+        });
+        resultData = out.resultData;
+        summary = out.summary;
+      } else {
+        const out = await runTool();
+        resultData = out.resultData;
+        summary = out.summary;
+      }
 
       if (LOCAL_CHANGE_TOOLS[name]) {
-        // resolveContext made the tool's persona the active one
-        this.noteChange(this.personaManager.getActivePersonaId(), LOCAL_CHANGE_TOOLS[name], enforcePolicy);
+        this.noteChange(targetPersonaId, LOCAL_CHANGE_TOOLS[name], enforcePolicy);
       }
-      this.recordActivity('tools/call', summary, true, name);
+      this.recordActivity('tools/call', summary, true, name, targetPersonaId);
       return {
         content: [
           {
