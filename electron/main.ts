@@ -187,9 +187,9 @@ function handleJobFinished(personaId: string, job: ScheduledJobKind, result: Job
  * A local change that friends should see: starts (or joins) the persona's pending auto-publish
  * when it's turned on. Never throws, so it can't fail the change itself.
  */
-function noteLocalChange(personaId: string, reason: string): void {
+function noteLocalChange(personaId: string, reason: string, options?: { fromAgent?: boolean }): void {
   try {
-    autoPublisher?.noteLocalChange(personaId, reason);
+    autoPublisher?.noteLocalChange(personaId, reason, options);
   } catch {
     // Auto-publish is a convenience; the change is saved either way
   }
@@ -1206,7 +1206,18 @@ function registerIpcHandlers() {
       resources: webringMcpServer.getResources(),
       prompts: webringMcpServer.getPrompts(),
       activityLog: webringMcpServer.getActivityLog(),
+      readOnlyMode: webringMcpServer.isReadOnlyMode(),
+      pendingApprovals: webringMcpServer.listPendingApprovals(),
     };
+  });
+
+  ipcMain.handle('studio:set-mcp-read-only', (_e, enabled: boolean) => {
+    webringMcpServer.setReadOnlyMode(Boolean(enabled));
+    return { readOnlyMode: webringMcpServer.isReadOnlyMode() };
+  });
+
+  ipcMain.handle('studio:resolve-mcp-approval', async (_e, id: string, approved: boolean) => {
+    return await webringMcpServer.resolveApproval(String(id), Boolean(approved));
   });
 
   ipcMain.handle(

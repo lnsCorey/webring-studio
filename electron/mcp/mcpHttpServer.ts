@@ -228,12 +228,6 @@ export class McpHttpServer {
     req: http.IncomingMessage,
     hasToken: boolean
   ): { status: number; message: string } | null {
-    if (req.headers.origin !== undefined && !hasToken) {
-      return {
-        status: 403,
-        message: 'Requests with an Origin header need the access token (see the MCP tab in Webring Studio).',
-      };
-    }
     const host = (req.headers.host || '').toLowerCase();
     if (host !== `127.0.0.1:${this.port}` && host !== `localhost:${this.port}`) {
       return { status: 403, message: 'Host must be 127.0.0.1 or localhost.' };
@@ -241,6 +235,12 @@ export class McpHttpServer {
     const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
     if (req.method === 'POST' && contentType !== 'application/json') {
       return { status: 415, message: 'Content-Type must be application/json.' };
+    }
+    if (!hasToken) {
+      return {
+        status: 403,
+        message: 'A valid access token is required (see the MCP tab in Webring Studio).',
+      };
     }
     return null;
   }

@@ -801,6 +801,8 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     const peerDataDir = path.join(tempRoot, 'mcp-peer');
     const manager = new PersonaManager(studioDataDir);
     const mcpServer = new WebringMcpServer(manager, studioDataDir);
+    mcpServer.setReadOnlyMode(false);
+    mcpServer.setRequireConfirmation(false);
     const httpServer = new McpHttpServer(mcpServer);
     const peerDb = new StudioDatabase(peerDataDir, 'peer.sqlite');
 
@@ -890,7 +892,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       expect(httpStatus.running).toBe(true);
       expect(httpStatus.port).toBeGreaterThan(0);
 
-      const httpRpcResp = await fetch(httpStatus.endpointUrl, {
+      const httpRpcResp = await fetch(httpStatus.authorizedEndpointUrl!, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -969,9 +971,17 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       sseController.abort();
       expect(firstChunk).toContain('/mcp/message?token=');
 
-      // The unauthenticated health check never reveals the token
-      const health = await (await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`)).text();
-      expect(health).not.toContain('token');
+      // Unauthenticated requests (even without Origin) are refused on all routes
+      const unauthHealth = await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`);
+      expect(unauthHealth.status).toBe(403);
+      const unauthPost = await rawPost({ Host: loopbackHost, 'Content-Type': 'application/json' });
+      expect(unauthPost).toBe(403);
+      const authHealth = await (
+        await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`, {
+          headers: { Authorization: `Bearer ${new URL(httpStatus.authorizedEndpointUrl!).searchParams.get('token')}` },
+        })
+      ).text();
+      expect(authHealth).not.toContain('token');
     } finally {
       await httpServer.stop();
       peerDb.close();
@@ -6048,5 +6058,178 @@ describe('Webring Hubs (optional third-party index)', () => {
       expect(hubs.calls[0]).toBe(`GET ${HUB}/api/info`);
       expect(db.getWebringHubs()[0].infoCheckedAt).toBe(clock.toISOString());
     });
+  });
+});
+
+describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verification Gaps', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-sec-p2-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('requires the access token on every MCP HTTP route even without an Origin header', async () => {
+    const manager = new PersonaManager(path.join(tempRoot, 'mcp-auth'));
+    const mcpServer = new WebringMcpServer(manager, tempRoot);
+    const httpServer = new McpHttpServer(mcpServer);
+    try {
+      const status = await httpServer.start(0);
+      expect((await fetch(`http://127.0.0.1:${status.port}/mcp/health`)).status).toBe(403);
+      expect((await fetch(`http://127.0.0.1:${status.port}/mcp/sse`)).status).toBe(403);
+      expect(
+        (
+          await fetch(status.endpointUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+          })
+        ).status
+      ).toBe(403);
+
+      const token = new URL(status.authorizedEndpointUrl!).searchParams.get('token')!;
+      expect(
+        (
+          await fetch(`http://127.0.0.1:${status.port}/mcp/health`, {
+            headers: { Authorization: `Bearer ${token}` },
+          })
+        ).status
+      ).toBe(200);
+    } finally {
+      await httpServer.stop();
+      manager.closeAll();
+    }
+  });
+
+  it('defaults MCP to read-only, queues outward tools for confirmation, labels peer feed untrusted, and holds agent changes from auto-publish', async () => {
+    const manager = new PersonaManager(path.join(tempRoot, 'mcp-policy'));
+    const mcpServer = new WebringMcpServer(manager, tempRoot);
+    const scheduler = new Scheduler({
+      configPath: path.join(tempRoot, 'scheduler.json'),
+      listPersonaIds: () => ['default'],
+      runner: {
+        sync: async () => ({ at: new Date().toISOString(), status: 'ok', message: 'synced' }),
+        publish: async () => ({ at: new Date().toISOString(), status: 'ok', message: 'published' }),
+      },
+    });
+    const publishCalls: string[] = [];
+    const autoPub = new AutoPublisher({
+      scheduler,
+      listPersonaIds: () => ['default'],
+      hasUnpublishedChanges: async () => false,
+      publish: async (personaId) => {
+        publishCalls.push(personaId);
+        return { at: new Date().toISOString(), status: 'ok', message: 'ok' };
+      },
+    });
+    scheduler.setPersonaSchedule('default', {
+      autoPublish: { enabled: true, delaySeconds: 30 },
+    });
+    mcpServer.attachScheduler(scheduler);
+    mcpServer.attachAppServices({
+      publishPaths: () => ({}),
+      deviceLogin: { start: async () => ({}), poll: async () => ({ status: 'pending' }) } as never,
+      onLocalChange: (personaId, reason, opts) => {
+        autoPub.noteLocalChange(personaId, reason, opts);
+      },
+    });
+
+    try {
+      // Read-only by default blocks local-write and outward tools
+      expect(mcpServer.isReadOnlyMode()).toBe(true);
+      const blocked = await mcpServer.executeToolCall('webring_create_post', { commentary: 'Blocked' }, { enforcePolicy: true });
+      expect(blocked.isError).toBe(true);
+
+      // Feed read is allowed and attaches trustNotice
+      const feedRes = await mcpServer.executeToolCall('webring_get_neighborhood_feed', {}, { enforcePolicy: true });
+      expect(feedRes.isError).toBeUndefined();
+      expect((feedRes.data as { trustNotice: string }).trustNotice).toContain('untrusted');
+
+      // Enabling writes allows local-write, and holds auto-publish for agent review
+      mcpServer.setReadOnlyMode(false);
+      const created = await mcpServer.executeToolCall('webring_create_post', { commentary: 'Agent draft' }, { enforcePolicy: true });
+      expect(created.isError).toBeUndefined();
+      expect(autoPub.status('default').agentHeld).toBe(true);
+      expect(autoPub.status('default').state).toBe('idle');
+      expect(publishCalls).toHaveLength(0);
+
+      // Outward tools (like rotating keys or enabling auto-publish) queue for human confirmation
+      const queued = await mcpServer.executeToolCall(
+        'webring_set_schedule',
+        {
+          autoPublishEnabled: true,
+          autoPublishDelaySeconds: 30,
+        },
+        { enforcePolicy: true }
+      );
+      expect((queued.data as { pendingApproval: boolean }).pendingApproval).toBe(true);
+      expect(mcpServer.listPendingApprovals()).toHaveLength(1);
+
+      const approvalId = (queued.data as { approvalId: string }).approvalId;
+      const denied = await mcpServer.resolveApproval(approvalId, false);
+      expect(denied.ok).toBe(true);
+      expect(mcpServer.listPendingApprovals()).toHaveLength(0);
+    } finally {
+      autoPub.dispose();
+      manager.closeAll();
+    }
+  });
+
+  it('never overwrites verified friend profiles on key change and excludes unverified/legacy rings from connections.json', async () => {
+    const myDir = path.join(tempRoot, 'my-site');
+    const friendDir = path.join(tempRoot, 'friend-site');
+    const myDb = new StudioDatabase(myDir, 'my.sqlite');
+    const friendDb = new StudioDatabase(friendDir, 'friend.sqlite');
+    try {
+      friendDb.updateProfile({
+        siteUrl: 'https://friend.sec.test',
+        handle: 'friend.sec.test',
+        displayName: 'Original Friend',
+        bio: 'Verified bio',
+      });
+      const friendOut = path.join(friendDir, 'out');
+      new StaticSiteGenerator(friendDb).generateToDirectory(friendOut);
+
+      const crawler = new RingCrawler(myDb);
+      const first = await crawler.crawlFriendSite('https://friend.sec.test', friendOut);
+      expect(first.verifiedSignature).toBe(true);
+      expect(myDb.getFriendBySiteUrl('https://friend.sec.test')?.displayName).toBe('Original Friend');
+
+      // Friend site rotates key without a rotation certificate (key_changed) and changes displayName
+      const newKeys = crypto.generateKeyPairSync('ed25519', {
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      });
+      friendDb.db
+        .prepare('UPDATE profile SET public_key_pem = ?, private_key_pem = ?, display_name = ? WHERE id = 1')
+        .run(newKeys.publicKey, newKeys.privateKey, 'Hijacked Name');
+      new StaticSiteGenerator(friendDb).generateToDirectory(friendOut);
+
+      const second = await crawler.crawlFriendSite('https://friend.sec.test', friendOut);
+      expect(second.verifiedSignature).toBe(false);
+      expect(myDb.getFriendBySiteUrl('https://friend.sec.test')?.keyStatus).toBe('changed');
+      expect(myDb.getFriendBySiteUrl('https://friend.sec.test')?.displayName).toBe('Original Friend');
+
+      // Legacy / unverified rings are excluded from getWebrings() / connections.json
+      myDb.upsertJoinedRing({
+        hubUrl: 'https://legacy-ring.test/webring.json',
+        name: 'Legacy Unsigned Ring',
+        status: 'legacy',
+        hubVerified: false,
+      });
+      myDb.upsertJoinedRing({
+        hubUrl: 'https://unverified-ring.test/webring.json',
+        name: 'Unverified Ring',
+        status: 'member',
+        hubVerified: false,
+      });
+      expect(myDb.getWebrings()).toHaveLength(0);
+    } finally {
+      myDb.close();
+      friendDb.close();
+    }
   });
 });

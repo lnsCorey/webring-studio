@@ -2181,6 +2181,40 @@ export class StudioDatabase {
     return this.getFriendById(id)!;
   }
 
+  /**
+   * Updates only key verification state and crawl timestamp for an existing friend without
+   * overwriting profile metadata (used when verification fails or a key change is pending).
+   */
+  public updateFriendVerificationState(
+    siteUrl: string,
+    input: {
+      keyStatus: FriendKeyStatus;
+      lastCrawledAt: string;
+      pinnedPublicKeyPem?: string;
+    }
+  ): FriendConnection | null {
+    const normalizedUrl = normalizeSiteUrl(siteUrl);
+    const existing = this.db
+      .prepare('SELECT id FROM friends WHERE site_url = ?')
+      .get(normalizedUrl) as { id: string } | undefined;
+    if (!existing) return null;
+    this.db
+      .prepare(
+        `UPDATE friends SET
+          pinned_public_key_pem = COALESCE(NULLIF(?, ''), pinned_public_key_pem),
+          key_status = ?,
+          last_crawled_at = ?
+        WHERE id = ?`
+      )
+      .run(
+        input.pinnedPublicKeyPem || '',
+        input.keyStatus,
+        input.lastCrawledAt,
+        existing.id
+      );
+    return this.getFriendById(existing.id)!;
+  }
+
   public setFriendVisibility(friendId: string, visibility: FriendVisibility): FriendConnection | undefined {
     this.db
       .prepare('UPDATE friends SET visibility = ? WHERE id = ?')
@@ -2667,7 +2701,7 @@ export class StudioDatabase {
    */
   public getWebrings(): WebringMembership[] {
     const joined: WebringMembership[] = this.getJoinedRings()
-      .filter((r) => r.status === 'member' || r.status === 'legacy')
+      .filter((r) => r.status === 'member' && r.hubVerified)
       .map((r) => ({
         id: r.id,
         name: r.name,
