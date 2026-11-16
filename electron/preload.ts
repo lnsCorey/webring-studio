@@ -111,6 +111,9 @@ contextBridge.exposeInMainWorld('studioApi', {
   setupDismiss: (dismissed: boolean) => ipcRenderer.invoke('studio:setup-dismiss', dismissed),
   openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
   getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),
+  setMcpReadOnly: (enabled: boolean) => ipcRenderer.invoke('studio:set-mcp-read-only', enabled),
+  resolveMcpApproval: (id: string, approved: boolean) =>
+    ipcRenderer.invoke('studio:resolve-mcp-approval', id, approved),
   callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
     ipcRenderer.invoke('studio:call-mcp-tool', toolName, args),
   onMcpActivity: (callback: (entry: unknown) => void) => {

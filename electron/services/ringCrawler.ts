@@ -563,18 +563,36 @@ export class RingCrawler {
             )
           : false;
 
-      // Update friend record with latest profile metadata & TOFU key state
-      this.db.addOrUpdateFriend({
-        siteUrl: normalizedFriendUrl,
-        displayName: profile.displayName,
-        handle: profile.handle,
-        avatarUrl: profile.avatarUrl,
-        bio: profile.bio,
-        did: profile.did,
-        pinnedPublicKeyPem: pinnedKeyToSave || undefined,
-        keyStatus,
-        lastCrawledAt: new Date().toISOString(),
-      });
+      // Update friend profile metadata only when both manifest and profile verify.
+      // On key change or unverified fetch, update only keyStatus and lastCrawledAt.
+      const crawledAt = new Date().toISOString();
+      if (isManifestVerified && isProfileVerified) {
+        this.db.addOrUpdateFriend({
+          siteUrl: normalizedFriendUrl,
+          displayName: profile.displayName,
+          handle: profile.handle,
+          avatarUrl: profile.avatarUrl,
+          bio: profile.bio,
+          did: profile.did,
+          pinnedPublicKeyPem: pinnedKeyToSave || undefined,
+          keyStatus,
+          lastCrawledAt: crawledAt,
+        });
+      } else if (existingFriend) {
+        this.db.updateFriendVerificationState(normalizedFriendUrl, {
+          keyStatus,
+          lastCrawledAt: crawledAt,
+          pinnedPublicKeyPem: pinnedKeyToSave || undefined,
+        });
+      } else {
+        this.db.addOrUpdateFriend({
+          siteUrl: normalizedFriendUrl,
+          displayName: new URL(normalizedFriendUrl).hostname,
+          pinnedPublicKeyPem: pinnedKeyToSave || undefined,
+          keyStatus,
+          lastCrawledAt: crawledAt,
+        });
+      }
 
       // Save copies only of documents that verified; otherwise forget them so they're downloaded next time
       const keepCopies = isManifestVerified && isProfileVerified;

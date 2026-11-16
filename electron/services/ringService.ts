@@ -430,6 +430,17 @@ export class RingService {
         results.push({ hubUrl: ring.hubUrl, name: ring.name, outcome: 'unchanged' });
         continue;
       }
+      if (!hub.verified) {
+        const warning =
+          hub.warning || 'Unsigned or unverified ring file: membership and neighbors were not updated.';
+        this.db.upsertJoinedRing({
+          hubUrl: ring.hubUrl,
+          lastSyncedAt: now,
+          syncWarning: warning,
+        });
+        results.push({ hubUrl: ring.hubUrl, name: ring.name, outcome: 'unchanged', warning });
+        continue;
+      }
       const common = {
         hubUrl: ring.hubUrl,
         lastSyncedAt: now,

@@ -19,6 +19,8 @@ export interface AutoPublishStatus {
   dueAt: string | null;
   /** What changed since the last publish, e.g. "post", "friend" (local only, for the UI). */
   reasons: string[];
+  /** True when an MCP agent made a local change that is held for human approval before auto-publish. */
+  agentHeld?: boolean;
   lastResult: JobResult | null;
 }
 
@@ -47,6 +49,7 @@ interface Entry {
   dueAt: number | null;
   timer: NodeJS.Timeout | null;
   reasons: Set<string>;
+  agentHeld: boolean;
   /** A change arrived during the running publish */
   rerun: boolean;
   lastResult: JobResult | null;
@@ -65,7 +68,7 @@ export class AutoPublisher {
   private entry(personaId: string): Entry {
     let entry = this.entries.get(personaId);
     if (!entry) {
-      entry = { state: 'idle', dueAt: null, timer: null, reasons: new Set(), rerun: false, lastResult: null, running: null };
+      entry = { state: 'idle', dueAt: null, timer: null, reasons: new Set(), agentHeld: false, rerun: false, lastResult: null, running: null };
       this.entries.set(personaId, entry);
     }
     return entry;
@@ -80,11 +83,12 @@ export class AutoPublisher {
 
   public status(personaId: string): AutoPublishStatus {
     const entry = this.entries.get(personaId);
-    if (!entry) return { state: 'idle', dueAt: null, reasons: [], lastResult: null };
+    if (!entry) return { state: 'idle', dueAt: null, reasons: [], agentHeld: false, lastResult: null };
     return {
       state: entry.state,
       dueAt: entry.state === 'pending' && entry.dueAt !== null ? new Date(entry.dueAt).toISOString() : null,
       reasons: [...entry.reasons],
+      agentHeld: entry.agentHeld,
       lastResult: entry.lastResult,
     };
   }
@@ -104,12 +108,38 @@ export class AutoPublisher {
   /**
    * Records a local change. Returns the status when an auto-publish is (or stays) pending, or
    * null when auto-publish is off or paused for this persona.
+   * Changes marked `fromAgent: true` hold auto-publish until a human approves or publishes manually.
    */
-  public noteLocalChange(personaId: string, reason: string): AutoPublishStatus | null {
-    const settings = this.activeSettings(personaId);
-    if (!settings) return null;
+  public noteLocalChange(
+    personaId: string,
+    reason: string,
+    options?: { fromAgent?: boolean }
+  ): AutoPublishStatus | null {
     const entry = this.entry(personaId);
+    if (options?.fromAgent) {
+      entry.agentHeld = true;
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+        entry.timer = null;
+      }
+      if (entry.state === 'pending') {
+        entry.state = 'idle';
+        entry.dueAt = null;
+      }
+    }
+    const settings = this.activeSettings(personaId);
+    if (!settings) {
+      if (options?.fromAgent) {
+        entry.reasons.add(reason);
+        this.emit(personaId);
+      }
+      return null;
+    }
     entry.reasons.add(reason);
+    if (entry.agentHeld) {
+      this.emit(personaId);
+      return this.status(personaId);
+    }
     if (entry.state === 'running') {
       entry.rerun = true;
     } else if (entry.state === 'idle') {
@@ -119,9 +149,22 @@ export class AutoPublisher {
     return this.status(personaId);
   }
 
+  /** Releases an agent-change hold and resumes auto-publish if enabled. */
+  public approveAgentChanges(personaId: string): AutoPublishStatus {
+    const entry = this.entry(personaId);
+    entry.agentHeld = false;
+    const settings = this.activeSettings(personaId);
+    if (settings && entry.state === 'idle' && entry.reasons.size > 0) {
+      this.arm(personaId, entry, settings.delaySeconds);
+    }
+    this.emit(personaId);
+    return this.status(personaId);
+  }
+
   /** Publishes the pending changes now (the "Publish now" button), or waits for a running one. */
   public publishNow(personaId: string): Promise<JobResult> {
     const entry = this.entry(personaId);
+    entry.agentHeld = false;
     if (entry.state === 'running' && entry.running) return entry.running;
     return this.fire(personaId, true);
   }
@@ -133,6 +176,7 @@ export class AutoPublisher {
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = null;
     entry.rerun = false;
+    entry.agentHeld = false;
     if (entry.state === 'pending') {
       entry.state = 'idle';
       entry.dueAt = null;
@@ -174,8 +218,16 @@ export class AutoPublisher {
     const entry = this.entry(personaId);
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = null;
-    if (!force && !this.activeSettings(personaId)) {
-      // Turned off or paused since the change
+    if (!force && (!this.activeSettings(personaId) || entry.agentHeld)) {
+      // Turned off, paused, or held pending human review of agent changes
+      if (entry.agentHeld) {
+        this.emit(personaId);
+        return Promise.resolve({
+          at: new Date(this.now()).toISOString(),
+          status: 'skipped',
+          message: 'Auto-publish held: agent-made changes require review.',
+        });
+      }
       entry.state = 'idle';
       entry.dueAt = null;
       entry.reasons.clear();
