@@ -5364,6 +5364,7 @@ export const App: React.FC = () => {
                   <iframe
                     key={`${testExportResult.previewUrl}-${iframeRefreshKey}`}
                     src={testExportResult.previewUrl}
+                    sandbox="allow-scripts allow-same-origin"
                     allow="fullscreen"
                     title="Exported Static Profile Site Preview"
                     className="w-full h-[75vh] border-0 bg-slate-950"

@@ -6372,3 +6372,111 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
     }
   });
 });
+
+describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-sec-p4-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it('blocks IPv6 transition and documentation ranges in networkGuard', () => {
+    expect(isPrivateNetworkAddress('64:ff9b::1')).toBe(true);
+    expect(isPrivateNetworkAddress('2001::1')).toBe(true);
+    expect(isPrivateNetworkAddress('2002:7f00:1::')).toBe(true);
+    expect(isPrivateNetworkAddress('3fff::1')).toBe(true);
+    expect(isPrivateNetworkAddress('2606:4700:4700::1111')).toBe(false);
+  });
+
+  it('rejects oversized PNG dimensions from header before full pixel decode', async () => {
+    const { decodeImage } = await import('../electron/services/imagePipeline');
+    // Minimal 29-byte PNG signature + IHDR claiming 100000 x 100000 pixels
+    const buf = Buffer.alloc(29);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+    buf.writeUInt32BE(13, 8);
+    buf.write('IHDR', 12, 'ascii');
+    buf.writeUInt32BE(100000, 16);
+    buf.writeUInt32BE(100000, 20);
+    expect(() => decodeImage(buf)).toThrow(/too large/);
+  });
+
+  it('compares pinned keys by SPKI bytes, enforces candidate key review, and omits lastCrawledAt from connections.json', () => {
+    const db = new StudioDatabase(tempRoot, 'p4.sqlite');
+    try {
+      const keys1 = crypto.generateKeyPairSync('ed25519', {
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      });
+      const keys2 = crypto.generateKeyPairSync('ed25519', {
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      });
+      const friend = db.addOrUpdateFriend({
+        siteUrl: 'https://peer.p4.test',
+        displayName: 'Peer',
+        visibility: 'public',
+        lastCrawledAt: '2026-11-16T00:00:00.000Z',
+      });
+      expect(db.pinSiteKey('https://peer.p4.test', 'did:web:peer.p4.test', keys1.publicKey)).toBe('pinned');
+      // Re-wrapped PEM with extra whitespace/CRLF still matches the pinned SPKI key
+      const rewrapped = keys1.publicKey.replace(/\n/g, '\r\n') + '\n';
+      expect(db.pinSiteKey('https://peer.p4.test', 'did:web:peer.p4.test', rewrapped)).toBe('pinned');
+
+      // Candidate key mismatch is refused when trusting
+      db.setCandidateSiteKey('https://peer.p4.test', keys2.publicKey);
+      expect(() => db.trustNewFriendKey(friend.id, keys1.publicKey)).toThrow(/candidate key/);
+      expect(db.trustNewFriendKey(friend.id, keys2.publicKey).keyStatus).toBe('pinned');
+
+      // Exported connections.json omits lastCrawledAt
+      db.updateProfile({
+        siteUrl: 'https://me.p4.test',
+        publishSettings: { publishFriendsList: true },
+      });
+      const bundle = db.buildSignedSiteBundle({ publish: true });
+      expect(bundle.connections.friends).toHaveLength(1);
+      expect('lastCrawledAt' in bundle.connections.friends[0]).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('hardens LocalPreviewServer against bad Host headers, malformed URLs, and wildcard CORS', async () => {
+    const previewDir = path.join(tempRoot, 'preview');
+    fs.mkdirSync(previewDir);
+    fs.writeFileSync(path.join(previewDir, 'index.html'), '<h1>ok</h1>');
+    const server = new LocalPreviewServer();
+    try {
+      const db = new StudioDatabase(tempRoot, 'prev.sqlite');
+      const gen = new StaticSiteGenerator(db);
+      const res = await server.runTestExportAndServe(gen, previewDir);
+      db.close();
+      const port = new URL(res.previewUrl).port;
+
+      const good = await fetch(res.previewUrl);
+      expect(good.status).toBe(200);
+      expect(good.headers.get('access-control-allow-origin')).toBeNull();
+
+      const badUrl = await fetch(`http://127.0.0.1:${port}/%E0%A4%A`);
+      expect(badUrl.status).toBe(400);
+
+      const badHost = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          { host: '127.0.0.1', port: Number(port), path: '/', headers: { Host: 'evil.example' } },
+          (r) => {
+            r.resume();
+            resolve(r.statusCode || 0);
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      expect(badHost).toBe(403);
+    } finally {
+      await server.stop();
+    }
+  });
+});

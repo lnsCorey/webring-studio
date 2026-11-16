@@ -18,6 +18,7 @@ import {
   ManifestDocumentKey,
   normalizeSiteUrl,
   ProfileDocumentSchema,
+  siteUrlToDidWeb,
   verifyDocumentSignature,
   WebringManifestSchema,
 } from '../../src/shared/schema';
@@ -239,6 +240,10 @@ function fetchPublicOnce(
       reject(new Error(`Unsupported protocol in ${rawUrl}`));
       return;
     }
+    if (url.protocol === 'http:' && !privatePeersAllowed()) {
+      reject(new Error(`Refusing insecure http:// URL outside dev mode: ${rawUrl}`));
+      return;
+    }
     // Node skips the DNS lookup for IP literals, so check those here
     const literalHost = url.hostname.replace(/^\[|\]$/g, '');
     if (net.isIP(literalHost) && !privatePeersAllowed() && isPrivateNetworkAddress(literalHost)) {
@@ -293,7 +298,12 @@ function fetchPublicOnce(
             reject(new Error(`Too many redirects fetching ${rawUrl}`));
             return;
           }
-          fetchPublicOnce(new URL(res.headers.location, url).toString(), options, redirectsLeft - 1).then(resolve, reject);
+          const nextUrl = new URL(res.headers.location, url);
+          if (url.protocol === 'https:' && nextUrl.protocol === 'http:' && !privatePeersAllowed()) {
+            reject(new Error(`Refusing HTTPS-to-HTTP downgrade redirect from ${rawUrl}`));
+            return;
+          }
+          fetchPublicOnce(nextUrl.toString(), options, redirectsLeft - 1).then(resolve, reject);
           return;
         }
         if ((status < 200 || status >= 300) && !options.anyStatus) {
@@ -489,9 +499,12 @@ export class RingCrawler {
     type SavedCopyFetch = Awaited<ReturnType<typeof fetchWithSavedCopy>>;
 
     try {
+      const expectedDid = siteUrlToDidWeb(normalizedFriendUrl);
       const manifestFetch = await fetchWithSavedCopy('/api/manifest.json');
       const rawManifest = manifestFetch.json;
       const manifest = WebringManifestSchema.parse(rawManifest);
+      const manifestIdentityMatches =
+        manifest.did === expectedDid && normalizeSiteUrl(manifest.siteUrl) === normalizedFriendUrl;
       // Fingerprints the manifest lists for each document (sites from older versions list none)
       const listedFingerprint = (key: ManifestDocumentKey) => manifest.documents?.[key]?.sha256;
 
@@ -502,9 +515,11 @@ export class RingCrawler {
       try {
         didFetch = await fetchWithSavedCopy(manifest.endpoints.did, listedFingerprint('did'));
         const didDoc = DidDocumentSchema.parse(didFetch.json);
-        fetchedPublicKeyPem = didDoc.verificationMethod[0]?.publicKeyPem || '';
-        if (didDoc.keyRotations && didDoc.keyRotations.length > 0) {
-          didKeyRotations = didDoc.keyRotations;
+        if (didDoc.id === expectedDid) {
+          fetchedPublicKeyPem = didDoc.verificationMethod[0]?.publicKeyPem || '';
+          if (didDoc.keyRotations && didDoc.keyRotations.length > 0) {
+            didKeyRotations = didDoc.keyRotations;
+          }
         }
       } catch {
         // Optional if DID doc isn't reachable
@@ -530,6 +545,7 @@ export class RingCrawler {
       if (fetchedPublicKeyPem) {
         if (pinStatus === 'changed') {
           // Domain key changed unexpectedly without a valid KeyRotationCertificate!
+          this.db.setCandidateSiteKey(normalizedFriendUrl, fetchedPublicKeyPem);
           keyChangedWarning = true;
           keyStatus = 'changed';
           pinnedKeyToSave = existingPinnedKey;
@@ -545,8 +561,11 @@ export class RingCrawler {
       const rawProfile = profileFetch.json;
       const profile = ProfileDocumentSchema.parse(rawProfile);
 
+      const profileIdentityMatches =
+        profile.did === expectedDid && normalizeSiteUrl(profile.siteUrl) === normalizedFriendUrl;
+
       const isManifestVerified =
-        !keyChangedWarning && effectiveVerifyKeyPem && manifest.proof
+        !keyChangedWarning && effectiveVerifyKeyPem && manifest.proof && manifestIdentityMatches
           ? verifyDocumentSignature(
               rawManifest as Record<string, unknown> & { proof?: typeof manifest.proof },
               effectiveVerifyKeyPem
@@ -554,7 +573,7 @@ export class RingCrawler {
           : false;
 
       const isProfileVerified =
-        !keyChangedWarning && effectiveVerifyKeyPem
+        !keyChangedWarning && effectiveVerifyKeyPem && profileIdentityMatches
           ? verifyDocumentSignature(
               rawProfile as Record<string, unknown> & { proof?: typeof profile.proof },
               effectiveVerifyKeyPem

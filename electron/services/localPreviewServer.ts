@@ -101,14 +101,27 @@ export class LocalPreviewServer {
 
     return new Promise((resolve, reject) => {
       const srv = http.createServer((req, res) => {
+        const host = (req.headers.host || '').toLowerCase();
+        if (host !== `127.0.0.1:${this.currentPort}` && host !== `localhost:${this.currentPort}`) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Forbidden');
+          return;
+        }
         if (!this.currentRootDir) {
           res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
           res.end('No active test export directory.');
           return;
         }
 
-        const rawUrl = (req.url || '/').split('?')[0].split('#')[0];
-        const decodedPath = decodeURIComponent(rawUrl === '/' ? '/index.html' : rawUrl);
+        let decodedPath: string;
+        try {
+          const rawUrl = (req.url || '/').split('?')[0].split('#')[0];
+          decodedPath = decodeURIComponent(rawUrl === '/' ? '/index.html' : rawUrl);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Bad Request');
+          return;
+        }
         const safeRelPath = path.normalize(decodedPath).replace(/^(\.\.(\/|\\|$))+/, '');
         const fullPath = path.join(this.currentRootDir, safeRelPath);
 
@@ -132,7 +145,6 @@ export class LocalPreviewServer {
         res.writeHead(200, {
           'Content-Type': contentType,
           'Cache-Control': 'no-store',
-          'Access-Control-Allow-Origin': '*',
         });
         fs.createReadStream(resolvedTarget).pipe(res);
       });
