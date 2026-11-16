@@ -97,6 +97,14 @@ export function decodeImage(buffer: Buffer): { image: RawImage; format: ImageFor
     return { image: upright, format };
   }
   if (format === 'png') {
+    // Check PNG IHDR dimensions (bytes 16..24) before allocating a decoded RGBA buffer
+    if (buffer.length >= 24 && buffer.toString('ascii', 12, 16) === 'IHDR') {
+      const width = buffer.readUInt32BE(16);
+      const height = buffer.readUInt32BE(20);
+      if (width === 0 || height === 0 || width * height > MAX_INPUT_MEGAPIXELS * 1_000_000) {
+        throw new UnsupportedImageError('This image is too large to process.');
+      }
+    }
     const decoded = PNG.sync.read(buffer);
     if (decoded.width * decoded.height > MAX_INPUT_MEGAPIXELS * 1_000_000) {
       throw new UnsupportedImageError('This image is too large to process.');

@@ -412,7 +412,26 @@ function createWindow(show = true) {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
+  });
+
+  // Deny all browser permission requests (camera, mic, geolocation, notifications, etc.)
+  mainWindow.webContents.session.setPermissionRequestHandler((_wc, _permission, callback) => {
+    callback(false);
+  });
+
+  // Prevent subframes (e.g. preview iframe) from navigating to non-loopback remote origins
+  mainWindow.webContents.on('will-frame-navigate', (event) => {
+    const url = event.url || '';
+    if (!url || url.startsWith('about:') || url.startsWith('data:')) return;
+    try {
+      const parsed = new URL(url);
+      if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') return;
+    } catch {
+      // Fall through to prevent
+    }
+    event.preventDefault();
   });
 
   // Links inside Studio (Markdown previews, posts) never open in an Electron window, which would
@@ -1199,7 +1218,21 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:open-path', async (_e, targetPath: string) => {
-    await shell.openPath(targetPath);
+    if (typeof targetPath !== 'string' || !targetPath.trim()) return { ok: false };
+    const resolved = path.resolve(targetPath);
+    const allowedRoots = [
+      path.resolve(app.getPath('userData')),
+      personaManager.getActiveContext().db.getProfile().publishSettings?.exportPath,
+    ]
+      .filter((p): p is string => Boolean(p && p.trim()))
+      .map((p) => path.resolve(p));
+    const isAllowed = allowedRoots.some(
+      (root) => resolved === root || resolved.startsWith(root + path.sep)
+    );
+    if (!isAllowed) {
+      throw new Error('Refusing to open path outside Webring Studio data or export folders.');
+    }
+    await shell.openPath(resolved);
     return { ok: true };
   });
 

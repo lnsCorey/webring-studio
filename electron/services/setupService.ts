@@ -371,7 +371,9 @@ export async function checkLiveSite(ctx: ActivePersonaContext, deps: SetupDeps =
 
   // A query string asks the host's cache for a fresh copy
   const bust = `?check=${now.getTime()}`;
-  const fetchJson = deps.fetchJson || ((url: string) => defaultJsonFetcher(url));
+  const proxy = ctx.db.getProxySettings();
+  const proxyUrl = proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined;
+  const fetchJson = deps.fetchJson || ((url: string) => defaultJsonFetcher(url, proxyUrl));
   let didDoc: { verificationMethod?: Array<{ publicKeyPem?: string }> };
   try {
     didDoc = (await fetchJson(`${siteUrl}/.well-known/did.json${bust}`)) as typeof didDoc;

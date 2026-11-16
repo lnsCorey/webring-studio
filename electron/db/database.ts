@@ -2911,7 +2911,16 @@ export class StudioDatabase {
       return 'pinned';
     }
 
-    if (priorPinnedPem.trim() === publicKeyPem.trim()) {
+    const spkiFp = (pem: string): string => {
+      try {
+        const der = crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' });
+        return crypto.createHash('sha256').update(der).digest('hex');
+      } catch {
+        return pem.trim();
+      }
+    };
+
+    if (spkiFp(priorPinnedPem) === spkiFp(publicKeyPem)) {
       if (!existing) {
         this.db
           .prepare(
@@ -2973,14 +2982,53 @@ export class StudioDatabase {
    * the friend lost their previous private key and could not sign a KeyRotationCertificate).
    * If `newPublicKeyPem` is omitted, clears the pinned key so the next sync pins their live key.
    */
+  public getCandidateSiteKey(siteUrl: string): string | null {
+    const normalized = normalizeSiteUrl(siteUrl);
+    const row = this.db
+      .prepare('SELECT value FROM local_settings WHERE key = ?')
+      .get(`candidate_key:${normalized}`) as { value: string } | undefined;
+    return row?.value || null;
+  }
+
+  public setCandidateSiteKey(siteUrl: string, publicKeyPem: string): void {
+    const normalized = normalizeSiteUrl(siteUrl);
+    this.db
+      .prepare(
+        'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+      )
+      .run(`candidate_key:${normalized}`, publicKeyPem.trim());
+  }
+
+  public clearCandidateSiteKey(siteUrl: string): void {
+    const normalized = normalizeSiteUrl(siteUrl);
+    this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(`candidate_key:${normalized}`);
+  }
+
   public trustNewFriendKey(friendId: string, newPublicKeyPem?: string): FriendConnection {
     const current = this.getFriendById(friendId);
     if (!current) {
       throw new Error(`Friend "${friendId}" not found.`);
     }
     const normalized = normalizeSiteUrl(current.siteUrl);
-    const cleanKey = newPublicKeyPem?.trim() || '';
+    const storedCandidate = this.getCandidateSiteKey(normalized);
+    const cleanKey = (newPublicKeyPem?.trim() || storedCandidate || '').trim();
+    if (storedCandidate && newPublicKeyPem?.trim()) {
+      const fp = (pem: string) => {
+        try {
+          return crypto
+            .createHash('sha256')
+            .update(crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' }))
+            .digest('hex');
+        } catch {
+          return pem.trim();
+        }
+      };
+      if (fp(storedCandidate) !== fp(newPublicKeyPem)) {
+        throw new Error('The key being trusted does not match the candidate key detected for this friend.');
+      }
+    }
     this.transaction(() => {
+      this.clearCandidateSiteKey(normalized);
       this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalized);
       if (cleanKey) {
         const did = current.did || siteUrlToDidWeb(normalized);
@@ -4069,9 +4117,17 @@ export class StudioDatabase {
     const exportedFriends: FriendConnection[] = publishSettings?.publishFriendsList
       ? allFriends
           .filter((f) => f.visibility === 'public')
-          .map(({ pinnedPublicKeyPem: _pk, keyStatus: _ks, ...f }) => ({
-            ...f,
+          .map((f) => ({
+            id: f.id,
+            siteUrl: f.siteUrl,
+            did: f.did,
+            displayName: f.displayName,
+            handle: f.handle,
+            avatarUrl: f.avatarUrl,
+            bio: f.bio,
             relationship: publishSettings?.stripRelationshipTags !== false ? [] : f.relationship,
+            visibility: f.visibility,
+            addedAt: f.addedAt,
           }))
       : [];
 

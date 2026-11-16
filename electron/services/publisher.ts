@@ -480,7 +480,7 @@ export class SitePublisher {
 
       const updateRefRes = await gh(`${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
         sha: newCommitSha,
-        force: true,
+        force: false,
       });
       if (updateRefRes.status !== 200) {
         throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
