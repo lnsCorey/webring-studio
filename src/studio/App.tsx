@@ -8058,10 +8058,12 @@ git push -u origin main --force`}
                           Log in real time, and this transport can publish.
                         </p>
                         <p className="text-xs text-slate-400 leading-relaxed">
-                          Clients that run inside a browser or Electron window send an{' '}
-                          <code>Origin</code> header and must use the URL with your{' '}
-                          <strong>access token</strong> (<code>?token=…</code>). Command-line agents
-                          don't need it. Web pages are always refused.
+                          Every route on the loopback MCP server (<code>/mcp</code>,{' '}
+                          <code>/mcp/message</code>, <code>/mcp/sse</code>, and{' '}
+                          <code>/mcp/health</code>) requires your <strong>access token</strong>{' '}
+                          (<code>?token=…</code> or <code>Authorization: Bearer</code>),
+                          regardless of whether an <code>Origin</code> header is sent. Web pages are
+                          always refused.
                         </p>
                       </div>
                     </div>
@@ -8087,6 +8089,34 @@ git push -u origin main --force`}
                         issue a new one, quit Studio, delete <code>mcp-http.json</code> from the Studio
                         data folder, and reopen it.
                       </p>
+                    </div>
+
+                    {/* Agent Safety Controls */}
+                    <div className="p-4 rounded-xl bg-amber-950/20 border border-amber-500/30 space-y-2">
+                      <h4 className="font-bold text-sm text-amber-300">
+                        Agent Safety Controls (Read-Only Default &amp; Human Confirmation)
+                      </h4>
+                      <ul className="text-xs text-slate-300 list-disc list-inside space-y-1">
+                        <li>
+                          <strong>Read-Only by default:</strong> External MCP connections start in
+                          Read-Only mode so agents cannot modify your data until you allow writes.
+                        </li>
+                        <li>
+                          <strong>Human confirmation queue:</strong> Outward, destructive, and
+                          local-file-import tools (publishing, deleting, trusting/rotating keys,
+                          changing proxy settings, enabling auto-publish or changing publish
+                          destinations) are queued for your explicit approval in Studio.
+                        </li>
+                        <li>
+                          <strong>Untrusted feed isolation:</strong>{' '}
+                          <code>webring_get_neighborhood_feed</code> excludes unverified peer
+                          entries by default and labels peer-authored text as untrusted data.
+                        </li>
+                        <li>
+                          <strong>Auto-publish hold:</strong> Local changes made by an MCP agent are
+                          held from automatic publishing until you review them or publish manually.
+                        </li>
+                      </ul>
                     </div>
 
                     {/* Available Tool Categories */}
@@ -8263,7 +8293,9 @@ git push -u origin main --force`}
                         </ol>
                         <p className="text-slate-400">
                           Your request is never published, so nobody else can see that you applied or
-                          were declined. You can join as many rings as you like.
+                          were declined. You can join as many rings as you like. Studio only
+                          publishes verified rings in <code>connections.json</code>, and unsigned or
+                          unverified ring files never overwrite your saved membership or neighbors.
                         </p>
                       </div>
 
@@ -8596,6 +8628,28 @@ git push -u origin main --force`}
                           </button>
                           .
                         </p>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                        <h4 className="font-bold text-sm text-indigo-400">
+                          Q: How does Studio protect my published site from unverified peers or
+                          prompt-injected AI agents?
+                        </h4>
+                        <ul className="text-xs text-slate-400 list-disc list-inside space-y-1 pl-2">
+                          <li>
+                            <strong>Verified-only publishing:</strong> Unverified friend profiles (or
+                            friends with a key-change warning) never overwrite stored display fields
+                            or reach <code>connections.json</code>, and unsigned or unverified ring
+                            files are never published or allowed to alter ring membership.
+                          </li>
+                          <li>
+                            <strong>MCP agent guardrails:</strong> Loopback MCP routes always require
+                            your access token, external MCP connections default to Read-Only mode,
+                            outward/destructive tools require human confirmation, feed reads exclude
+                            unverified entries by default, and agent-made changes are held from
+                            auto-publish until you review them.
+                          </li>
+                        </ul>
                       </div>
 
                       <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
