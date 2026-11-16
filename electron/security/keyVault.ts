@@ -29,11 +29,21 @@ export function isEncryptedKey(stored: string): boolean {
   return stored.startsWith(ENCRYPTED_KEY_PREFIX);
 }
 
+let warnedPlaintextFallback = false;
+
 /**
- * Returns the value to store: sealed when a cipher is available, otherwise unchanged.
+ * Returns the value to store: sealed when a cipher is available, otherwise unchanged
+ * (logging a warning once when a non-empty secret cannot be sealed).
  */
 export function sealPrivateKey(privateKeyPem: string, cipher?: KeyCipher): string {
-  if (isEncryptedKey(privateKeyPem) || !cipher?.isAvailable()) {
+  if (!privateKeyPem || isEncryptedKey(privateKeyPem)) {
+    return privateKeyPem;
+  }
+  if (!cipher?.isAvailable()) {
+    if (!warnedPlaintextFallback) {
+      warnedPlaintextFallback = true;
+      console.warn('[keyVault] OS keychain is unavailable; secret cannot be sealed at rest.');
+    }
     return privateKeyPem;
   }
   return `${ENCRYPTED_KEY_PREFIX}${cipher.encrypt(privateKeyPem).toString('base64')}`;

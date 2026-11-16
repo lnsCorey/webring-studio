@@ -364,6 +364,16 @@ async function initServices() {
       refreshTrayMenu();
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:schedule-updated');
     },
+    onBeforePublish: (personaId, status) => {
+      if ((!mainWindow || !mainWindow.isVisible()) && Notification.isSupported()) {
+        const label = personaManager.listPersonaRecords().find((p) => p.id === personaId)?.label || 'Webring Studio';
+        const note = new Notification({
+          title: `Auto-publishing ${label}`,
+          body: `Publishing changes (${status.reasons.join(', ') || 'site update'}).`,
+        });
+        note.show();
+      }
+    },
     onFinished: (personaId, result) => handleJobFinished(personaId, 'publish', result, 'Auto-publish'),
   });
 
@@ -882,19 +892,20 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
-  // Manual syncs and publishes share the scheduler's per-persona lock, so they never overlap a scheduled run
-  const withActiveLock = <T>(fn: () => Promise<T>) =>
-    scheduler.runExclusive(personaManager.getActivePersonaId(), fn);
+  // Manual syncs and publishes share the scheduler's per-persona lock, capturing personaId once
+  const withActiveLock = <T>(fn: (personaId: string, ctx: ActivePersonaContext) => Promise<T>) => {
+    const personaId = personaManager.getActivePersonaId();
+    return scheduler.runExclusive(personaId, () =>
+      personaManager.withPersonaContext(personaId, (ctx) => fn(personaId, ctx))
+    );
+  };
 
   ipcMain.handle('studio:crawl-friend', async (_e, siteUrl: string, localDirOverride?: string) => {
-    return withActiveLock(() =>
-      personaManager.getActiveContext().ringCrawler.crawlFriendSite(siteUrl, localDirOverride)
-    );
+    return withActiveLock((_personaId, ctx) => ctx.ringCrawler.crawlFriendSite(siteUrl, localDirOverride));
   });
 
   ipcMain.handle('studio:crawl-all-friends', async (event) => {
-    return withActiveLock(async () => {
-      const ctx = personaManager.getActiveContext();
+    return withActiveLock(async (_personaId, ctx) => {
       const results = await ctx.ringCrawler.crawlAllFriends({
         // Progress for the Sync button: counts only, nothing about the sites
         onProgress: ({ done, total }) => {
@@ -1089,9 +1100,9 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:export-local', (_e, targetDir?: string) => {
-    return withActiveLock(async () => {
-      const result = await publishTo(personaManager.getActiveContext(), 'local', publishPaths(), { targetDir });
-      if (result.success) scheduleWebringHubFollowUp(personaManager.getActivePersonaId());
+    return withActiveLock(async (personaId, ctx) => {
+      const result = await publishTo(ctx, 'local', publishPaths(), { targetDir });
+      if (result.success) scheduleWebringHubFollowUp(personaId);
       return result;
     });
   });
@@ -1126,14 +1137,7 @@ function registerIpcHandlers() {
 
   // The Publish tab sends its current form; save it, then publish with the saved settings
   const publishWithSettings = (destination: PublishDestination, settings: unknown) =>
-    withActiveLock(async () => {
-      const result = await publishWithSettingsNow(destination, settings);
-      if (result.success) scheduleWebringHubFollowUp(personaManager.getActivePersonaId());
-      return result;
-    });
-  const publishWithSettingsNow = (destination: PublishDestination, settings: unknown) =>
-    (async () => {
-      const ctx = personaManager.getActiveContext();
+    withActiveLock(async (personaId, ctx) => {
       const currentProfile = ctx.db.getProfile();
       ctx.db.updateProfile({
         publishSettings: {
@@ -1141,8 +1145,10 @@ function registerIpcHandlers() {
           ...((settings as object) || {}),
         },
       });
-      return publishTo(ctx, destination, publishPaths());
-    })();
+      const result = await publishTo(ctx, destination, publishPaths());
+      if (result.success) scheduleWebringHubFollowUp(personaId);
+      return result;
+    });
 
   ipcMain.handle('studio:publish-remote', async (_e, settings) => publishWithSettings('remote', settings));
 
@@ -1174,8 +1180,9 @@ function registerIpcHandlers() {
     })
   );
   ipcMain.handle('studio:setup-publish', async () => {
+    const personaId = personaManager.getActivePersonaId();
     const result = await publishGitHubSite(personaManager.getActiveContext(), publishPaths());
-    if (result.success) scheduleWebringHubFollowUp(personaManager.getActivePersonaId());
+    if (result.success) scheduleWebringHubFollowUp(personaId);
     refreshTrayMenu();
     return result;
   });

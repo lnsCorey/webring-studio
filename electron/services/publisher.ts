@@ -11,7 +11,7 @@ import {
   planSync,
   STUDIO_OWNED_PREFIXES,
 } from './publishSync';
-import { PublishSettings } from '../db/database';
+import { PublishSettings, StudioDatabase } from '../db/database';
 import { StaticSiteGenerator } from './siteGenerator';
 import { githubPagesSiteUrl } from '../../src/shared/setup';
 
@@ -92,6 +92,30 @@ export type PagesBuildStatus =
 /** Files GitHub can add to a new repo; a repo holding only these counts as empty. */
 const STARTER_FILE = /^(readme(\.md)?|license(\.md|\.txt)?|\.gitignore)$/i;
 
+export function verifyOrPinSftpHostKey(
+  db: StudioDatabase,
+  host: string,
+  port: number,
+  presentedSha256Hex: string
+): { accepted: boolean; reason?: string } {
+  const normalized = presentedSha256Hex.trim().toLowerCase();
+  if (!normalized) {
+    return { accepted: false, reason: 'Server did not present a host key.' };
+  }
+  const pinned = db.getSftpHostKeyFingerprint(host, port);
+  if (!pinned) {
+    db.setSftpHostKeyFingerprint(host, port, normalized);
+    return { accepted: true };
+  }
+  if (pinned === normalized) {
+    return { accepted: true };
+  }
+  return {
+    accepted: false,
+    reason: `SFTP host key changed for ${host}:${port} (expected ${pinned.slice(0, 16)}…, got ${normalized.slice(0, 16)}…).`,
+  };
+}
+
 export class SitePublisher {
   constructor(private generator: StaticSiteGenerator) {}
 
@@ -141,8 +165,25 @@ export class SitePublisher {
 
     if (mode === 'sftp') {
       const sftp = new SftpClient();
+      let hostKeyError: string | undefined;
       try {
-        await sftp.connect({ host: settings.host, port, username: settings.username, password: settings.password });
+        const privateKey = settings.sftpPrivateKeyPath
+          ? fs.readFileSync(settings.sftpPrivateKeyPath, 'utf8')
+          : undefined;
+        await sftp.connect({
+          host: settings.host,
+          port,
+          username: settings.username,
+          ...(privateKey ? { privateKey } : {}),
+          ...(settings.sftpUseAgent && process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
+          ...(settings.password ? { password: settings.password } : {}),
+          hostHash: 'sha256',
+          hostVerifier: (hashedKey: string) => {
+            const check = verifyOrPinSftpHostKey(db, settings.host, port, hashedKey);
+            if (!check.accepted) hostKeyError = check.reason;
+            return check.accepted;
+          },
+        });
         const owned = await this.listSftpOwned(sftp, root);
         const plan = planSync(files, db.getPublishLedger(destination), owned);
         const madeDirs = new Set<string>();
@@ -173,19 +214,26 @@ export class SitePublisher {
         };
       } catch (err: unknown) {
         await sftp.end().catch(() => undefined);
+        const detail = hostKeyError || (err instanceof Error ? err.message : String(err));
         return {
           success: false,
           mode,
           destination: settings.host,
           filesPublished: 0,
-          message: `SFTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
+          message: `SFTP upload failed: ${detail}`,
         };
       }
     }
 
     const client = new ftp.Client();
     try {
-      await client.access({ host: settings.host, port, user: settings.username, password: settings.password, secure: false });
+      await client.access({
+        host: settings.host,
+        port,
+        user: settings.username,
+        password: settings.password,
+        secure: !settings.ftpAllowInsecure,
+      });
       const owned = await this.listFtpOwned(client, root);
       const plan = planSync(files, db.getPublishLedger(destination), owned);
       const outcome = await applySyncPlan(db, destination, stagingDir, plan, {

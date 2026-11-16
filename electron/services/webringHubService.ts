@@ -456,14 +456,15 @@ export class WebringHubService {
       throw new Error(errorMessage(nonceRes, `${record.title} didn't hand out a removal code`));
     }
     const createdAt = this.now().toISOString();
+    const hubUrl = normalizeSiteUrl(record.url);
     // The private key is used here, in the engine, and never leaves it
     const signature = signWebringHubPayload(
-      { action: 'remove', siteUrl, did, nonce, createdAt },
+      { action: 'remove', siteUrl, did, hubUrl, nonce, createdAt },
       this.db.getKeys().privateKeyPem
     );
     const res = await this.request(`${record.url}/api/entries/${encodeURIComponent(did)}/remove`, {
       method: 'POST',
-      body: { siteUrl, did, nonce, createdAt, signature },
+      body: { siteUrl, did, hubUrl, nonce, createdAt, signature },
     });
     if (res.status === 204 || res.status === 200 || res.status === 404) {
       return this.update(record.url, {

@@ -102,9 +102,21 @@ export class StaticSiteGenerator {
     const apiDir = path.join(outputDir, 'api');
     const mediaOutDir = path.join(outputDir, 'media');
 
+    if (fs.existsSync(outputDir)) {
+      const existingEntries = fs.readdirSync(outputDir);
+      const hasMarker =
+        fs.existsSync(path.join(outputDir, '.webring-studio')) ||
+        fs.existsSync(path.join(outputDir, 'api', 'manifest.json'));
+      if (existingEntries.length > 0 && !hasMarker) {
+        throw new Error(
+          `Refusing to write into non-empty folder "${outputDir}" without a .webring-studio marker.`
+        );
+      }
+    }
     fs.mkdirSync(wellKnownDir, { recursive: true });
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(mediaOutDir, { recursive: true });
+    fs.writeFileSync(path.join(outputDir, '.webring-studio'), 'webring-studio\n', 'utf8');
 
     const writeJson = (relPath: string, data: unknown) => {
       const fullPath = path.join(outputDir, relPath);
@@ -350,17 +362,36 @@ export class StaticSiteGenerator {
       ? `${album.title} · ${bundle.profile.displayName}`
       : `${bundle.profile.displayName} — Federated Profile & Webring`;
 
+    const commentProvider = bundle.profile.commentConfig?.provider;
+    const hasGiscus = commentProvider === 'giscus' && Boolean(bundle.profile.commentConfig?.giscusRepo);
+    const hasUtterances = commentProvider === 'utterances' && Boolean(bundle.profile.commentConfig?.giscusRepo);
+    const commentHost = hasGiscus ? ' https://giscus.app' : hasUtterances ? ' https://utteranc.es' : '';
+    const frameSrcDirective = `${commentHost}${frameSrcExtras}`.trim();
+    const frameSrcClause = frameSrcDirective ? ` frame-src ${frameSrcDirective};` : " frame-src 'none';";
+
+    const cssCandidates = [
+      path.join(__dirname, '../assets/site.css'),
+      path.join(__dirname, '../../electron/assets/site.css'),
+    ];
+    let compiledSiteCss = '';
+    for (const candidate of cssCandidates) {
+      if (fs.existsSync(candidate)) {
+        compiledSiteCss = fs.readFileSync(candidate, 'utf8');
+        break;
+      }
+    }
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://giscus.app https://utteranc.es${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''}; frame-src https://giscus.app https://utteranc.es${frameSrcExtras}; connect-src 'self' https: http:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'${commentHost}${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''};${frameSrcClause} connect-src 'self' https: http:;" />
   <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
-  <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />
-  <script src="https://cdn.tailwindcss.com"></script>${analyticsHeadSnippet}${adsHeadSnippet}
+  <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />${analyticsHeadSnippet}${adsHeadSnippet}
   <script>window.__WEBRING_BUNDLE__ = ${safeJson};${albumId ? `\n  window.__WEBRING_ALBUM_ID__ = ${embedJson(albumId)};` : ''}${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
+  <style>${compiledSiteCss}</style>
   <style>
     body.theme-neo-webring { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
     body.theme-minimal-zine { background: #fafaf9; color: #1c1917; font-family: Georgia, Cambria, serif; }
@@ -899,10 +930,19 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         \`;
       }
 
+      function localAvatarUri(name) {
+        const label = (String(name || '?').trim()[0] || '?').toUpperCase();
+        let hash = 0;
+        for (let i = 0; i < String(name || '').length; i++) hash = (hash * 31 + String(name).charCodeAt(i)) >>> 0;
+        const hue = hash % 360;
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="32" fill="hsl(' + hue + ',55%,38%)"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#fff" font-family="system-ui,sans-serif" font-size="28" font-weight="700">' + esc(label) + '</text></svg>';
+        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      }
+
       function renderFriend(friend) {
         return \`
           <a href="\${safeUrl(friend.siteUrl)}" target="_blank" rel="noopener noreferrer" class="card-surface rounded-xl p-3.5 flex items-center gap-3 hover:border-indigo-400/50 transition">
-            <img src="\${safeUrl(friend.avatarUrl || 'https://api.dicebear.com/7.x/shapes/svg?seed=' + encodeURIComponent(friend.displayName))}" class="w-12 h-12 rounded-full object-cover border border-white/20" />
+            <img src="\${friend.avatarUrl ? safeUrl(friend.avatarUrl) : localAvatarUri(friend.displayName)}" class="w-12 h-12 rounded-full object-cover border border-white/20" />
             <div class="min-w-0 flex-1">
               <h4 class="font-bold text-sm truncate">\${esc(friend.displayName)}</h4>
               <p class="text-xs opacity-70 truncate">\${esc(friend.siteUrl)}</p>

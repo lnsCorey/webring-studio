@@ -546,13 +546,11 @@ export class RingCrawler {
       const profile = ProfileDocumentSchema.parse(rawProfile);
 
       const isManifestVerified =
-        !keyChangedWarning && effectiveVerifyKeyPem
-          ? manifest.proof
-            ? verifyDocumentSignature(
-                rawManifest as Record<string, unknown> & { proof?: typeof manifest.proof },
-                effectiveVerifyKeyPem
-              )
-            : true
+        !keyChangedWarning && effectiveVerifyKeyPem && manifest.proof
+          ? verifyDocumentSignature(
+              rawManifest as Record<string, unknown> & { proof?: typeof manifest.proof },
+              effectiveVerifyKeyPem
+            )
           : false;
 
       const isProfileVerified =
@@ -563,10 +561,17 @@ export class RingCrawler {
             )
           : false;
 
-      // Update friend profile metadata only when both manifest and profile verify.
-      // On key change or unverified fetch, update only keyStatus and lastCrawledAt.
+      const isManifestFresh = isManifestVerified
+        ? this.db.checkDocumentFreshness(manifestFetch.url, manifest.updatedAt, true)
+        : false;
+      const isProfileFresh = isProfileVerified
+        ? this.db.checkDocumentFreshness(profileFetch.url, profile.updatedAt, true)
+        : false;
+
+      // Update friend profile metadata only when both manifest and profile verify and are not rolled back.
+      // On key change, rollback, or unverified fetch, update only keyStatus and lastCrawledAt.
       const crawledAt = new Date().toISOString();
-      if (isManifestVerified && isProfileVerified) {
+      if (isManifestVerified && isProfileVerified && isManifestFresh && isProfileFresh) {
         this.db.addOrUpdateFriend({
           siteUrl: normalizedFriendUrl,
           displayName: profile.displayName,

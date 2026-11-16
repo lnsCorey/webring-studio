@@ -39,14 +39,21 @@ export interface AutoPublisherOptions {
   listPersonaIds: () => string[];
   /** True when the persona has local changes that haven't been published yet. */
   hasUnpublishedChanges: (personaId: string) => Promise<boolean>;
+  /** Quiet period after the last change before firing (default 10s). */
+  quietPeriodSeconds?: number;
+  /** Maximum extension beyond firstChange + delaySeconds (default 60s). */
+  maxExtensionSeconds?: number;
   now?: () => Date;
   onStatusChange?: (personaId: string, status: AutoPublishStatus) => void;
+  onBeforePublish?: (personaId: string, status: AutoPublishStatus) => void;
   onFinished?: (personaId: string, result: JobResult) => void;
 }
 
 interface Entry {
   state: AutoPublishState;
   dueAt: number | null;
+  firstChangeAt: number | null;
+  lastChangeAt: number | null;
   timer: NodeJS.Timeout | null;
   reasons: Set<string>;
   agentHeld: boolean;
@@ -68,7 +75,18 @@ export class AutoPublisher {
   private entry(personaId: string): Entry {
     let entry = this.entries.get(personaId);
     if (!entry) {
-      entry = { state: 'idle', dueAt: null, timer: null, reasons: new Set(), agentHeld: false, rerun: false, lastResult: null, running: null };
+      entry = {
+        state: 'idle',
+        dueAt: null,
+        firstChangeAt: null,
+        lastChangeAt: null,
+        timer: null,
+        reasons: new Set(),
+        agentHeld: false,
+        rerun: false,
+        lastResult: null,
+        running: null,
+      };
       this.entries.set(personaId, entry);
     }
     return entry;
@@ -99,9 +117,18 @@ export class AutoPublisher {
 
   private arm(personaId: string, entry: Entry, delaySeconds: number): void {
     if (entry.timer) clearTimeout(entry.timer);
+    const now = this.now();
+    entry.firstChangeAt = entry.firstChangeAt ?? now;
+    entry.lastChangeAt = entry.lastChangeAt ?? now;
+    const quietMs = (this.options.quietPeriodSeconds ?? 10) * 1000;
+    const maxExtMs = (this.options.maxExtensionSeconds ?? 60) * 1000;
+    const baseDue = entry.firstChangeAt + delaySeconds * 1000;
+    const quietDue = entry.lastChangeAt + quietMs;
+    const targetDue = Math.min(baseDue + maxExtMs, Math.max(baseDue, quietDue));
+    const waitMs = Math.max(0, targetDue - now);
     entry.state = 'pending';
-    entry.dueAt = this.now() + delaySeconds * 1000;
-    entry.timer = setTimeout(() => void this.fire(personaId, false), delaySeconds * 1000);
+    entry.dueAt = targetDue;
+    entry.timer = setTimeout(() => void this.fire(personaId, false), waitMs);
     entry.timer.unref?.();
   }
 
@@ -136,13 +163,16 @@ export class AutoPublisher {
       return null;
     }
     entry.reasons.add(reason);
+    const now = this.now();
+    entry.firstChangeAt = entry.firstChangeAt ?? now;
+    entry.lastChangeAt = now;
     if (entry.agentHeld) {
       this.emit(personaId);
       return this.status(personaId);
     }
     if (entry.state === 'running') {
       entry.rerun = true;
-    } else if (entry.state === 'idle') {
+    } else if (entry.state === 'idle' || entry.state === 'pending') {
       this.arm(personaId, entry, settings.delaySeconds);
     }
     this.emit(personaId);
@@ -236,6 +266,9 @@ export class AutoPublisher {
     }
     entry.state = 'running';
     entry.dueAt = null;
+    entry.firstChangeAt = null;
+    entry.lastChangeAt = null;
+    this.options.onBeforePublish?.(personaId, this.status(personaId));
     entry.reasons.clear();
     entry.rerun = false;
     this.emit(personaId);
