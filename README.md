@@ -107,7 +107,7 @@ A persona is a separate online identity: its own SQLite database, Ed25519 key, `
 ### Security and privacy
 
 - Your signing key, SFTP/FTP password and GitHub token are encrypted with your operating system's keychain (Keychain on macOS, DPAPI on Windows, libsecret on Linux). Studio never shows them again after you save them, and only unlocks them to sign or to connect when publishing.
-- Every document you publish is signed. Friends' keys are pinned the first time Studio sees them, and a changed key is flagged rather than trusted, unless the old key signed off on it (see [Changing your signing key](#changing-your-signing-key)).
+- Every document you publish is signed. Friends' keys are pinned the first time Studio sees them, and a changed key is flagged rather than trusted, unless the old key signed off on it (see [Changing your signing key](#changing-your-signing-key)). Unverified friend profiles or friends with a key-change warning never overwrite stored display fields or reach `connections.json`.
 - Friends are private by default: they aren't listed on your public site unless you mark them public.
 - **Mute** hides a site from your feed. **Block** also stops crawling it and keeps its endorsements off your published site.
 - When crawling, Studio refuses addresses on your own computer or local network, so a peer can't use it to probe devices behind your firewall.
@@ -209,7 +209,7 @@ A webring is a circle of sites linked by **← Prev**, **Next →** and **Random
 - **Leaving and removal:** if you remove a ring and publish, the maintainer's next sync drops you. If a maintainer removes, bans or closes a ring, members' Studios pick that up on their next sync. Maintainers can also hide a member from Prev/Next/Random without removing them.
 - **Navigation:** Prev/Next are written into your page when you publish. When a visitor clicks them, the page re-reads the ring file so removed sites are skipped, falling back to the saved link if that fails.
 
-Studio only trusts a ring file signed by its maintainer's key, served from the maintainer's own site, and never older than the last copy it saw. A key change or an unsigned ring file can raise a warning but never removes anyone.
+Studio only trusts a ring file signed by its maintainer's key, served from the maintainer's own site, and never older than the last copy it saw. Unsigned or unverified ring files never update saved membership, neighbors, or status, and only verified rings (`hubVerified`) are published in `connections.json`.
 
 ### Webring Hubs
 
@@ -237,7 +237,7 @@ Each job can also add a random delay of up to 5, 15 or 30 minutes (**jitter**), 
 
 Every persona with a schedule runs, even when it isn't the one you have open. Scheduled publishes are skipped when nothing has changed. Jobs run one at a time and never overlap a sync or publish you start by hand.
 
-Schedules run while Studio is running. With **background mode** on (the default), closing the window leaves Studio in the menu bar / system tray so schedules keep going. Quit from the tray icon or with Cmd+Q. You can also have Studio **start at login**. If your computer was asleep or Studio was closed, each missed job runs once when it's back. Failures are recorded on the Schedule card and can raise a notification.
+Schedules run while Studio is running. With **background mode** on (the default), closing the window leaves Studio in the menu bar / system tray so schedules keep going. Quit from the tray icon or with Cmd+Q. You can also have Studio **start at login**. If your computer was asleep or Studio was closed, each missed job runs once when it's back. Failures are recorded on the Schedule card and can raise a notification. Local changes made by an MCP agent are held from automatic publishing until you review them or publish manually.
 
 ## Connecting an MCP agent
 
@@ -256,7 +256,13 @@ While Studio is open, it serves MCP on `127.0.0.1` with a fixed port. This is th
 - In the **AI Agent (MCP)** tab, click **Copy SSE URL** (or **Copy HTTP URL**). The URL includes an access token.
 - In your MCP client, add a server with transport **SSE** (or Streamable HTTP) and paste the URL.
 
-Command-line agents can connect without the token. Clients that run inside a browser or an Electron window send an `Origin` header and must use the URL with the token; web pages are always refused. Treat the token like a password. To issue a new one, quit Studio, delete `mcp-http.json` from the data folder, and reopen it.
+Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the access token (`?token=` or `Authorization: Bearer <token>`), regardless of whether an `Origin` header is sent. Web pages are always refused. Treat the token like a password. To issue a new one, quit Studio, delete `mcp-http.json` from the data folder, and reopen it.
+
+**MCP safety controls:**
+
+- **Read-Only by default:** External MCP connections start in Read-Only mode so agents can read your personas, feed, and setup status without modifying anything until you allow writes.
+- **Tool tiers & human confirmation:** Tools are split into `read`, `local-write`, and `outward` (publishing, deleting, trusting/rotating keys, proxy settings, `webring_set_schedule` auto-publish/destination changes, and local-path photo imports). External `outward` tool calls are queued for in-app human confirmation rather than running immediately.
+- **Untrusted feed isolation & auto-publish hold:** `webring_get_neighborhood_feed` excludes unverified entries by default and labels peer-authored content as untrusted data. Local changes made by an MCP agent are held from auto-publish until you review or publish manually.
 
 **2. Standalone stdio server**
 
