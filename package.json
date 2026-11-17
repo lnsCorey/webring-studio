@@ -10,7 +10,7 @@
   "scripts": {
     "dev:vite": "vite",
     "build:vite": "vite build",
-    "build:site-css": "tailwindcss -i src/index.css -o electron/assets/site.css --content \"electron/services/siteGenerator.ts,electron/services/siteTemplates.ts\" --minify",
+    "build:site-css": "tailwindcss -i src/index.css -o electron/assets/site.css --content \"electron/services/*.ts\" --minify && node -e \"const fs=require('fs');fs.mkdirSync('dist-electron/electron/assets',{recursive:true});fs.copyFileSync('electron/assets/site.css','dist-electron/electron/assets/site.css')\"",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "npm run build:vite && npm run build:site-css && npm run build:electron",
     "dev": "npm run build && node scripts/brand-dev-electron.mjs && electron .",

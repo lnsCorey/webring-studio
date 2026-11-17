@@ -6296,6 +6296,7 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
       const csp = html.match(/http-equiv="Content-Security-Policy"[^>]*>/)?.[0] || '';
       expect(html).not.toContain('cdn.tailwindcss.com');
       expect(html).not.toContain('api.dicebear.com');
+      expect(html).toContain('.flex{display:flex}');
       expect(csp).not.toContain('https://giscus.app');
       expect(csp).not.toContain('https://utteranc.es');
       expect(fs.existsSync(path.join(outDir, '.webring-studio'))).toBe(true);
