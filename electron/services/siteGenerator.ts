@@ -371,6 +371,7 @@ export class StaticSiteGenerator {
 
     const cssCandidates = [
       path.join(__dirname, '../assets/site.css'),
+      path.join(__dirname, '../../../electron/assets/site.css'),
       path.join(__dirname, '../../electron/assets/site.css'),
     ];
     let compiledSiteCss = '';

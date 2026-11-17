@@ -642,7 +642,21 @@ declare global {
           summary: string;
           success: boolean;
         }>;
+        readOnlyMode?: boolean;
+        pendingApprovals?: Array<{
+          id: string;
+          toolName: string;
+          tier: string;
+          args: Record<string, unknown>;
+          requestedAt: string;
+          status: string;
+        }>;
       }>;
+      setMcpReadOnly?: (enabled: boolean) => Promise<{ readOnlyMode: boolean }>;
+      resolveMcpApproval?: (
+        id: string,
+        approved: boolean
+      ) => Promise<{ ok: boolean; approval?: unknown; result?: unknown }>;
       callMcpTool?: (
         toolName: string,
         args?: Record<string, unknown>
@@ -906,6 +920,15 @@ export const App: React.FC = () => {
       personaId: string;
       summary: string;
       success: boolean;
+    }>;
+    readOnlyMode?: boolean;
+    pendingApprovals?: Array<{
+      id: string;
+      toolName: string;
+      tier: string;
+      args: Record<string, unknown>;
+      requestedAt: string;
+      status: string;
     }>;
   } | null>(null);
   const [selectedMcpTool, setSelectedMcpTool] = useState<string>('webring_list_personas');
@@ -6717,6 +6740,103 @@ export const App: React.FC = () => {
                       : 'STDIO & HTTP MCP Ready'}
                   </span>
                 </div>
+              </div>
+
+              {/* Agent Safety Controls & Pending Approvals */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <h3 className="font-bold text-sm text-white flex items-center gap-2">
+                      Agent Access Policy
+                      <span
+                        className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${
+                          mcpInfo?.readOnlyMode !== false
+                            ? 'bg-emerald-500/20 text-emerald-300'
+                            : 'bg-amber-500/20 text-amber-300'
+                        }`}
+                      >
+                        {mcpInfo?.readOnlyMode !== false ? 'Read-Only' : 'Writes Allowed'}
+                      </span>
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Read-Only mode blocks external MCP writes by default. When writes are allowed,
+                      outward and destructive actions still queue below for your confirmation, and
+                      agent-made changes are held from auto-publish until you review them.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const next = !(mcpInfo?.readOnlyMode !== false);
+                      await window.studioApi?.setMcpReadOnly?.(next);
+                      const info = await window.studioApi?.getMcpInfo?.();
+                      if (info) setMcpInfo(info);
+                      notify(next ? 'MCP switched to Read-Only mode.' : 'MCP local writes enabled (outward tools still require confirmation).');
+                    }}
+                    className={`px-3.5 py-2 rounded-xl text-xs font-semibold border transition-colors ${
+                      mcpInfo?.readOnlyMode !== false
+                        ? 'bg-amber-500/15 border-amber-500/40 text-amber-200 hover:bg-amber-500/25'
+                        : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/25'
+                    }`}
+                  >
+                    {mcpInfo?.readOnlyMode !== false ? 'Allow Local Writes' : 'Switch Back to Read-Only'}
+                  </button>
+                </div>
+
+                {(mcpInfo?.pendingApprovals?.length || 0) > 0 && (
+                  <div className="border-t border-slate-800 pt-3 space-y-2">
+                    <div className="text-xs font-bold text-amber-300">
+                      Pending Confirmations ({mcpInfo?.pendingApprovals?.length})
+                    </div>
+                    <div className="space-y-2">
+                      {mcpInfo?.pendingApprovals?.map((item) => (
+                        <div
+                          key={item.id}
+                          className="p-3 rounded-xl bg-slate-950 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-mono font-bold text-white">
+                              {item.toolName}{' '}
+                              <span className="text-[10px] font-normal text-amber-300">
+                                ({item.tier})
+                              </span>
+                            </div>
+                            <pre className="text-[11px] text-slate-400 mt-1 overflow-x-auto max-h-24">
+                              {JSON.stringify(item.args, null, 2)}
+                            </pre>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await window.studioApi?.resolveMcpApproval?.(item.id, true);
+                                const info = await window.studioApi?.getMcpInfo?.();
+                                if (info) setMcpInfo(info);
+                                await refreshData();
+                                notify(`Approved and ran ${item.toolName}.`);
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
+                            >
+                              Approve &amp; Run
+                            </button>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await window.studioApi?.resolveMcpApproval?.(item.id, false);
+                                const info = await window.studioApi?.getMcpInfo?.();
+                                if (info) setMcpInfo(info);
+                                notify(`Denied ${item.toolName}.`);
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-200 text-xs font-semibold"
+                            >
+                              Deny
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Dual Transport Configuration Cards */}
