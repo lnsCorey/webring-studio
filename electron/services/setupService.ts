@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import { requireUsableProxy } from '../security/proxyAgent';
 import { ActivePersonaContext } from './personaManager';
 import {
   githubPagesSiteUrl,
@@ -214,7 +215,9 @@ export async function getSetupStatus(
 export async function connectGitHub(
   ctx: ActivePersonaContext,
   token: string,
-  deps: SetupDeps = {}
+  deps: SetupDeps = {},
+  /** allowPlaintext: the user agreed to store the token unencrypted (no OS keychain) */
+  options: { allowPlaintext?: boolean } = {}
 ): Promise<{ login: string; name?: string }> {
   const clean = token.trim();
   if (!clean) throw new Error('No GitHub token was given.');
@@ -222,13 +225,16 @@ export async function connectGitHub(
   if (!user) throw new Error('GitHub rejected that token. Check it was copied in full, or sign in again.');
   const settings = ctx.db.getProfile().publishSettings;
   const signedInAsOther = settings.githubOwner && settings.githubOwner.toLowerCase() !== user.login.toLowerCase();
-  ctx.db.updateProfile({
-    publishSettings: {
-      githubToken: clean,
-      // Keep a repo the user already set up (it may belong to an organization); otherwise use their account
-      ...(!settings.githubRepo || !signedInAsOther ? { githubOwner: user.login } : {}),
+  ctx.db.updateProfile(
+    {
+      publishSettings: {
+        githubToken: clean,
+        // Keep a repo the user already set up (it may belong to an organization); otherwise use their account
+        ...(!settings.githubRepo || !signedInAsOther ? { githubOwner: user.login } : {}),
+      },
     },
-  });
+    { allowPlaintext: options.allowPlaintext === true }
+  );
   return { login: user.login, ...(user.name ? { name: user.name } : {}) };
 }
 
@@ -371,8 +377,8 @@ export async function checkLiveSite(ctx: ActivePersonaContext, deps: SetupDeps =
 
   // A query string asks the host's cache for a fresh copy
   const bust = `?check=${now.getTime()}`;
-  const proxy = ctx.db.getProxySettings();
-  const proxyUrl = proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined;
+  // Throws ProxyUnavailableError before any request when the saved proxy can't be unlocked
+  const proxyUrl = requireUsableProxy(ctx.db.getProxySettings());
   const fetchJson = deps.fetchJson || ((url: string) => defaultJsonFetcher(url, proxyUrl));
   let didDoc: { verificationMethod?: Array<{ publicKeyPem?: string }> };
   try {

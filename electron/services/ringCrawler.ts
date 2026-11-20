@@ -28,7 +28,7 @@ import {
   PrivateNetworkAddressError,
   privatePeersAllowed,
 } from '../security/networkGuard';
-import { createProxyAgent } from '../security/proxyAgent';
+import { createProxyAgent, requireUsableProxy } from '../security/proxyAgent';
 
 export interface CrawlSiteResult {
   siteUrl: string;
@@ -417,10 +417,7 @@ export class RingCrawler {
       conditionalFetcher ||
       (customFetcher
         ? async (url: string) => ({ json: await customFetcher(url) })
-        : createConditionalJsonFetcher(() => {
-            const proxy = this.db.getProxySettings();
-            return proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined;
-          }));
+        : createConditionalJsonFetcher(() => requireUsableProxy(this.db.getProxySettings())));
   }
 
   /**
@@ -429,7 +426,28 @@ export class RingCrawler {
    * on EVERY document, enforces TOFU public key pinning, populates the local `network_feed`,
    * and discovers any likes/shares/comments of OUR items (`endorsements`).
    */
+  /** Throws ProxyUnavailableError when the saved proxy can't be unlocked, so nothing may connect. */
+  public assertCanSync(): void {
+    requireUsableProxy(this.db.getProxySettings());
+  }
+
   public async crawlFriendSite(friendSiteUrl: string, localDirOverride?: string): Promise<CrawlSiteResult> {
+    // A proxy that can't be unlocked stops the crawl before anything connects
+    try {
+      requireUsableProxy(this.db.getProxySettings());
+    } catch (err) {
+      return {
+        siteUrl: normalizeSiteUrl(friendSiteUrl),
+        success: false,
+        itemsIndexed: 0,
+        photosIndexed: 0,
+        endorsementsFound: 0,
+        entriesRejected: 0,
+        entriesPruned: 0,
+        verifiedSignature: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
     return this.crawlAndTrack(friendSiteUrl, localDirOverride, true);
   }
 
@@ -1037,6 +1055,8 @@ export class RingCrawler {
   public async crawlAllFriends(
     options: { concurrency?: number; onProgress?: (progress: SyncProgress) => void } = {}
   ): Promise<CrawlSiteResult[]> {
+    // A proxy that can't be unlocked stops the whole run once, before any friend is contacted
+    requireUsableProxy(this.db.getProxySettings());
     const concurrency = options.concurrency ?? SYNC_CONCURRENCY;
     const friends = this.db.getFriends();
     const recrawlFirst = this.db.getNeedsRecrawlUrls();

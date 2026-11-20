@@ -126,6 +126,16 @@ function removeTempDir(dir: string): void {
 }
 
 /**
+ * Stands in for the OS keychain (Electron safeStorage) the running app has, for tests that model
+ * the app storing passwords, tokens or a proxy login. Without one, new secrets need consent.
+ */
+const TEST_CIPHER: KeyCipher = {
+  isAvailable: () => true,
+  encrypt: (plainText) => Buffer.from(plainText, 'utf8').reverse(),
+  decrypt: (cipherText) => Buffer.from(cipherText).reverse().toString('utf8'),
+};
+
+/**
  * Rewrites one of a site's published documents as its owner would: signed with the site key, with
  * the manifest's digest of it updated and the manifest signed again. (A document changed without
  * its manifest no longer matches the manifest's digest, and friends refuse it.)
@@ -466,7 +476,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
 
   it('compartmentalizes multiple online personas with isolated SQLite DBs, Ed25519 keys, DIDs, and friend graphs', () => {
     const userDataDir = path.join(tempRoot, 'multi-persona-studio');
-    const manager = new PersonaManager(userDataDir);
+    const manager = new PersonaManager(userDataDir, { keyCipher: TEST_CIPHER });
 
     try {
       // 1. Default persona is initialized automatically
@@ -1385,7 +1395,7 @@ describe('Private Key Encryption at Rest', () => {
   it('seals publishing credentials, never returns them from getProfile, and keeps them through the form', () => {
     // An older install stored them in plaintext
     const legacy = new StudioDatabase(tempRoot, 'creds.sqlite');
-    legacy.updateProfile({ publishSettings: { password: 'sftp-secret', githubToken: 'ghp_legacy' } });
+    legacy.updateProfile({ publishSettings: { password: 'sftp-secret', githubToken: 'ghp_legacy' } }, { allowPlaintext: true });
     legacy.close();
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
@@ -5345,7 +5355,7 @@ describe('Guided setup: GitHub sign-in, site creation, publish and live check', 
   let dir: string;
   let managers: PersonaManager[] = [];
   const openManager = () => {
-    const manager = new PersonaManager(dir);
+    const manager = new PersonaManager(dir, { keyCipher: TEST_CIPHER });
     managers.push(manager);
     return manager;
   };
@@ -6333,7 +6343,7 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
   });
 
   it('isolates MCP personaId calls without switching the app active persona and redacts proxy credentials', async () => {
-    const manager = new PersonaManager(path.join(tempRoot, 'iso'));
+    const manager = new PersonaManager(path.join(tempRoot, 'iso'), { keyCipher: TEST_CIPHER });
     const created = manager.createPersona({
       label: 'Alt',
       displayName: 'Alt Persona',

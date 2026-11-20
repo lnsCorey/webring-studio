@@ -30,6 +30,7 @@ import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
 import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
 import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
+import { PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -486,7 +487,9 @@ declare global {
         activePersonaId: string;
         personas: PersonaSummary[];
       }>;
-      updateProfile: (updates: unknown) => Promise<unknown>;
+      updateProfile: (updates: unknown, options?: { allowPlaintext?: boolean }) => Promise<unknown>;
+      getSecurityStatus?: () => Promise<SecurityStatusView>;
+      onSecurityStatusChanged?: (cb: (status: SecurityStatusView) => void) => () => void;
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
       addPhoto: (input: unknown) => Promise<unknown>;
@@ -531,10 +534,10 @@ declare global {
       searchWebringHub?: WebringHubApi['searchWebringHub'];
       setWebringHubListed?: WebringHubApi['setWebringHubListed'];
       checkKeyWithWebringHubs?: WebringHubApi['checkKeyWithWebringHubs'];
-      setProxySettings?: (input: {
-        enabled?: boolean;
-        proxyUrl?: string;
-      }) => Promise<{ enabled: boolean; proxyUrl: string }>;
+      setProxySettings?: (
+        input: { enabled?: boolean; proxyUrl?: string },
+        options?: { allowPlaintext?: boolean }
+      ) => Promise<{ enabled: boolean; proxyUrl: string }>;
       setFriendVisibility: (
         friendId: string,
         visibility: FriendVisibility
@@ -613,8 +616,11 @@ declare global {
       getSetupStatus?: SetupApi['getSetupStatus'];
       githubLoginAvailable?: SetupApi['githubLoginAvailable'];
       githubLoginStart?: SetupApi['githubLoginStart'];
-      githubLoginPoll?: SetupApi['githubLoginPoll'];
-      githubConnectToken?: SetupApi['githubConnectToken'];
+      githubLoginPoll?: (
+        loginId: string,
+        options?: { allowPlaintext?: boolean }
+      ) => ReturnType<SetupApi['githubLoginPoll']>;
+      githubConnectToken?: (token: string, options?: { allowPlaintext?: boolean }) => ReturnType<SetupApi['githubConnectToken']>;
       setupConfigureSite?: SetupApi['setupConfigureSite'];
       setupPublish?: SetupApi['setupPublish'];
       setupCheckLive?: SetupApi['setupCheckLive'];
@@ -719,6 +725,7 @@ export const App: React.FC = () => {
     | 'privacy-faq'
     | 'webrings'
     | 'hubs'
+    | 'security-storage'
   >('quickstart');
   const [bundle, setBundle] = useState<CompleteSiteBundle | null>(null);
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
@@ -883,7 +890,7 @@ export const App: React.FC = () => {
   const [scheduleOverview, setScheduleOverview] = useState<ScheduleOverview | null>(null);
   const [runningJob, setRunningJob] = useState<'sync' | 'publish' | null>(null);
   const [publishedUpToDate, setPublishedUpToDate] = useState(false);
-  const [proxySettings, setProxySettings] = useState<{ enabled: boolean; proxyUrl: string }>({
+  const [proxySettings, setProxySettings] = useState<{ enabled: boolean; proxyUrl: string; unavailable?: boolean }>({
     enabled: false,
     proxyUrl: '',
   });
@@ -986,6 +993,50 @@ export const App: React.FC = () => {
   const [friendsFilter, setFriendsFilter] = useState<'all' | 'sync-problems'>('all');
   const [openSyncProblemId, setOpenSyncProblemId] = useState<string | null>(null);
 
+  // Keychain and proxy state for the security banners (studio:get-security-status)
+  const [securityStatus, setSecurityStatus] = useState<SecurityStatusView>({
+    keyVaultAvailable: true,
+    proxyUnavailable: false,
+    agentChangesHeld: false,
+  });
+  const [vaultBannerDismissed, setVaultBannerDismissed] = useState(false);
+  const refreshSecurityStatus = async () => {
+    const status = await window.studioApi?.getSecurityStatus?.().catch(() => undefined);
+    if (status) setSecurityStatus(status);
+  };
+  useEffect(() => {
+    void refreshSecurityStatus();
+    return window.studioApi?.onSecurityStatusChanged?.((status) => setSecurityStatus(status));
+  }, []);
+
+  // Asks before a new password or token is stored without encryption (no OS keychain)
+  const [consentRequest, setConsentRequest] = useState<{ label: string; resolve: (allow: boolean) => void } | null>(null);
+  const askConsent = (label: string) =>
+    new Promise<boolean>((resolve) => setConsentRequest({ label, resolve }));
+
+  /**
+   * Saves profile changes. A newly typed password or token needs the user's consent when the
+   * keychain is unavailable; saved ones come back masked and aren't new.
+   */
+  const saveProfile = async (updates: unknown) => {
+    if (!window.studioApi) throw new Error('Not available.');
+    const publish = (updates as { publishSettings?: Record<string, unknown> } | null)?.publishSettings;
+    const newSecret = publish
+      ? (['password', 'githubToken'] as const).find(
+          (field) => typeof publish[field] === 'string' && publish[field] && publish[field] !== '••••••••'
+        )
+      : undefined;
+    if (newSecret && !securityStatus.keyVaultAvailable) {
+      const allow = await askConsent(newSecret === 'githubToken' ? 'GitHub token' : 'password');
+      if (!allow) {
+        notify("Not saved: you chose not to store it without encryption.");
+        throw new Error('Not saved: storing it without encryption was declined.');
+      }
+      return window.studioApi.updateProfile(updates, { allowPlaintext: true });
+    }
+    return window.studioApi.updateProfile(updates);
+  };
+
   useEffect(() => {
     if (!bundle || !setupStatus || showSetupWizard) return;
     if (setupStatus.complete || setupStatus.dismissed || setupAutoOpened.current.has(activePersonaId)) return;
@@ -994,6 +1045,7 @@ export const App: React.FC = () => {
     setShowSetupWizard(true);
   }, [bundle, setupStatus, activePersonaId]);
 
+  const setupTokenConsent = useRef(false);
   const setupApi: SetupApi | null =
     window.studioApi?.getSetupStatus &&
     window.studioApi.githubLoginAvailable &&
@@ -1007,9 +1059,27 @@ export const App: React.FC = () => {
       ? {
           getSetupStatus: window.studioApi.getSetupStatus,
           githubLoginAvailable: window.studioApi.githubLoginAvailable,
-          githubLoginStart: window.studioApi.githubLoginStart,
-          githubLoginPoll: window.studioApi.githubLoginPoll,
-          githubConnectToken: window.studioApi.githubConnectToken,
+          // A GitHub token is a secret: without the keychain, ask before sign-in stores it unencrypted
+          githubLoginStart: async () => {
+            setupTokenConsent.current = false;
+            if (!securityStatus.keyVaultAvailable) {
+              if (!(await askConsent('GitHub token'))) {
+                throw new Error("Sign-in cancelled: Studio can't store the GitHub token securely on this device.");
+              }
+              setupTokenConsent.current = true;
+            }
+            return window.studioApi!.githubLoginStart!();
+          },
+          githubLoginPoll: (loginId: string) =>
+            window.studioApi!.githubLoginPoll!(loginId, setupTokenConsent.current ? { allowPlaintext: true } : undefined),
+          githubConnectToken: async (token: string) => {
+            let allowPlaintext = false;
+            if (!securityStatus.keyVaultAvailable) {
+              allowPlaintext = await askConsent('GitHub token');
+              if (!allowPlaintext) throw new Error("Not saved: Studio can't store the GitHub token securely on this device.");
+            }
+            return window.studioApi!.githubConnectToken!(token, allowPlaintext ? { allowPlaintext } : undefined);
+          },
           setupConfigureSite: window.studioApi.setupConfigureSite,
           setupPublish: window.studioApi.setupPublish,
           setupCheckLive: window.studioApi.setupCheckLive,
@@ -1312,7 +1382,7 @@ export const App: React.FC = () => {
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({
+    await saveProfile({
       siteUrl,
       handle,
       displayName,
@@ -1599,7 +1669,7 @@ export const App: React.FC = () => {
     if (friendVisibility === 'public' && !publishSettings.publishFriendsList) {
       const nextSettings = { ...publishSettings, publishFriendsList: true };
       setPublishSettings(nextSettings);
-      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+      await saveProfile({ publishSettings: nextSettings });
     }
     setFriendSiteUrl('');
     setFriendName('');
@@ -1624,7 +1694,7 @@ export const App: React.FC = () => {
     if (edit.visibility === 'public' && !publishSettings.publishFriendsList) {
       const nextSettings = { ...publishSettings, publishFriendsList: true };
       setPublishSettings(nextSettings);
-      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+      await saveProfile({ publishSettings: nextSettings });
     }
     setEditingFriendId(null);
     await refreshStudioData();
@@ -1635,7 +1705,7 @@ export const App: React.FC = () => {
     if (!window.studioApi) return;
     const nextSettings = { ...publishSettings, ...patch };
     setPublishSettings(nextSettings);
-    await window.studioApi.updateProfile({ publishSettings: nextSettings });
+    await saveProfile({ publishSettings: nextSettings });
     await refreshStudioData();
     notify('Updated social graph privacy policy and re-signed static JSON bundle!');
   };
@@ -1865,6 +1935,10 @@ export const App: React.FC = () => {
       const message = `Sync: ${parts.join(', ')}.`;
       setSyncProblemsMessage(withProblems ? message : null);
       notify(message);
+    } catch (err) {
+      // e.g. the proxy can't be unlocked: nothing was contacted, and the banner explains it
+      notify(`Sync stopped: ${errorMessage(err)}`);
+      void refreshSecurityStatus();
     } finally {
       setIsSyncingFriends(false);
     }
@@ -1972,10 +2046,21 @@ export const App: React.FC = () => {
   const handleSaveProxySettings = async (next: { enabled?: boolean; proxyUrl?: string }) => {
     if (!window.studioApi?.setProxySettings) return;
     try {
-      const updated = await window.studioApi.setProxySettings({
-        enabled: next.enabled ?? proxySettings.enabled,
-        proxyUrl: next.proxyUrl ?? proxySettings.proxyUrl,
-      });
+      const proxyUrl = next.proxyUrl ?? proxySettings.proxyUrl;
+      // A proxy login is a password: without the keychain, ask before storing it unencrypted
+      let allowPlaintext = false;
+      if (!securityStatus.keyVaultAvailable && /^[a-z0-9+.-]+:\/\/[^/@\s]+@/i.test(proxyUrl.trim())) {
+        allowPlaintext = await askConsent('proxy password');
+        if (!allowPlaintext) {
+          notify('Proxy not saved: you chose not to store its password without encryption.');
+          return;
+        }
+      }
+      const updated = await window.studioApi.setProxySettings(
+        { enabled: next.enabled ?? proxySettings.enabled, proxyUrl },
+        allowPlaintext ? { allowPlaintext } : undefined
+      );
+      void refreshSecurityStatus();
       setProxySettings(updated);
       notify(
         updated.enabled && updated.proxyUrl
@@ -2194,14 +2279,14 @@ export const App: React.FC = () => {
     if (chosen) {
       const nextSettings = { ...publishSettings, exportPath: chosen };
       setPublishSettings(nextSettings);
-      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+      await saveProfile({ publishSettings: nextSettings });
       notify(`Saved local export folder: ${chosen}`);
     }
   };
 
   const handleSaveRemoteSettings = async () => {
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     await refreshStudioData();
     notify(
       `Saved ${publishSettings.protocol.toUpperCase()} connection settings for this persona in SQLite!`
@@ -2227,7 +2312,7 @@ export const App: React.FC = () => {
       remotePath: '/var/www/html',
     };
     setPublishSettings(clearedSettings);
-    await window.studioApi.updateProfile({ publishSettings: clearedSettings });
+    await saveProfile({ publishSettings: clearedSettings });
     await refreshStudioData();
     notify(`Deleted stored SFTP/FTP credentials from ${activeLabel}'s database.`);
   };
@@ -2235,7 +2320,7 @@ export const App: React.FC = () => {
   const handlePublishRemote = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     notify(`Saved settings & connecting to ${publishSettings.protocol.toUpperCase()} host ${publishSettings.host}...`);
     const res = await window.studioApi.publishRemote(publishSettings);
     await refreshStudioData();
@@ -2244,7 +2329,7 @@ export const App: React.FC = () => {
 
   const handleSaveGithubSettings = async () => {
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     await refreshStudioData();
     notify('Saved GitHub Pages connection settings for this persona in SQLite!');
   };
@@ -2268,7 +2353,7 @@ export const App: React.FC = () => {
     };
     setPublishSettings(clearedSettings);
     setGithubCheckResult(null);
-    await window.studioApi.updateProfile({ publishSettings: clearedSettings });
+    await saveProfile({ publishSettings: clearedSettings });
     await refreshStudioData();
     notify(`Deleted stored GitHub Pages credentials from ${activeLabel}'s database.`);
   };
@@ -2288,7 +2373,7 @@ export const App: React.FC = () => {
   const handlePublishGithub = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     notify(`Saved settings & deploying to github.com/${publishSettings.githubOwner}/${publishSettings.githubRepo}...`);
     setGithubDeploying(true);
     try {
@@ -2713,6 +2798,46 @@ export const App: React.FC = () => {
             </button>
           </div>
         </header>
+
+        {/* Safeguards that block or warn, with what to do (stacked) */}
+        {securityStatus.proxyUnavailable && (
+          <SecurityBanner
+            severity="error"
+            title="Network activity paused."
+            message="Your proxy is configured but can't be unlocked, so Studio has paused all network activity to avoid exposing your IP address."
+            actions={[
+              { label: 'Retry', onClick: () => void refreshSecurityStatus().then(() => refreshStudioData()) },
+              {
+                label: 'Open proxy settings',
+                onClick: () => {
+                  setActiveTab('publish');
+                  setTimeout(
+                    () => document.getElementById('proxy-settings')?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+                    100
+                  );
+                },
+              },
+            ]}
+          />
+        )}
+        {!securityStatus.keyVaultAvailable && !vaultBannerDismissed && (
+          <SecurityBanner
+            severity="warning"
+            title="Secure storage unavailable."
+            message="This device's secure storage isn't available. New passwords and tokens won't be saved unless you allow unencrypted storage."
+            actions={[
+              {
+                label: 'Learn more',
+                onClick: () => {
+                  setHelpSection('security-storage');
+                  setActiveTab('help');
+                },
+              },
+            ]}
+            dismissible
+            onDismiss={() => setVaultBannerDismissed(true)}
+          />
+        )}
 
         {/* Scrollable Workspace */}
         <div className="flex-1 overflow-y-auto p-6">
@@ -4784,7 +4909,7 @@ export const App: React.FC = () => {
                                   publishFriendsList: true,
                                 };
                                 setPublishSettings(nextSettings);
-                                await window.studioApi?.updateProfile({
+                                await saveProfile({
                                   publishSettings: nextSettings,
                                 });
                               }
@@ -5387,7 +5512,7 @@ export const App: React.FC = () => {
                 mediaSrc={mediaSrc}
                 onSave={async (updates) => {
                   if (!window.studioApi) return;
-                  await window.studioApi.updateProfile(updates);
+                  await saveProfile(updates);
                   await refreshStudioData();
                 }}
               />
@@ -5949,7 +6074,7 @@ export const App: React.FC = () => {
                     </p>
                   )}
 
-                  <div className="border-t border-slate-800 pt-4 space-y-2">
+                  <div id="proxy-settings" className="border-t border-slate-800 pt-4 space-y-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <label className="flex items-center gap-2 text-xs font-semibold text-slate-200">
                         <input
@@ -5982,6 +6107,11 @@ export const App: React.FC = () => {
                         Save Proxy
                       </button>
                     </div>
+                    {proxySettings.unavailable && (
+                      <p className="text-[11px] text-rose-300">
+                        Saved proxy can't be unlocked on this device. Re-enter it to continue.
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
@@ -7467,6 +7597,7 @@ export const App: React.FC = () => {
                       { id: 'privacy-faq', label: '6. Security & Privacy FAQ' },
                       { id: 'webrings', label: '7. Webrings Guide' },
                       { id: 'hubs', label: '8. Webring Hubs' },
+                      { id: 'security-storage', label: '9. Secure Storage & Proxy' },
                     ] as const
                   ).map((sec) => (
                     <button
@@ -8841,6 +8972,47 @@ git push -u origin main --force`}
                 </div>
               )}
 
+              {/* SECTION 9: SECURE STORAGE & PROXY */}
+              {helpSection === 'security-storage' && (
+                <div className="space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+                    <h3 className="text-xl font-bold">Secure Storage &amp; Proxy</h3>
+                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                      <h4 className="font-bold text-sm text-violet-400">Where Studio keeps your passwords and tokens</h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        Your signing key, SFTP/FTP password, GitHub token and a proxy login are encrypted with your
+                        operating system's secure storage: the Keychain on macOS, Windows' data protection, or the
+                        Secret Service (GNOME Keyring or KWallet) on Linux. Only you, signed in to this device, can
+                        unlock them.
+                      </p>
+                    </div>
+                    <div className="p-4 rounded-xl bg-slate-950 border border-amber-500/30 space-y-1.5">
+                      <h4 className="font-bold text-sm text-amber-300">"Secure storage unavailable"</h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        Some Linux desktops have no Secret Service running, and some remote or sandboxed sessions
+                        can't reach it. Then Studio can't encrypt anything. It shows a yellow notice, and before it
+                        saves a new password or token it asks whether to store it <strong>unencrypted</strong>.
+                        Anyone with access to your user account's files could read it. If you'd rather not, cancel:
+                        nothing is saved. On Linux, installing and starting GNOME Keyring or KWallet usually fixes it.
+                      </p>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        The command-line MCP never stores a secret unencrypted. Enter passwords and tokens in the app.
+                      </p>
+                    </div>
+                    <div className="p-4 rounded-xl bg-slate-950 border border-rose-500/30 space-y-1.5">
+                      <h4 className="font-bold text-sm text-rose-300">"Network activity paused"</h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        If you set a proxy (for example Tor) and Studio can't unlock it on this device, it doesn't
+                        fall back to connecting directly, which would reveal your IP address to your friends' hosts.
+                        Sync, hub requests and saving images all stop, and a red notice says so. Re-enter the proxy in{' '}
+                        <strong>Publish &amp; SFTP → Proxy</strong>, or turn the proxy off there, to continue.
+                        Publishing to your own host isn't routed through the proxy and isn't affected.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* SECTION 6: SECURITY, PRIVACY & TROUBLESHOOTING FAQ */}
               {helpSection === 'privacy-faq' && (
                 <div className="space-y-6">
@@ -9179,6 +9351,16 @@ git push -u origin main --force`}
       </main>
 
       {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {consentRequest && (
+        <PlaintextConsentDialog
+          secretLabel={consentRequest.label}
+          onAnswer={(allow) => {
+            consentRequest.resolve(allow);
+            setConsentRequest(null);
+          }}
+        />
+      )}
+
       {(() => {
         const reviewing = keyChangeFriendId ? allFriends.find((f) => f.id === keyChangeFriendId) : undefined;
         return reviewing ? (
@@ -9204,7 +9386,7 @@ git push -u origin main --force`}
             siteUrl: bundle.profile.siteUrl,
           }}
           onSaveProfile={async (changes) => {
-            await window.studioApi?.updateProfile(changes);
+            await saveProfile(changes);
             await refreshStudioData();
           }}
           onEnableSchedule={async () => {

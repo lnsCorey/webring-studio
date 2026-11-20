@@ -56,12 +56,14 @@ import {
 } from '../../src/shared/schema';
 import { markdownToPlainText } from '../../src/shared/markdown';
 import {
+  isAvailable as isKeyCipherAvailable,
   isEncryptedKey,
   KeyCipher,
   openPrivateKey,
   openSecret,
   sealPrivateKey,
   sealSecret,
+  SecretStorageUnavailableError,
 } from '../security/keyVault';
 import {
   DEMO_PEER_SITE_URL,
@@ -613,6 +615,7 @@ export class StudioDatabase {
     this.ensureDefaultProfile(options);
     this.sealPrivateKeyAtRest();
     this.sealPublishSecretsAtRest();
+    this.sealProxyAtRest();
     this.migrateLegacyHub();
     this.removeLegacyDemoContent();
   }
@@ -737,6 +740,43 @@ export class StudioDatabase {
       | { publish_settings_json: string }
       | undefined;
     return JSON.parse(String(row?.publish_settings_json || '{}'));
+  }
+
+  /** True when the OS keychain can seal secrets for this persona now. */
+  public isKeyVaultAvailable(): boolean {
+    return isKeyCipherAvailable(this.keyCipher);
+  }
+
+  /**
+   * Refuses to store a new secret unencrypted unless the user agreed to (`allowPlaintext`): with no
+   * keychain, sealSecret would keep it as plain text in the database file.
+   */
+  private assertSecretCanBeStored(value: string | undefined, options: { allowPlaintext?: boolean }): void {
+    if (!value || isEncryptedKey(value) || options.allowPlaintext || this.isKeyVaultAvailable()) return;
+    throw new SecretStorageUnavailableError();
+  }
+
+  /**
+   * Seals a proxy URL stored as plain text (by an older build, or saved while the keychain was
+   * unavailable) once the keychain is available. Runs at every start; migration 4 runs it once too.
+   */
+  private sealProxyAtRest(): void {
+    if (!this.isKeyVaultAvailable()) return;
+    const row = this.db.prepare("SELECT value FROM local_settings WHERE key = 'proxySettingsJson'").get() as
+      | { value: string }
+      | undefined;
+    if (!row?.value) return;
+    let parsed: { enabled?: unknown; proxyUrl?: unknown };
+    try {
+      parsed = JSON.parse(row.value);
+    } catch {
+      return;
+    }
+    const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
+    if (!raw || isEncryptedKey(raw)) return;
+    this.db
+      .prepare("UPDATE local_settings SET value = ? WHERE key = 'proxySettingsJson'")
+      .run(JSON.stringify({ ...parsed, proxyUrl: sealSecret(raw, this.keyCipher) }));
   }
 
   /** Encrypts plaintext publishing credentials (from older builds or the MCP CLI) once a cipher is available. */
@@ -1242,6 +1282,13 @@ export class StudioDatabase {
         version: 3,
         name: 'friend_candidate_keys',
         up: () => this.moveCandidateKeysToFriends(),
+      },
+      {
+        // A plaintext proxy is sealed when the keychain is available; otherwise it stays as it is
+        // and the security banner says so (sealProxyAtRest also runs at every start)
+        version: 4,
+        name: 'reseal_proxy',
+        up: () => this.sealProxyAtRest(),
       },
     ];
   }
@@ -1806,7 +1853,14 @@ export class StudioDatabase {
     };
   }
 
-  public updateProfile(updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> }): ProfileDocument {
+  public updateProfile(
+    updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> },
+    options: { allowPlaintext?: boolean } = {}
+  ): ProfileDocument {
+    for (const field of SECRET_PUBLISH_FIELDS) {
+      const incoming = updates.publishSettings?.[field];
+      if (incoming !== STORED_SECRET_PLACEHOLDER) this.assertSecretCanBeStored(incoming, options);
+    }
     const current = this.getProfile();
     const siteUrl = updates.siteUrl ? normalizeSiteUrl(updates.siteUrl) : current.siteUrl;
     const now = new Date().toISOString();
@@ -3450,29 +3504,47 @@ export class StudioDatabase {
   // ---------------------------------------------------------------------------
   // Per-persona outbound proxy settings (local only, never exported)
 
-  public getProxySettings(): { enabled: boolean; proxyUrl: string } {
+  /**
+   * The persona's outbound proxy. `unavailable` means a proxy is saved but can't be unlocked on this
+   * device (sealed with a keychain that isn't available): callers must not connect at all
+   * (proxyAgent.requireUsableProxy), rather than silently going direct.
+   */
+  public getProxySettings(): { enabled: boolean; proxyUrl: string; unavailable?: boolean } {
     const row = this.db
       .prepare("SELECT value FROM local_settings WHERE key = 'proxySettingsJson'")
       .get() as { value: string } | undefined;
     if (!row?.value) return { enabled: false, proxyUrl: '' };
+    let parsed: { enabled?: unknown; proxyUrl?: unknown };
     try {
-      const parsed = JSON.parse(row.value) as { enabled?: unknown; proxyUrl?: unknown };
-      const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
-      const unsealed = raw ? openSecret(raw, this.keyCipher).trim() : '';
-      return {
-        enabled: Boolean(parsed.enabled && unsealed),
-        proxyUrl: unsealed,
-      };
+      parsed = JSON.parse(row.value);
     } catch {
       return { enabled: false, proxyUrl: '' };
     }
+    const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
+    if (!raw) return { enabled: false, proxyUrl: '' };
+    let unsealed: string;
+    try {
+      unsealed = openSecret(raw, this.keyCipher).trim();
+    } catch {
+      return { enabled: true, proxyUrl: '', unavailable: true };
+    }
+    return {
+      enabled: Boolean(parsed.enabled && unsealed),
+      proxyUrl: unsealed,
+    };
   }
 
-  public setProxySettings(input: { enabled?: boolean; proxyUrl?: string }): {
+  public setProxySettings(
+    input: { enabled?: boolean; proxyUrl?: string },
+    options: { allowPlaintext?: boolean } = {}
+  ): {
     enabled: boolean;
     proxyUrl: string;
   } {
     const current = this.getProxySettings();
+    if (current.unavailable && input.proxyUrl === undefined) {
+      throw new Error("The saved proxy can't be unlocked on this device. Re-enter it to continue.");
+    }
     const nextUrl = input.proxyUrl !== undefined ? input.proxyUrl.trim() : current.proxyUrl;
     if (nextUrl) {
       let parsed: URL;
@@ -3494,6 +3566,15 @@ export class StudioDatabase {
         throw new Error('Proxy URL must include a valid hostname and port (e.g. socks5h://127.0.0.1:9050).');
       }
     }
+    // A proxy login is a secret: without the keychain it's stored only with the user's consent
+    let hasCredentials = false;
+    try {
+      const parsedUrl = nextUrl ? new URL(nextUrl) : null;
+      hasCredentials = Boolean(parsedUrl && (parsedUrl.username || parsedUrl.password));
+    } catch {
+      hasCredentials = false;
+    }
+    if (hasCredentials) this.assertSecretCanBeStored(nextUrl, options);
     const nextEnabled =
       input.enabled !== undefined ? Boolean(input.enabled && nextUrl) : Boolean(current.enabled && nextUrl);
     const storedUrl = nextUrl ? sealSecret(nextUrl, this.keyCipher) : '';

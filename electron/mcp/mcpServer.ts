@@ -11,7 +11,8 @@ import {
   Scheduler,
   SchedulePreset,
 } from '../services/scheduler';
-import { parseProxyUrl } from '../security/proxyAgent';
+import { parseProxyUrl, redactProxyUrl } from '../security/proxyAgent';
+import { SecretStorageUnavailableError } from '../security/keyVault';
 import { GitHubDeviceLogin } from '../services/githubAuth';
 import { notifyWebringHubs, publishTo, PublishPaths } from '../services/jobs';
 import {
@@ -359,7 +360,8 @@ export class WebringMcpServer {
       method,
       toolName,
       personaId: personaId || this.personaManager.getActivePersonaId(),
-      summary,
+      // A URL's login (a proxy's user and password) never goes into the log
+      summary: summary.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, '$1***@'),
       success,
     };
     this.activityLog.unshift(entry);
@@ -2260,20 +2262,7 @@ export class WebringMcpServer {
             enabled: typeof args.enabled === 'boolean' ? args.enabled : undefined,
             proxyUrl: rawUrl,
           });
-          const redactProxy = (u: string): string => {
-            if (!u) return '';
-            try {
-              const p = new URL(u);
-              if (p.username || p.password) {
-                p.username = p.username ? '***' : '';
-                p.password = p.password ? '***' : '';
-              }
-              return p.toString();
-            } catch {
-              return u.replace(/\/\/[^@]+@/, '//***@');
-            }
-          };
-          const safeProxy = redactProxy(updated.proxyUrl);
+          const safeProxy = redactProxyUrl(updated.proxyUrl);
           resultData = { enabled: updated.enabled, proxyUrl: safeProxy };
           summary = `Updated proxy settings for ${ctx.persona.displayName} (${updated.enabled ? safeProxy : 'disabled'})`;
           break;
@@ -2669,7 +2658,13 @@ export class WebringMcpServer {
         data: resultData,
       };
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
+      // The MCP never stores a secret unencrypted: there's no one to ask for consent
+      const msg =
+        err instanceof SecretStorageUnavailableError
+          ? "Secrets can't be stored from the command-line MCP without OS encryption; use the Studio app."
+          : err instanceof Error
+            ? err.message
+            : String(err);
       this.recordActivity('tools/call', `Error in ${name}: ${msg}`, false, name);
       return {
         content: [

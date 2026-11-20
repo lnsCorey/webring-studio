@@ -10,7 +10,8 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:update-persona-label', personaId, label),
   deletePersona: (personaId: string, deleteFiles?: boolean) =>
     ipcRenderer.invoke('studio:delete-persona', personaId, deleteFiles),
-  updateProfile: (updates: unknown) => ipcRenderer.invoke('studio:update-profile', updates),
+  updateProfile: (updates: unknown, options?: { allowPlaintext?: boolean }) =>
+    ipcRenderer.invoke('studio:update-profile', updates, options),
   createAlbum: (input: unknown) => ipcRenderer.invoke('studio:create-album', input),
   deleteAlbum: (albumId: string) => ipcRenderer.invoke('studio:delete-album', albumId),
   addPhoto: (input: unknown) => ipcRenderer.invoke('studio:add-photo', input),
@@ -44,8 +45,15 @@ contextBridge.exposeInMainWorld('studioApi', {
   rotateKeys: () => ipcRenderer.invoke('studio:rotate-keys'),
   trustFriendKey: (friendId: string, expectedFingerprint: string) =>
     ipcRenderer.invoke('studio:trust-friend-key', friendId, expectedFingerprint),
-  setProxySettings: (input: { enabled?: boolean; proxyUrl?: string }) =>
-    ipcRenderer.invoke('studio:set-proxy-settings', input),
+  setProxySettings: (input: { enabled?: boolean; proxyUrl?: string }, options?: { allowPlaintext?: boolean }) =>
+    ipcRenderer.invoke('studio:set-proxy-settings', input, options),
+  // Keychain and proxy state for the security banner
+  getSecurityStatus: () => ipcRenderer.invoke('studio:get-security-status'),
+  onSecurityStatusChanged: (cb: (status: unknown) => void) => {
+    const listener = (_e: unknown, status: unknown) => cb(status);
+    ipcRenderer.on('studio:security-status-changed', listener);
+    return () => ipcRenderer.removeListener('studio:security-status-changed', listener);
+  },
   setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>
     ipcRenderer.invoke('studio:set-friend-visibility', friendId, visibility),
   deleteFriend: (friendId: string) => ipcRenderer.invoke('studio:delete-friend', friendId),
@@ -105,8 +113,10 @@ contextBridge.exposeInMainWorld('studioApi', {
   getSetupStatus: (options?: { checkGitHub?: boolean }) => ipcRenderer.invoke('studio:setup-status', options),
   githubLoginAvailable: () => ipcRenderer.invoke('studio:github-login-available'),
   githubLoginStart: () => ipcRenderer.invoke('studio:github-login-start'),
-  githubLoginPoll: (loginId: string) => ipcRenderer.invoke('studio:github-login-poll', loginId),
-  githubConnectToken: (token: string) => ipcRenderer.invoke('studio:github-connect-token', token),
+  githubLoginPoll: (loginId: string, options?: { allowPlaintext?: boolean }) =>
+    ipcRenderer.invoke('studio:github-login-poll', loginId, options),
+  githubConnectToken: (token: string, options?: { allowPlaintext?: boolean }) =>
+    ipcRenderer.invoke('studio:github-connect-token', token, options),
   setupConfigureSite: (options?: { repoName?: string; allowAddressChange?: boolean }) =>
     ipcRenderer.invoke('studio:setup-configure-site', options),
   setupPublish: () => ipcRenderer.invoke('studio:setup-publish'),

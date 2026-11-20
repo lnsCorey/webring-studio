@@ -23,7 +23,15 @@ export interface WindowProxyPlan {
 /** Studio's own dev server and the local preview server must never go through the proxy. */
 const LOOPBACK_BYPASS = '127.0.0.1,localhost,[::1]';
 
-export function planWindowProxy(settings: { enabled: boolean; proxyUrl: string }): WindowProxyPlan {
+export function planWindowProxy(settings: { enabled: boolean; proxyUrl: string; unavailable?: boolean }): WindowProxyPlan {
+  // A proxy that can't be unlocked must not turn into a direct connection: send the window's
+  // traffic to a closed local port instead, so remote content fails to load
+  if (settings.unavailable) {
+    return {
+      key: 'blocked',
+      config: { mode: 'fixed_servers', proxyRules: 'socks5://127.0.0.1:9', proxyBypassRules: LOOPBACK_BYPASS },
+    };
+  }
   if (!settings.enabled || !settings.proxyUrl.trim()) {
     return { key: 'system', config: { mode: 'system' } };
   }

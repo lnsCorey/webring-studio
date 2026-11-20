@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { requireUsableProxy } from '../security/proxyAgent';
 import * as path from 'path';
 import { ActivePersonaContext } from './personaManager';
 import { PublishResult } from './publisher';
@@ -20,6 +21,9 @@ export interface SyncAllResult {
 }
 
 export async function runSyncAll(ctx: ActivePersonaContext): Promise<SyncAllResult> {
+  // A proxy that can't be unlocked stops the whole run with one ProxyUnavailableError, before
+  // any friend, ring or hub is contacted
+  requireUsableProxy(ctx.db.getProxySettings());
   const friends = await ctx.ringCrawler.crawlAllFriends();
   const joined = await ctx.ringService.syncJoinedRings();
   const hosted = await ctx.ringService.syncHostedRings();

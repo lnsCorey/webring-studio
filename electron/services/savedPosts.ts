@@ -1,4 +1,5 @@
 import { SavedPost, StudioDatabase } from '../db/database';
+import { requireUsableProxy } from '../security/proxyAgent';
 import { cleanUpLibrary, MediaLibrary } from './mediaLibrary';
 import { fetchPublicImage } from './ringCrawler';
 
@@ -24,10 +25,10 @@ export async function savePost(
   if (!saved.localMediaUrl && /^https?:\/\//i.test(saved.mediaUrl)) {
     try {
       // The image comes from the friend's host, so it takes the persona's proxy like a sync does
-      const proxy = db.getProxySettings();
+
       const image = options.fetchImage
         ? await options.fetchImage(saved.mediaUrl)
-        : await fetchPublicImage(saved.mediaUrl, proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined);
+        : await fetchPublicImage(saved.mediaUrl, requireUsableProxy(db.getProxySettings()));
       db.setSavedLocalMedia(saved.id, await library.importSavedImage(image.body, image.contentType));
     } catch {
       // Keep the saved text and the link to the original image
