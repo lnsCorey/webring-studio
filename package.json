@@ -5,7 +5,7 @@
   "description": "Self-contained federated personal profile & webring studio with static JSON generation and ATProto did:web identity",
   "main": "dist-electron/electron/main.js",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=24 <25"
   },
   "scripts": {
     "dev:vite": "vite",

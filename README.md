@@ -34,7 +34,7 @@ There are no packaged releases yet; run Webring Studio from source.
 
 **Requirements**
 
-- **Node.js 22.13 or newer** (Node 24 recommended) and npm. `npm install` refuses older versions. Ubuntu and Debian's `apt` package is too old (Node 18), so install Node with [nvm](https://github.com/nvm-sh/nvm) instead:
+- **Node.js 24** and npm. `npm install` refuses other versions (older ones lack features Studio uses, and the test tools don't run on Node 26 yet). Ubuntu and Debian's `apt` package is too old (Node 18), so install Node with [nvm](https://github.com/nvm-sh/nvm) instead:
   ```bash
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
   # open a new terminal, then:
@@ -64,7 +64,7 @@ The first launch creates an empty primary persona. Start by setting your site's 
 
 **Troubleshooting**
 
-- **`EBADENGINE` / "Unsupported engine":** your Node is too old. Check with `node -v`, run `nvm install 24 && nvm use 24`, delete `node_modules`, and run `npm install` again.
+- **`EBADENGINE` / "Unsupported engine":** your Node isn't version 24. Check with `node -v`, run `nvm install 24 && nvm use 24`, delete `node_modules`, and run `npm install` again.
 - **"N vulnerabilities" after `npm install`:** npm's audit report about the project's dependencies; it doesn't mean the install failed. **Don't run `npm audit fix --force`**: it upgrades packages across major versions and will break the app.
 
 ## Getting started
@@ -268,7 +268,7 @@ While Studio is open, it serves MCP on `127.0.0.1` with a fixed port. This is th
 
 - Any other client: add a Streamable HTTP server at `http://127.0.0.1:<port>/mcp` and send the header `Authorization: Bearer <token>` with every request.
 
-Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the token in that header, whether or not an `Origin` header is sent. A token in the URL (`?token=`) isn't accepted: URLs end up in logs, shell history and process lists. Web pages are always refused. Treat the token like a password. It's kept in `mcp-http.json` in Studio's data folder, which is inside your user profile; on Windows that's what protects it (the file's `0600` mode has no effect there). To issue a new token, quit Studio, delete `mcp-http.json`, and reopen it.
+Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the token in that header, whether or not an `Origin` header is sent. A token in the URL (`?token=`) isn't accepted: URLs end up in logs, shell history and process lists. Web pages are always refused. Treat the token like a password. It's kept in `mcp-http.json` in Studio's data folder (see [Installation](#installation) for where that is), which is inside your user profile; on Windows that's what protects it (the file's `0600` mode has no effect there). To issue a new token, quit Studio, delete `mcp-http.json`, and reopen it.
 
 **MCP safety controls:**
 
@@ -299,12 +299,14 @@ Then configure your MCP client to run:
 
 ## Development
 
+Requires Node 24 (see .nvmrc). Run `nvm use` before `npm ci`.
+
 | Command | What it does |
 |---|---|
 | `npm run dev` | Build the UI and the Electron code, then launch the app |
 | `npm run build` | Build both without launching |
 | `npm run build:vite` / `npm run build:electron` | Build just the UI / just the Electron code |
-| `npm test` | Run the test suite (Vitest, `tests/federation.test.ts`) |
+| `npm test` | Run the test suite (Vitest, `tests/*.test.ts`) |
 | `npm run loadtest:sync` | Measure how syncing scales with 50–2000 friends ([tests/load/README.md](tests/load/README.md)) |
 | `npx tsc -p tsconfig.json --noEmit` | Type-check the UI |
 | `npx tsc -p tsconfig.electron.json --noEmit` | Type-check the Electron code |
@@ -312,7 +314,7 @@ Then configure your MCP client to run:
 | `node scripts/brand-dev-electron.mjs` | macOS: show "Webring Studio" and its icon in the Dock and app menu when running from source (runs automatically after `npm install` and before `npm run dev`) |
 | `python3 scripts/generate-icons.py` | Regenerate every app icon and branded image from `images/logo-icon.png` (macOS) |
 
-**No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 22.13+ (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
+**No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 24 (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
 
 **Testing against local sites.** Studio refuses `http://` and local-network addresses for friends, rings and hubs. To test with a site or hub on `127.0.0.1` (for example `php -S 127.0.0.1:8080 index.php` in `webring-hub-php`), start Studio with `WEBRING_ALLOW_PRIVATE_PEERS=1` set. Never set it for everyday use.
 
