@@ -12,7 +12,7 @@ import {
   planSync,
   STUDIO_OWNED_PREFIXES,
 } from './publishSync';
-import { PublishSettings, StudioDatabase } from '../db/database';
+import { PublishSettings, sftpAuthMethodOf, StudioDatabase } from '../db/database';
 import { StaticSiteGenerator } from './siteGenerator';
 import { githubPagesSiteUrl } from '../../src/shared/setup';
 
@@ -25,6 +25,46 @@ export interface PublishResult {
   unchanged?: number;
   removed?: number;
   message: string;
+  /** The SFTP server presented a different key than the pinned one (the app asks the user). */
+  hostKeyMismatch?: { host: string; port: number; expectedFingerprint: string; presentedFingerprint: string };
+}
+
+/**
+ * The SFTP server's key isn't the one pinned at an earlier publish. Nothing was uploaded and the
+ * new key isn't pinned: the user decides, after checking with their host.
+ */
+export class HostKeyMismatchError extends Error {
+  constructor(
+    public host: string,
+    public port: number,
+    public expectedFingerprint: string,
+    public presentedFingerprint: string
+  ) {
+    super(
+      `The server's identity has changed: ${host}:${port} presented a different key than the one pinned at an earlier publish. ` +
+        'Check with your hosting provider before trusting it.'
+    );
+    this.name = 'HostKeyMismatchError';
+  }
+}
+
+/** The Windows OpenSSH agent's pipe, used when SSH_AUTH_SOCK isn't set. */
+export const WINDOWS_OPENSSH_AGENT_PIPE = '\\\\.\\pipe\\openssh-ssh-agent';
+
+/**
+ * The SSH agent to sign in with: SSH_AUTH_SOCK, or on Windows the OpenSSH agent's pipe. Throws a
+ * readable error when neither is there.
+ */
+export function resolveSshAgent(
+  options: { platform?: string; env?: Record<string, string | undefined>; exists?: (p: string) => boolean } = {}
+): string {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const exists = options.exists ?? ((p: string) => fs.existsSync(p));
+  const sock = env.SSH_AUTH_SOCK?.trim();
+  if (sock && exists(sock)) return sock;
+  if (platform === 'win32' && exists(WINDOWS_OPENSSH_AGENT_PIPE)) return WINDOWS_OPENSSH_AGENT_PIPE;
+  throw new Error('No SSH agent found. Start the OpenSSH Authentication Agent service or choose another sign-in method.');
 }
 
 /** Git's blob id for file contents: sha1("blob <size>\0" + content). */
@@ -98,7 +138,7 @@ export function verifyOrPinSftpHostKey(
   host: string,
   port: number,
   presentedSha256Hex: string
-): { accepted: boolean; reason?: string } {
+): { accepted: boolean; reason?: string; mismatch?: HostKeyMismatchError } {
   const normalized = presentedSha256Hex.trim().toLowerCase();
   if (!normalized) {
     return { accepted: false, reason: 'Server did not present a host key.' };
@@ -111,9 +151,18 @@ export function verifyOrPinSftpHostKey(
   if (pinned === normalized) {
     return { accepted: true };
   }
+  // Never re-pinned automatically: recorded so the user can review it (studio:trust-sftp-host-key)
+  db.recordSftpHostKeyMismatch({
+    host,
+    port,
+    expectedFingerprint: pinned,
+    presentedFingerprint: normalized,
+    at: new Date().toISOString(),
+  });
   return {
     accepted: false,
     reason: `SFTP host key changed for ${host}:${port} (expected ${pinned.slice(0, 16)}…, got ${normalized.slice(0, 16)}…).`,
+    mismatch: new HostKeyMismatchError(host, port, pinned, normalized),
   };
 }
 
@@ -167,21 +216,34 @@ export class SitePublisher {
     if (mode === 'sftp') {
       const sftp = new SftpClient();
       let hostKeyError: string | undefined;
+      let mismatch: HostKeyMismatchError | undefined;
       try {
-        const privateKey = settings.sftpPrivateKeyPath
-          ? fs.readFileSync(settings.sftpPrivateKeyPath, 'utf8')
-          : undefined;
+        // Sign in the way the user chose; the key file is read only now, at connect time
+        const method = sftpAuthMethodOf(settings);
+        const auth: Record<string, unknown> =
+          method === 'agent'
+            ? { agent: resolveSshAgent() }
+            : method === 'privateKey'
+              ? {
+                  privateKey: fs.readFileSync(
+                    settings.sftpPrivateKeyPath || (() => { throw new Error('Choose a key file for SFTP in Publishing settings.'); })(),
+                    'utf8'
+                  ),
+                  ...(settings.sftpKeyPassphrase ? { passphrase: settings.sftpKeyPassphrase } : {}),
+                }
+              : { password: settings.password || '' };
         await sftp.connect({
           host: settings.host,
           port,
           username: settings.username,
-          ...(privateKey ? { privateKey } : {}),
-          ...(settings.sftpUseAgent && process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
-          ...(settings.password ? { password: settings.password } : {}),
+          ...auth,
           hostHash: 'sha256',
           hostVerifier: (hashedKey: string) => {
             const check = verifyOrPinSftpHostKey(db, settings.host, port, hashedKey);
-            if (!check.accepted) hostKeyError = check.reason;
+            if (!check.accepted) {
+              hostKeyError = check.reason;
+              mismatch = check.mismatch;
+            }
             return check.accepted;
           },
         });
@@ -215,6 +277,21 @@ export class SitePublisher {
         };
       } catch (err: unknown) {
         await sftp.end().catch(() => undefined);
+        if (mismatch) {
+          return {
+            success: false,
+            mode,
+            destination: settings.host,
+            filesPublished: 0,
+            message: mismatch.message,
+            hostKeyMismatch: {
+              host: mismatch.host,
+              port: mismatch.port,
+              expectedFingerprint: mismatch.expectedFingerprint,
+              presentedFingerprint: mismatch.presentedFingerprint,
+            },
+          };
+        }
         const detail = hostKeyError || (err instanceof Error ? err.message : String(err));
         return {
           success: false,

@@ -33,6 +33,7 @@ import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
 import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
 import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
 import { HeldAgentChangeView, HeldChangesPanel } from './HeldChangesPanel';
+import { authMethodOf, HostKeyMismatchDialog, SftpHostKeyApi, SftpSecurityControls } from './SftpSecurityControls';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -90,6 +91,12 @@ interface PublishSettingsState {
   port: number;
   username: string;
   password?: string;
+  sftpAuthMethod?: 'password' | 'privateKey' | 'agent';
+  sftpUseAgent?: boolean;
+  /** Shown by name only; set by the main-process key picker. */
+  sftpPrivateKeyPath?: string;
+  sftpKeyPassphrase?: string;
+  ftpAllowInsecure?: boolean;
   remotePath: string;
   atprotoPdsUrl?: string;
   publishFriendsList?: boolean;
@@ -630,6 +637,10 @@ declare global {
       autoPublishCancel?: (personaId: string) => Promise<ScheduleOverview>;
       onScheduleUpdated?: (cb: () => void) => () => void;
       chooseExportFolder: () => Promise<string | null>;
+      pickSftpKey?: SftpHostKeyApi['pickSftpKey'];
+      getSftpHostKey?: SftpHostKeyApi['getSftpHostKey'];
+      forgetSftpHostKey?: SftpHostKeyApi['forgetSftpHostKey'];
+      trustSftpHostKey?: (presentedFingerprint: string) => Promise<unknown>;
       exportLocal: (targetDir?: string, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
@@ -644,6 +655,7 @@ declare global {
         destination: string;
         filesPublished: number;
         message: string;
+        hostKeyMismatch?: { host: string; port: number; expectedFingerprint: string; presentedFingerprint: string };
       }>;
       publishGithub: (settings: unknown, options?: PublishHeldOptions) => Promise<{
         success: boolean;
@@ -1163,12 +1175,14 @@ export const App: React.FC = () => {
     if (!window.studioApi) throw new Error('Not available.');
     const publish = (updates as { publishSettings?: Record<string, unknown> } | null)?.publishSettings;
     const newSecret = publish
-      ? (['password', 'githubToken'] as const).find(
+      ? (['password', 'githubToken', 'sftpKeyPassphrase'] as const).find(
           (field) => typeof publish[field] === 'string' && publish[field] && publish[field] !== '••••••••'
         )
       : undefined;
     if (newSecret && !securityStatus.keyVaultAvailable) {
-      const allow = await askConsent(newSecret === 'githubToken' ? 'GitHub token' : 'password');
+      const allow = await askConsent(
+        newSecret === 'githubToken' ? 'GitHub token' : newSecret === 'sftpKeyPassphrase' ? 'key passphrase' : 'password'
+      );
       if (!allow) {
         notify("Not saved: you chose not to store it without encryption.");
         throw new Error('Not saved: storing it without encryption was declined.');
@@ -2487,8 +2501,17 @@ export const App: React.FC = () => {
     notify(`Deleted stored SFTP/FTP credentials from ${activeLabel}'s database.`);
   };
 
-  const handlePublishRemote = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // SFTP: the server presented a different key than the pinned one (the review dialog is open)
+  const [hostKeyMismatch, setHostKeyMismatch] = useState<{
+    host: string;
+    port: number;
+    expectedFingerprint: string;
+    presentedFingerprint: string;
+  } | null>(null);
+  const [sftpKeyRefresh, setSftpKeyRefresh] = useState(0);
+
+  const handlePublishRemote = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (!window.studioApi) return;
     await saveProfile({ publishSettings });
     const options = await confirmPublishWithHeldChanges();
@@ -2497,6 +2520,8 @@ export const App: React.FC = () => {
     const res = await window.studioApi.publishRemote(publishSettings, options);
     void refreshSecurityStatus();
     await refreshStudioData();
+    setSftpKeyRefresh((n) => n + 1);
+    if (res.hostKeyMismatch) setHostKeyMismatch(res.hostKeyMismatch);
     notify(res.message);
   };
 
@@ -6531,17 +6556,19 @@ export const App: React.FC = () => {
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     />
                   </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Password</label>
-                    <input
-                      type="password"
-                      value={publishSettings.password || ''}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, password: e.target.value }))
-                      }
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                  </div>
+                  {(publishSettings.protocol === 'ftp' || authMethodOf(publishSettings) === 'password') && (
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">Password</label>
+                      <input
+                        type="password"
+                        value={publishSettings.password || ''}
+                        onChange={(e) =>
+                          setPublishSettings((prev) => ({ ...prev, password: e.target.value }))
+                        }
+                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                      />
+                    </div>
+                  )}
                   <div>
                     <label className="block text-xs text-slate-400 mb-1">Remote Web Root Path</label>
                     <input
@@ -6556,6 +6583,15 @@ export const App: React.FC = () => {
                     />
                   </div>
                 </div>
+
+                <SftpSecurityControls
+                  settings={publishSettings}
+                  onChange={(changes) => setPublishSettings((prev) => ({ ...prev, ...changes }))}
+                  api={window.studioApi}
+                  askConfirm={askConfirm}
+                  notify={notify}
+                  refreshKey={sftpKeyRefresh}
+                />
 
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
                   <div className="flex flex-wrap items-center gap-2.5">
@@ -9542,6 +9578,24 @@ git push -u origin main --force`}
           onClose={() => {
             setApprovalModalOpen(false);
             setApprovalFocusId(null);
+          }}
+        />
+      )}
+
+      {hostKeyMismatch && (
+        <HostKeyMismatchDialog
+          mismatch={hostKeyMismatch}
+          onCancel={() => setHostKeyMismatch(null)}
+          onTrust={async () => {
+            try {
+              await window.studioApi?.trustSftpHostKey?.(hostKeyMismatch.presentedFingerprint);
+            } catch (err) {
+              notify(errorMessage(err));
+              return;
+            }
+            setHostKeyMismatch(null);
+            notify('Trusted the server\'s new key. Publishing…');
+            await handlePublishRemote();
           }}
         />
       )}

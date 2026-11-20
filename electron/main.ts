@@ -843,6 +843,8 @@ function registerIpcHandlers() {
     if (updates?.publishSettings && typeof updates.publishSettings === 'object') {
       updates = { ...updates, publishSettings: { ...updates.publishSettings } };
       delete updates.publishSettings.exportPath;
+      // The SFTP key file is chosen only through studio:pick-sftp-key
+      delete updates.publishSettings.sftpPrivateKeyPath;
     }
     const profile = ctx.db.updateProfile(updates, { allowPlaintext: options?.allowPlaintext === true });
     // A replaced profile photo or banner that was uploaded to the library is deleted here
@@ -1295,6 +1297,40 @@ function registerIpcHandlers() {
   // The only way to change the export folder: the user picks it here, and it's checked and saved
   // in main (the window can't set the path, and MCP never can)
   ipcMain.handle('studio:choose-export-folder', () => pickExportFolder());
+
+  // SFTP key file: picked here, never sent by the window. Returns only the file name to show.
+  ipcMain.handle('studio:pick-sftp-key', async () => {
+    if (!mainWindow) return null;
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose your SSH private key file',
+      properties: ['openFile', 'showHiddenFiles'],
+    });
+    if (res.canceled || res.filePaths.length === 0) return null;
+    const ctx = personaManager.getActiveContext();
+    ctx.db.updateProfile({
+      publishSettings: { ...ctx.db.getProfile().publishSettings, sftpPrivateKeyPath: res.filePaths[0], sftpAuthMethod: 'privateKey' },
+    });
+    return { fileName: path.basename(res.filePaths[0]) };
+  });
+
+  // The SFTP server key pinned for the current host, forgetting it, and trusting a changed one
+  const sftpTarget = () => {
+    const settings = personaManager.getActiveContext().db.getProfile().publishSettings;
+    return { host: settings.host || '', port: settings.port || 22 };
+  };
+  ipcMain.handle('studio:get-sftp-host-key', () => {
+    const { host, port } = sftpTarget();
+    const db = personaManager.getActiveContext().db;
+    return { pinned: host ? db.getSftpHostKey(host, port) : null, mismatch: db.getSftpHostKeyMismatch() };
+  });
+  ipcMain.handle('studio:forget-sftp-host-key', () => {
+    const { host, port } = sftpTarget();
+    if (host) personaManager.getActiveContext().db.forgetSftpHostKey(host, port);
+    return { ok: true };
+  });
+  ipcMain.handle('studio:trust-sftp-host-key', (_e, presentedFingerprint: string) =>
+    personaManager.getActiveContext().db.trustSftpHostKey(String(presentedFingerprint || ''))
+  );
 
   // Exports to the saved folder; with none saved, the user picks one first. The window never
   // supplies a path (any first argument is ignored).
