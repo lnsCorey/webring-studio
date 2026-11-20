@@ -95,7 +95,7 @@ export class StaticSiteGenerator {
       .digest('hex');
   }
 
-  public generateToDirectory(outputDir: string, compiledProfileHtml?: string): GeneratedSiteResult {
+  public generateToDirectory(outputDir: string): GeneratedSiteResult {
     const bundle = this.db.buildSignedSiteBundle({ publish: true });
     const filesWritten: string[] = [];
 
@@ -107,7 +107,7 @@ export class StaticSiteGenerator {
     // narrows the gap between checking the folder and writing to it
     const lockPath = claimExportFolder(outputDir, this.db.getProfile().publishSettings.exportPath);
     try {
-      return this.writeSite(outputDir, bundle, filesWritten, wellKnownDir, apiDir, mediaOutDir, compiledProfileHtml);
+      return this.writeSite(outputDir, bundle, filesWritten, wellKnownDir, apiDir, mediaOutDir);
     } finally {
       if (lockPath) fs.rmSync(lockPath, { force: true });
     }
@@ -119,8 +119,7 @@ export class StaticSiteGenerator {
     filesWritten: string[],
     wellKnownDir: string,
     apiDir: string,
-    mediaOutDir: string,
-    compiledProfileHtml?: string
+    mediaOutDir: string
   ): GeneratedSiteResult {
     fs.mkdirSync(wellKnownDir, { recursive: true });
     fs.mkdirSync(apiDir, { recursive: true });
@@ -184,9 +183,7 @@ export class StaticSiteGenerator {
     }
 
     // 4. Write standalone index.html for the hosted Profile Website
-    const indexHtml = compiledProfileHtml
-      ? this.injectHydrationData(compiledProfileHtml, bundle)
-      : this.buildStandaloneProfileHtml(bundle);
+    const indexHtml = this.buildStandaloneProfileHtml(bundle);
 
     fs.writeFileSync(path.join(outputDir, 'index.html'), indexHtml, 'utf8');
     filesWritten.push('index.html');
@@ -261,14 +258,6 @@ export class StaticSiteGenerator {
     if (!this.mediaStoreDir) return [];
     const library = new MediaLibrary(this.mediaStoreDir);
     return [...this.db.getLocalMediaReferences().urls].sort().map((url) => ({ url, file: library.resolveLocalUrl(url) }));
-  }
-
-  private injectHydrationData(htmlTemplate: string, bundle: CompleteSiteBundle): string {
-    const scriptTag = `<script>window.__WEBRING_BUNDLE__ = ${JSON.stringify(bundle)};</script>`;
-    if (htmlTemplate.includes('</head>')) {
-      return htmlTemplate.replace('</head>', `${scriptTag}\n</head>`);
-    }
-    return `${scriptTag}\n${htmlTemplate}`;
   }
 
   /**
@@ -385,20 +374,14 @@ export class StaticSiteGenerator {
       path.join(__dirname, '../../../electron/assets/site.css'),
       path.join(__dirname, '../../electron/assets/site.css'),
     ];
-    let compiledSiteCss = '';
-    for (const candidate of cssCandidates) {
-      if (fs.existsSync(candidate)) {
-        compiledSiteCss = fs.readFileSync(candidate, 'utf8');
-        break;
-      }
-    }
+    const compiledSiteCss = loadSiteCss(cssCandidates);
 
-    return `<!DOCTYPE html>
+    return withInlineScriptHashes(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'${commentHost}${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''};${frameSrcClause} connect-src 'self' https: http:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' ${INLINE_SCRIPT_HASHES}${commentHost}${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''};${frameSrcClause} connect-src 'self' https: http:;" />
   <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />${analyticsHeadSnippet}${adsHeadSnippet}
@@ -935,7 +918,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
                 <a href="\${buildDeepLink('like', item.canonicalUrl, item.title, item.mediaUrl, item.category)}" class="px-2.5 py-1 rounded bg-pink-500/20 text-pink-300 hover:bg-pink-500/30 font-medium">♥ Like</a>
                 <a href="\${buildDeepLink('comment', item.canonicalUrl, item.title, item.mediaUrl, 'comment')}" class="px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 font-medium">💬 Comment</a>
                 <a href="\${buildDeepLink('share', item.targetUrl, item.title, item.mediaUrl, item.category)}" class="accent-soft px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 font-medium">↻ Re-Share</a>
-                \${hasLiveProvider ? \`<button data-container="\${liveContainerId}" data-canonical="\${esc(item.canonicalUrl)}" onclick="window.toggleLiveCommentThread(this.getAttribute('data-container'), this.getAttribute('data-canonical'))" class="px-2.5 py-1 rounded bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 font-medium">💬 Live Thread</button>\` : ''}
+                \${hasLiveProvider ? \`<button data-container="\${liveContainerId}" data-canonical="\${esc(item.canonicalUrl)}" data-action="live-thread" class="px-2.5 py-1 rounded bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 font-medium">💬 Live Thread</button>\` : ''}
               </div>
             </div>
           </div>
@@ -1008,6 +991,17 @@ ${AVATAR_PAGE_SCRIPT}
       window.openGuestbook = function() {
         window.toggleLiveCommentThread('guestbook-thread', profile.siteUrl + '#guestbook');
       };
+      // The page has no inline event handlers (its CSP forbids them): buttons say what they do in data-action
+      document.addEventListener('click', function(ev) {
+        const button = ev.target && ev.target.closest ? ev.target.closest('[data-action]') : null;
+        if (!button) return;
+        const action = button.getAttribute('data-action');
+        if (action === 'live-thread') {
+          window.toggleLiveCommentThread(button.getAttribute('data-container'), button.getAttribute('data-canonical'));
+        } else if (action === 'guestbook') {
+          window.openGuestbook();
+        }
+      });
 
       const blockRenderers = {
         albums: (b) => {
@@ -1074,7 +1068,7 @@ ${AVATAR_PAGE_SCRIPT}
           return section(b, '🔗 Webrings (' + rings.length + ')', '<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">' + cards + '</div>');
         },
         guestbook: (b) => hasGuestbook
-          ? section(b, '📖 Guestbook', '<div class="card-surface rounded-xl p-4"><button onclick="window.openGuestbook()" class="accent-solid px-4 py-2 rounded-xl bg-indigo-600 text-white text-sm font-semibold">Open Guestbook</button><div id="guestbook-thread" class="hidden mt-3"></div></div>')
+          ? section(b, '📖 Guestbook', '<div class="card-surface rounded-xl p-4"><button data-action="guestbook" class="accent-solid px-4 py-2 rounded-xl bg-indigo-600 text-white text-sm font-semibold">Open Guestbook</button><div id="guestbook-thread" class="hidden mt-3"></div></div>')
           : '',
       };
 
@@ -1253,7 +1247,7 @@ ${AVATAR_PAGE_SCRIPT}
     })();
   </script>${preview ? PREVIEW_BRIDGE : ''}
 </body>
-</html>`;
+</html>`);
   }
 
   /** Look & feel as <body> attributes, so the published page is styled before its script runs. */
@@ -1282,6 +1276,40 @@ ${AVATAR_PAGE_SCRIPT}
   }
 }
 
+
+export const SITE_CSS_MISSING_MESSAGE = 'Site stylesheet missing — run npm run build:site-css';
+
+/** The compiled site stylesheet: the first candidate that exists. A page without it would publish unstyled. */
+export function loadSiteCss(candidates: string[]): string {
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf8');
+  }
+  throw new Error(SITE_CSS_MISSING_MESSAGE);
+}
+
+/** Stands in for the inline scripts' hashes in a page's CSP until the page is complete. */
+const INLINE_SCRIPT_HASHES = '__WEBRING_INLINE_SCRIPT_HASHES__';
+
+/** CSP sources for each inline <script> in the page (those without src), as the browser hashes them. */
+export function inlineScriptHashes(html: string): string[] {
+  const hashes = new Set<string>();
+  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+    if (/\bsrc\s*=/i.test(match[1])) continue;
+    hashes.add(`'sha256-${crypto.createHash('sha256').update(match[2], 'utf8').digest('base64')}'`);
+  }
+  return [...hashes];
+}
+
+/**
+ * Fills the page's CSP with the hash of every inline script, so the page runs its own scripts
+ * and nothing injected (no 'unsafe-inline'). Line endings are normalised first, as an HTML
+ * parser does before a browser hashes a script.
+ */
+function withInlineScriptHashes(page: string): string {
+  const html = page.replace(/\r\n?/g, '\n');
+  if (html.split(INLINE_SCRIPT_HASHES).length !== 2) throw new Error('Page CSP is missing its script-hash placeholder.');
+  return html.replace(INLINE_SCRIPT_HASHES, inlineScriptHashes(html).join(' '));
+}
 
 /** JSON that's safe inside a <script> element. */
 function embedJson(value: unknown): string {

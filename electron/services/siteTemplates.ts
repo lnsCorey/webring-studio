@@ -284,7 +284,7 @@ export function renderTemplatePage(ctx: any): string {
   };
   const itemActions = (item: any, labels: boolean) => {
     const live = ctx.hasLiveProvider
-      ? '<button data-container="live-comments-' + esc(item.id) + '" data-canonical="' + esc(item.canonicalUrl) + '" onclick="window.toggleLiveCommentThread(this.getAttribute(\'data-container\'), this.getAttribute(\'data-canonical\'))">💬 ' + (labels ? 'Live thread' : '') + '</button>'
+      ? '<button data-container="live-comments-' + esc(item.id) + '" data-canonical="' + esc(item.canonicalUrl) + '" data-action="live-thread">💬 ' + (labels ? 'Live thread' : '') + '</button>'
       : '';
     return '<div class="tpl-actions">' +
       '<a href="' + link('like', item.canonicalUrl, item.title, item.mediaUrl, item.category) + '">♥ ' + (labels ? 'Like' : '') + '</a>' +

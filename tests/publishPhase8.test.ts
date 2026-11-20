@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { sftpAuthMethodOf, StudioDatabase } from '../electron/db/database';
 import { PersonaManager } from '../electron/services/personaManager';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
-import { StaticSiteGenerator } from '../electron/services/siteGenerator';
+import { inlineScriptHashes, loadSiteCss, StaticSiteGenerator } from '../electron/services/siteGenerator';
 import {
   ftpAccessOptions,
   FtpTlsError,
@@ -298,5 +299,84 @@ describe('Security Phase 8: GitHub token guidance', () => {
     expect(app).toContain('Avoid classic tokens; they grant access to all your repositories.');
     expect(app.match(/Create token on GitHub/g)?.length).toBe(2);
     expect(app).not.toMatch(/Tokens \(classic\)|public_repo/);
+  });
+});
+
+describe('Security Phase 8: the published page runs only its own scripts', () => {
+  let dir: string;
+  let db: StudioDatabase;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p8-csp-'));
+    db = new StudioDatabase(dir, 'csp.sqlite');
+    db.updateProfile({
+      siteUrl: 'https://me.ring.test',
+      handle: 'me.ring.test',
+      displayName: 'Me',
+      publishSettings: { analyticsEnabled: true, analyticsMeasurementId: 'G-ABC123XYZ' },
+    });
+  });
+
+  afterEach(() => {
+    db.close();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows may still hold the database file
+    }
+  });
+
+  const scriptSrcOf = (html: string) => {
+    const csp = /http-equiv="Content-Security-Policy" content="([^"]*)"/.exec(html)![1];
+    return csp.split(';').map((d) => d.trim()).find((d) => d.startsWith('script-src'))!;
+  };
+
+  const pages = () => {
+    const generator = new StaticSiteGenerator(db);
+    const out = path.join(dir, 'site');
+    generator.generateToDirectory(out);
+    return {
+      published: fs.readFileSync(path.join(out, 'index.html'), 'utf8'),
+      preview: generator.buildStandaloneProfileHtml(db.buildSignedSiteBundle({ publish: true }), { preview: true }),
+    };
+  };
+
+  it("has no 'unsafe-inline' scripts, and every inline script's hash is in the CSP", () => {
+    for (const html of Object.values(pages())) {
+      const scriptSrc = scriptSrcOf(html);
+      expect(scriptSrc).not.toContain('unsafe-inline');
+      expect(scriptSrc).not.toContain('__WEBRING_INLINE_SCRIPT_HASHES__');
+      const inline = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].filter((m) => !/\bsrc\s*=/i.test(m[1]));
+      expect(inline.length).toBeGreaterThanOrEqual(3); // bundle, page, analytics (and the preview bridge)
+      expect(html).toContain("gtag('config', 'G-ABC123XYZ'");
+      for (const m of inline) {
+        const hash = `'sha256-${crypto.createHash('sha256').update(m[2], 'utf8').digest('base64')}'`;
+        expect(scriptSrc).toContain(hash);
+      }
+      expect(inlineScriptHashes(html).length).toBe(new Set(inline.map((m) => m[2])).size);
+      expect(html).not.toContain('\r');
+    }
+  });
+
+  it('has no inline event handler attributes, in the page or in what its scripts render', () => {
+    const { published } = pages();
+    expect(published).not.toMatch(/\son[a-z]+\s*=\s*["']/i);
+    for (const file of ['electron/services/siteGenerator.ts', 'electron/services/siteTemplates.ts', 'electron/services/pageEnhancements.ts']) {
+      expect(read(file)).not.toMatch(/\son[a-z]+=\\?["']/);
+    }
+    expect(published).toContain("closest('[data-action]')");
+  });
+
+  it('refuses to build an unstyled page when the stylesheet is missing', () => {
+    expect(() => loadSiteCss([path.join(dir, 'nope.css')])).toThrow('Site stylesheet missing — run npm run build:site-css');
+    const css = path.join(dir, 'site.css');
+    fs.writeFileSync(css, 'body{}');
+    expect(loadSiteCss([path.join(dir, 'nope.css'), css])).toBe('body{}');
+  });
+
+  it('no longer has an unescaped hydration path', () => {
+    const source = read('electron/services/siteGenerator.ts');
+    expect(source).not.toContain('injectHydrationData');
+    expect(source).not.toMatch(/__WEBRING_BUNDLE__ = \$\{JSON\.stringify/);
   });
 });
