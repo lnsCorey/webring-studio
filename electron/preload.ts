@@ -128,6 +128,13 @@ contextBridge.exposeInMainWorld('studioApi', {
   setMcpPrivateData: (enabled: boolean) => ipcRenderer.invoke('studio:set-mcp-private-data', enabled),
   resolveMcpApproval: (id: string, approved: boolean) =>
     ipcRenderer.invoke('studio:resolve-mcp-approval', id, approved),
+  denyAllMcpApprovals: () => ipcRenderer.invoke('studio:deny-all-mcp-approvals'),
+  // An agent's request was queued for approval (shows the approval modal)
+  onMcpApprovalRequested: (cb: (approval: unknown) => void) => {
+    const listener = (_e: unknown, approval: unknown) => cb(approval);
+    ipcRenderer.on('studio:mcp-approval-requested', listener);
+    return () => ipcRenderer.removeListener('studio:mcp-approval-requested', listener);
+  },
   callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
     ipcRenderer.invoke('studio:call-mcp-tool', toolName, args),
   onMcpActivity: (callback: (entry: unknown) => void) => {

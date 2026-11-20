@@ -4,7 +4,8 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { PersonaManager } from '../electron/services/personaManager';
-import { getMcpToolTier, WebringMcpServer } from '../electron/mcp/mcpServer';
+import { getMcpToolTier, MAX_PENDING_APPROVALS, McpPendingApproval, WebringMcpServer } from '../electron/mcp/mcpServer';
+import { describeToolCall } from '../electron/mcp/describeToolCall';
 import { runWithoutNetwork } from '../electron/security/networkPolicy';
 import { requestPublicJson } from '../electron/services/ringCrawler';
 import { EXPECTED_TOOL_TIERS } from './mcpToolTiers.expected';
@@ -270,5 +271,124 @@ describe('Security Phase 7: private data stays hidden from agents unless allowed
     // No tool can change either setting
     const names = restarted.getTools().map((t) => t.name).join(' ');
     expect(names).not.toMatch(/read_only|readonly|private_data|mcp_settings/i);
+  });
+});
+
+describe('Security Phase 7: the approval queue', () => {
+  let dir: string;
+  let manager: PersonaManager;
+  let mcp: WebringMcpServer;
+  let other: string;
+  let requested: McpPendingApproval[];
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p7-approve-'));
+    manager = new PersonaManager(dir);
+    other = manager.createPersona({ label: 'Side project', displayName: 'Persona B' }).created.id;
+    manager.switchPersona('default');
+    mcp = new WebringMcpServer(manager, dir);
+    mcp.setReadOnlyMode(false);
+    requested = [];
+    mcp.attachAppServices({
+      publishPaths: () => ({ userDataDir: dir, tempDir: dir }),
+      deviceLogin: {} as never,
+      onApprovalRequested: (approval) => requested.push(approval),
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    manager.closeAll();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows may still hold a database file
+    }
+  });
+
+  const agent = (name: string, args: Record<string, unknown> = {}) =>
+    mcp.executeToolCall(name, args, { enforcePolicy: true });
+
+  it('binds a request to the persona it targeted, and runs it there when approved later', async () => {
+    const queued = await agent('webring_create_hosted_ring', { personaId: other, name: 'Bound ring' });
+    expect((queued.data as { pendingApproval: boolean }).pendingApproval).toBe(true);
+    const [item] = mcp.listPendingApprovals();
+    expect(item).toMatchObject({
+      personaId: other,
+      personaName: 'Side project',
+      summary: expect.stringContaining('Bound ring'),
+      status: 'pending',
+    });
+    expect(Date.parse(item.expiresAt) - Date.parse(item.requestedAt)).toBe(30 * 60 * 1000);
+    expect(requested.map((r) => r.id)).toEqual([item.id]);
+
+    expect(manager.getActivePersonaId()).toBe('default');
+    const res = await mcp.resolveApproval(item.id, true);
+    expect(res.ok).toBe(true);
+    const ringsIn = (id: string) => manager.withPersonaContext(id, async (ctx) => ctx.db.getHostedRings().map((r) => r.name));
+    expect(await ringsIn(other)).toEqual(['Bound ring']);
+    expect(await ringsIn('default')).toEqual([]);
+    expect(mcp.listApprovalHistory()[0]).toMatchObject({ id: item.id, status: 'approved' });
+  });
+
+  it("an approved export still writes only to the saved folder, never the agent's", async () => {
+    const saved = path.join(dir, 'saved-export');
+    const db = manager.getActiveContext().db;
+    db.updateProfile({ publishSettings: { ...db.getProfile().publishSettings, exportPath: saved } });
+    const elsewhere = path.join(dir, 'agent-folder');
+    await agent('webring_export_static_site', { targetDir: elsewhere });
+    const [item] = mcp.listPendingApprovals();
+    const res = await mcp.resolveApproval(item.id, true);
+    const data = (res.result as { data: { success: boolean; ignoredTargetDir?: string } }).data;
+    expect(data.success).toBe(true);
+    expect(data.ignoredTargetDir).toBe(elsewhere);
+    expect(fs.existsSync(path.join(saved, 'index.html'))).toBe(true);
+    expect(fs.existsSync(elsewhere)).toBe(false);
+  });
+
+  it('an expired request can no longer be approved', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-20T10:00:00.000Z'));
+    await agent('webring_rotate_keys');
+    const [item] = mcp.listPendingApprovals();
+    vi.setSystemTime(new Date('2026-11-20T10:31:00.000Z'));
+    expect(mcp.listPendingApprovals()).toEqual([]);
+    const res = await mcp.resolveApproval(item.id, true);
+    expect(res).toMatchObject({ ok: false, error: expect.stringMatching(/expired/) });
+    expect(mcp.listApprovalHistory()[0]).toMatchObject({ id: item.id, status: 'expired' });
+  });
+
+  it('refuses a request beyond the limit with a readable error, keeping the first ones', async () => {
+    for (let i = 0; i < MAX_PENDING_APPROVALS; i++) {
+      const res = await agent('webring_create_hosted_ring', { name: `Ring ${i}` });
+      expect(res.isError, `request ${i}`).toBeUndefined();
+    }
+    const over = await agent('webring_create_hosted_ring', { name: 'One too many' });
+    expect(over.isError).toBe(true);
+    expect(over.content[0].text).toMatch(/Too many requests are waiting for approval in Studio; ask the user to review them/);
+    const pending = mcp.listPendingApprovals();
+    expect(pending).toHaveLength(MAX_PENDING_APPROVALS);
+    expect(pending[0].summary).toContain('Ring 0');
+
+    expect(mcp.denyAllApprovals()).toBe(MAX_PENDING_APPROVALS);
+    expect(mcp.listPendingApprovals()).toEqual([]);
+  });
+
+  it('describes every outward tool in plain words (no fallback)', () => {
+    const outward = Object.entries(EXPECTED_TOOL_TIERS)
+      .filter(([, tier]) => tier === 'outward')
+      .map(([name]) => name);
+    // Tools that are outward only with some arguments
+    outward.push('webring_set_schedule', 'webring_set_profile_image', 'webring_hubs');
+    for (const name of outward) {
+      expect(describeToolCall(name, {}), name).not.toBe(`Run ${name}`);
+    }
+    expect(describeToolCall('webring_set_schedule', { publishEnabled: true, publishPreset: { kind: 'interval', minutes: 15 } })).toBe(
+      'Turn on scheduled publishing every 15 minutes.'
+    );
+    expect(describeToolCall('webring_update_profile', { siteUrl: 'https://new.example' })).toMatch(
+      /^Change your profile site URL to https:\/\/new\.example/
+    );
+    expect(describeToolCall('webring_set_proxy', { proxyUrl: 'socks5h://me:secret@127.0.0.1:9050' })).not.toContain('secret');
   });
 });

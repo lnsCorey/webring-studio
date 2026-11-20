@@ -31,6 +31,7 @@ import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesP
 import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
 import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
 import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
+import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -679,21 +680,17 @@ declare global {
         }>;
         readOnlyMode?: boolean;
         allowPrivateData?: boolean;
-        pendingApprovals?: Array<{
-          id: string;
-          toolName: string;
-          tier: string;
-          args: Record<string, unknown>;
-          requestedAt: string;
-          status: string;
-        }>;
+        pendingApprovals?: McpApprovalView[];
+        approvalHistory?: McpApprovalView[];
       }>;
       setMcpReadOnly?: (enabled: boolean) => Promise<{ readOnlyMode: boolean }>;
       setMcpPrivateData?: (enabled: boolean) => Promise<{ allowPrivateData: boolean }>;
       resolveMcpApproval?: (
         id: string,
         approved: boolean
-      ) => Promise<{ ok: boolean; approval?: unknown; result?: unknown }>;
+      ) => Promise<{ ok: boolean; approval?: unknown; result?: unknown; error?: string }>;
+      denyAllMcpApprovals?: () => Promise<{ denied: number }>;
+      onMcpApprovalRequested?: (cb: (approval: McpApprovalView) => void) => () => void;
       callMcpTool?: (
         toolName: string,
         args?: Record<string, unknown>
@@ -965,14 +962,8 @@ export const App: React.FC = () => {
     }>;
     readOnlyMode?: boolean;
     allowPrivateData?: boolean;
-    pendingApprovals?: Array<{
-      id: string;
-      toolName: string;
-      tier: string;
-      args: Record<string, unknown>;
-      requestedAt: string;
-      status: string;
-    }>;
+    pendingApprovals?: McpApprovalView[];
+    approvalHistory?: McpApprovalView[];
   } | null>(null);
   const [selectedMcpTool, setSelectedMcpTool] = useState<string>('webring_list_personas');
   const [mcpToolArgsJson, setMcpToolArgsJson] = useState<string>('{}');
@@ -1029,6 +1020,39 @@ export const App: React.FC = () => {
     tone?: 'warning' | 'danger';
     resolve: (confirmed: boolean) => void;
   } | null>(null);
+  // Agent requests waiting for approval: the modal opens when one arrives
+  const [approvalModalOpen, setApprovalModalOpen] = useState(false);
+  const [approvalFocusId, setApprovalFocusId] = useState<string | null>(null);
+  const reloadMcpInfo = async () => {
+    const info = await window.studioApi?.getMcpInfo?.().catch(() => undefined);
+    if (info) setMcpInfo(info);
+    return info;
+  };
+  useEffect(() => {
+    void reloadMcpInfo();
+    return window.studioApi?.onMcpApprovalRequested?.(() => {
+      void reloadMcpInfo().then(() => setApprovalModalOpen(true));
+    });
+  }, []);
+  const resolveApproval = async (item: McpApprovalView, approved: boolean) => {
+    const res = await window.studioApi?.resolveMcpApproval?.(item.id, approved);
+    const info = await reloadMcpInfo();
+    if (!info?.pendingApprovals?.length) setApprovalModalOpen(false);
+    setApprovalFocusId(null);
+    if (!res?.ok) {
+      notify(res?.error || 'That request is no longer waiting.');
+      return;
+    }
+    if (approved) await refreshStudioData();
+    notify(`${approved ? 'Approved' : 'Denied'}: ${item.summary}`);
+  };
+  const denyAllApprovals = async () => {
+    const res = await window.studioApi?.denyAllMcpApprovals?.();
+    await reloadMcpInfo();
+    setApprovalModalOpen(false);
+    notify(`Denied ${res?.denied ?? 0} agent request(s).`);
+  };
+
   const askConfirm = (request: {
     title: string;
     message: React.ReactNode;
@@ -2590,6 +2614,7 @@ export const App: React.FC = () => {
       label: 'AI Agent (MCP)',
       icon: <Sparkles className="w-4 h-4" />,
       badge: mcpInfo?.status.toolCount || 24,
+      alert: mcpInfo?.pendingApprovals?.length ? `${mcpInfo.pendingApprovals.length} waiting for approval` : undefined,
     },
     { id: 'help', label: 'Help & Deploy Guide', icon: <BookOpen className="w-4 h-4" /> },
   ];
@@ -7141,60 +7166,15 @@ export const App: React.FC = () => {
                   </label>
                 </div>
 
-                {(mcpInfo?.pendingApprovals?.length || 0) > 0 && (
-                  <div className="border-t border-slate-800 pt-3 space-y-2">
-                    <div className="text-xs font-bold text-amber-300">
-                      Pending Confirmations ({mcpInfo?.pendingApprovals?.length})
-                    </div>
-                    <div className="space-y-2">
-                      {mcpInfo?.pendingApprovals?.map((item) => (
-                        <div
-                          key={item.id}
-                          className="p-3 rounded-xl bg-slate-950 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3"
-                        >
-                          <div className="min-w-0 flex-1">
-                            <div className="text-xs font-mono font-bold text-white">
-                              {item.toolName}{' '}
-                              <span className="text-[10px] font-normal text-amber-300">
-                                ({item.tier})
-                              </span>
-                            </div>
-                            <pre className="text-[11px] text-slate-400 mt-1 overflow-x-auto max-h-24">
-                              {JSON.stringify(item.args, null, 2)}
-                            </pre>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                await window.studioApi?.resolveMcpApproval?.(item.id, true);
-                                const info = await window.studioApi?.getMcpInfo?.();
-                                if (info) setMcpInfo(info);
-                                await refreshStudioData();
-                                notify(`Approved and ran ${item.toolName}.`);
-                              }}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
-                            >
-                              Approve &amp; Run
-                            </button>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                await window.studioApi?.resolveMcpApproval?.(item.id, false);
-                                const info = await window.studioApi?.getMcpInfo?.();
-                                if (info) setMcpInfo(info);
-                                notify(`Denied ${item.toolName}.`);
-                              }}
-                              className="px-3 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-200 text-xs font-semibold"
-                            >
-                              Deny
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                <McpApprovalPanel
+                  pending={mcpInfo?.pendingApprovals || []}
+                  history={mcpInfo?.approvalHistory || []}
+                  onReview={(item) => {
+                    setApprovalFocusId(item.id);
+                    setApprovalModalOpen(true);
+                  }}
+                  onResolve={resolveApproval}
+                />
               </div>
 
               {/* Dual Transport Configuration Cards */}
@@ -9412,6 +9392,19 @@ git push -u origin main --force`}
       </main>
 
       {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {approvalModalOpen && (mcpInfo?.pendingApprovals?.length || 0) > 0 && (
+        <McpApprovalModal
+          pending={mcpInfo?.pendingApprovals || []}
+          focusId={approvalFocusId}
+          onResolve={resolveApproval}
+          onDenyAll={denyAllApprovals}
+          onClose={() => {
+            setApprovalModalOpen(false);
+            setApprovalFocusId(null);
+          }}
+        />
+      )}
+
       {confirmRequest && (
         <ConfirmDialog
           title={confirmRequest.title}

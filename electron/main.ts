@@ -436,6 +436,16 @@ async function initServices() {
     onPublished: scheduleWebringHubFollowUp,
     onLocalChange: noteLocalChange,
     onAutoPublishSettingsChanged: (personaId) => void autoPublisher.refresh([personaId]),
+    // An agent's request is waiting: the window shows the approval modal; if it isn't focused,
+    // a notification brings it forward
+    onApprovalRequested: (approval) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:mcp-approval-requested', approval);
+      if ((!mainWindow || !mainWindow.isFocused()) && Notification.isSupported()) {
+        const note = new Notification({ title: 'Agent request needs approval', body: approval.summary });
+        note.on('click', () => showMainWindow());
+        note.show();
+      }
+    },
   });
 
   mcpHttpServer = new McpHttpServer(webringMcpServer, {
@@ -1324,6 +1334,7 @@ function registerIpcHandlers() {
       readOnlyMode: webringMcpServer.isReadOnlyMode(),
       allowPrivateData: webringMcpServer.isPrivateDataAllowed(),
       pendingApprovals: webringMcpServer.listPendingApprovals(),
+      approvalHistory: webringMcpServer.listApprovalHistory(),
     };
   });
 
@@ -1339,8 +1350,9 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('studio:resolve-mcp-approval', async (_e, id: string, approved: boolean) => {
-    return await webringMcpServer.resolveApproval(String(id), Boolean(approved));
+    return await webringMcpServer.resolveApproval(String(id), approved === true);
   });
+  ipcMain.handle('studio:deny-all-mcp-approvals', () => ({ denied: webringMcpServer.denyAllApprovals() }));
 
   ipcMain.handle(
     'studio:call-mcp-tool',

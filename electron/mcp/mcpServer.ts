@@ -15,6 +15,7 @@ import {
 import { parseProxyUrl, redactProxyUrl } from '../security/proxyAgent';
 import { SecretStorageUnavailableError } from '../security/keyVault';
 import { isNetworkDisabled, runWithoutNetwork } from '../security/networkPolicy';
+import { describeToolCall } from './describeToolCall';
 import { GitHubDeviceLogin } from '../services/githubAuth';
 import { notifyWebringHubs, publishTo, PublishPaths } from '../services/jobs';
 import {
@@ -93,14 +94,31 @@ export interface McpActivityLogEntry {
 
 export type McpToolTier = 'read' | 'local-write' | 'outward';
 
+/**
+ * An agent's request waiting for the user (or already decided). Bound to the persona it targeted
+ * when it was queued: approving it runs it there, whatever persona is active by then.
+ */
 export interface McpPendingApproval {
   id: string;
   toolName: string;
   tier: McpToolTier;
   args: Record<string, unknown>;
+  personaId: string;
+  personaName: string;
+  /** What it would do, in plain words (describeToolCall). */
+  summary: string;
+  /** The MCP client that asked, when it said (clientInfo.name at initialize). */
+  client?: string;
   requestedAt: string;
-  status: 'pending' | 'approved' | 'denied';
+  expiresAt: string;
+  decidedAt?: string;
+  status: 'pending' | 'approved' | 'denied' | 'expired';
 }
+
+/** At most this many requests wait for approval; more are refused, never dropped silently. */
+export const MAX_PENDING_APPROVALS = 20;
+const APPROVAL_HISTORY = 50;
+const APPROVAL_TTL_MS = 30 * 60 * 1000;
 
 /**
  * The persona one MCP tool call works on, fixed when the call starts. Each call runs inside its
@@ -276,6 +294,8 @@ export interface McpAppServices {
   onLocalChange?: (personaId: string, reason: string, options?: { fromAgent?: boolean }) => void;
   /** Auto-publish was turned on/off or its delay changed (picks up or cancels a pending publish). */
   onAutoPublishSettingsChanged?: (personaId: string) => void;
+  /** An agent's request was queued for the user's approval (the app shows the approval modal). */
+  onApprovalRequested?: (approval: McpPendingApproval) => void;
 }
 
 export class WebringMcpServer {
@@ -324,6 +344,9 @@ export class WebringMcpServer {
   private allowPrivateData = false;
   private requireConfirmation = true;
   private pendingApprovals: McpPendingApproval[] = [];
+  private approvalHistory: McpPendingApproval[] = [];
+  /** The connected client's name, from initialize (shown with its requests). */
+  private clientName = '';
 
   public isReadOnlyMode(): boolean {
     return this.readOnlyMode;
@@ -354,23 +377,77 @@ export class WebringMcpServer {
     this.requireConfirmation = enabled;
   }
 
-  public listPendingApprovals(): McpPendingApproval[] {
-    return this.pendingApprovals.filter((a) => a.status === 'pending').map((a) => ({ ...a }));
+  /** Moves requests past their expiry out of the queue (checked whenever the queue is used). */
+  private expireApprovals(now = Date.now()): void {
+    const expired = this.pendingApprovals.filter((a) => Date.parse(a.expiresAt) <= now);
+    if (!expired.length) return;
+    this.pendingApprovals = this.pendingApprovals.filter((a) => !expired.includes(a));
+    for (const item of expired) this.archiveApproval(item, 'expired');
   }
 
+  private archiveApproval(item: McpPendingApproval, status: McpPendingApproval['status']): McpPendingApproval {
+    item.status = status;
+    item.decidedAt = new Date().toISOString();
+    this.approvalHistory.unshift(item);
+    if (this.approvalHistory.length > APPROVAL_HISTORY) this.approvalHistory.length = APPROVAL_HISTORY;
+    return { ...item };
+  }
+
+  /** Requests waiting for the user, oldest first. */
+  public listPendingApprovals(): McpPendingApproval[] {
+    this.expireApprovals();
+    return this.pendingApprovals.map((a) => ({ ...a }));
+  }
+
+  /** The last decided (or expired) requests, newest first. */
+  public listApprovalHistory(): McpPendingApproval[] {
+    this.expireApprovals();
+    return this.approvalHistory.map((a) => ({ ...a }));
+  }
+
+  /**
+   * The user's decision on a queued request. Approving runs it in the persona it was queued for,
+   * with every check still on except the confirmation itself (read-only mode, the saved export
+   * folder, the exact file path shown). An expired or already-decided request can't be approved.
+   */
   public async resolveApproval(
     id: string,
     approved: boolean
-  ): Promise<{ ok: boolean; approval?: McpPendingApproval; result?: unknown }> {
-    const item = this.pendingApprovals.find((a) => a.id === id && a.status === 'pending');
-    if (!item) return { ok: false };
-    item.status = approved ? 'approved' : 'denied';
-    if (!approved) {
-      this.recordActivity('approval/denied', `Denied ${item.toolName}`, false, item.toolName);
-      return { ok: true, approval: { ...item } };
+  ): Promise<{ ok: boolean; approval?: McpPendingApproval; result?: unknown; error?: string }> {
+    this.expireApprovals();
+    const item = this.pendingApprovals.find((a) => a.id === id);
+    if (!item) {
+      const past = this.approvalHistory.find((a) => a.id === id);
+      return {
+        ok: false,
+        error: past?.status === 'expired' ? 'This request expired. Ask the agent to try again.' : 'This request was already decided.',
+      };
     }
-    const result = await this.executeToolCall(item.toolName, item.args);
-    return { ok: true, approval: { ...item } , result };
+    this.pendingApprovals = this.pendingApprovals.filter((a) => a !== item);
+    if (!approved) {
+      const approval = this.archiveApproval(item, 'denied');
+      this.recordActivity('approval/denied', `Denied: ${item.summary}`, false, item.toolName, item.personaId);
+      return { ok: true, approval };
+    }
+    const approval = this.archiveApproval(item, 'approved');
+    const result = await this.executeToolCall(
+      item.toolName,
+      { ...item.args, personaId: item.personaId },
+      { enforcePolicy: true, approved: true }
+    );
+    return { ok: true, approval, result };
+  }
+
+  /** Denies every waiting request. Returns how many. */
+  public denyAllApprovals(): number {
+    this.expireApprovals();
+    const items = this.pendingApprovals;
+    this.pendingApprovals = [];
+    for (const item of items) {
+      this.archiveApproval(item, 'denied');
+      this.recordActivity('approval/denied', `Denied: ${item.summary}`, false, item.toolName, item.personaId);
+    }
+    return items.length;
   }
 
   /** The running app attaches publishing and GitHub sign-in; the stdio CLI can't use the keychain. */
@@ -452,6 +529,16 @@ export class WebringMcpServer {
     if (this.onActivity) {
       this.onActivity(entry);
     }
+  }
+
+  /**
+   * Runs `fn` with a persona's context: the active one (kept open for the whole call, even if the
+   * user switches persona meanwhile) or, for another persona, a context of its own.
+   */
+  private runInPersona<T>(personaId: string, fn: (ctx: ActivePersonaContext) => Promise<T>): Promise<T> {
+    return personaId === this.personaManager.getActivePersonaId()
+      ? this.personaManager.withActiveContext(fn)
+      : this.personaManager.withPersonaContext(personaId, fn);
   }
 
   /**
@@ -1584,11 +1671,16 @@ export class WebringMcpServer {
   public async executeToolCall(
     name: string,
     rawArgs?: Record<string, unknown>,
-    options?: { enforcePolicy?: boolean }
+    /** approved: the user approved this exact request; only the confirmation step is skipped. */
+    options?: { enforcePolicy?: boolean; approved?: boolean }
   ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean; data?: unknown }> {
     const args = rawArgs || {};
     const enforcePolicy = Boolean(options?.enforcePolicy);
     try {
+      const requestedPersonaId =
+        typeof args.personaId === 'string' ? args.personaId.trim() : '';
+      const activeId = this.personaManager.getActivePersonaId();
+      const targetPersonaId = requestedPersonaId || activeId;
       if (enforcePolicy) {
         const tier = getMcpToolTier(name, args);
         if (this.readOnlyMode && tier !== 'read') {
@@ -1599,38 +1691,51 @@ export class WebringMcpServer {
             isError: true,
           };
         }
-        if (this.requireConfirmation && tier === 'outward') {
+        if (this.requireConfirmation && tier === 'outward' && !options?.approved) {
+          this.expireApprovals();
+          if (this.pendingApprovals.length >= MAX_PENDING_APPROVALS) {
+            throw new Error('Too many requests are waiting for approval in Studio; ask the user to review them');
+          }
+          const record = this.personaManager.listPersonaRecords().find((p) => p.id === targetPersonaId);
+          if (!record) throw new Error(`Persona "${targetPersonaId}" not found`);
+          // Described with the target persona's own data (album titles, friend names, publish host)
+          const summary = await this.runInPersona(targetPersonaId, async (ctx) => describeToolCall(name, args, ctx));
+          const now = Date.now();
           const approval: McpPendingApproval = {
-            id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            id: `approval-${now}-${Math.random().toString(36).slice(2, 8)}`,
             toolName: name,
             tier,
             args,
-            requestedAt: new Date().toISOString(),
+            personaId: targetPersonaId,
+            personaName: record.label,
+            summary,
+            ...(this.clientName ? { client: this.clientName } : {}),
+            requestedAt: new Date(now).toISOString(),
+            expiresAt: new Date(now + APPROVAL_TTL_MS).toISOString(),
             status: 'pending',
           };
-          this.pendingApprovals.unshift(approval);
-          if (this.pendingApprovals.length > 50) {
-            this.pendingApprovals.length = 50;
+          this.pendingApprovals.push(approval);
+          try {
+            this.appServices?.onApprovalRequested?.({ ...approval });
+          } catch {
+            // The request is queued either way; the MCP tab lists it
           }
           const payload = {
             pendingApproval: true,
             approvalId: approval.id,
             toolName: name,
             tier,
-            message: `Action "${name}" requires human confirmation in Webring Studio before running.`,
+            summary,
+            expiresAt: approval.expiresAt,
+            message: `This needs the user's approval in Webring Studio: ${summary}`,
           };
-          this.recordActivity('tools/call', `Queued "${name}" for human confirmation`, true, name);
+          this.recordActivity('tools/call', `Waiting for approval: ${summary}`, true, name, targetPersonaId);
           return {
             content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
             data: payload,
           };
         }
       }
-
-      const requestedPersonaId =
-        typeof args.personaId === 'string' ? args.personaId.trim() : '';
-      const activeId = this.personaManager.getActivePersonaId();
-      const targetPersonaId = requestedPersonaId || activeId;
 
       const runTool = async (): Promise<{ resultData: unknown; summary: string }> => {
         let resultData: unknown;
@@ -2511,14 +2616,10 @@ export class WebringMcpServer {
               : `exported-profile-site-${ctx.persona.id}`;
           const savedExportPath = profile.publishSettings?.exportPath;
           const requestedDir = typeof args.targetDir === 'string' ? args.targetDir.trim() : '';
-          if (enforcePolicy && requestedDir && savedExportPath && path.resolve(requestedDir) !== path.resolve(savedExportPath)) {
-            throw new Error(
-              'MCP cannot change the export folder; use the folder picker in Webring Studio.'
-            );
-          }
-          const outDir =
-            (enforcePolicy ? savedExportPath : requestedDir || savedExportPath) ||
-            path.join(this.userDataDir, defaultFolder);
+          // MCP never chooses the export folder, even for an approved request: only the folder
+          // picker in the app can. A different folder asked for is ignored, and the result says so.
+          const outDir = savedExportPath || path.join(this.userDataDir, defaultFolder);
+          const ignoredTargetDir = requestedDir && path.resolve(requestedDir) !== path.resolve(outDir) ? requestedDir : '';
 
           const pubRes = ctx.sitePublisher.publishToLocalDirectory(outDir);
           if (pubRes.success) {
@@ -2526,7 +2627,13 @@ export class WebringMcpServer {
               publishSettings: { ...profile.publishSettings, exportPath: outDir },
             });
           }
-          resultData = pubRes;
+          resultData = ignoredTargetDir
+            ? {
+                ...pubRes,
+                ignoredTargetDir,
+                note: "Agents can't choose the export folder; Studio exported to the saved folder. Change it in the app.",
+              }
+            : pubRes;
           summary = `Exported signed static site to ${outDir}`;
           break;
         }
@@ -2746,10 +2853,7 @@ export class WebringMcpServer {
         callContext.run({ ctx, personaId: targetPersonaId, agent: enforcePolicy }, () =>
           noNetwork ? runWithoutNetwork(runTool) : runTool()
         );
-      const { resultData, summary } =
-        targetPersonaId === activeId
-          ? await this.personaManager.withActiveContext(runIn)
-          : await this.personaManager.withPersonaContext(targetPersonaId, runIn);
+      const { resultData, summary } = await this.runInPersona(targetPersonaId, runIn);
 
       if (LOCAL_CHANGE_TOOLS[name]) {
         this.noteChange(targetPersonaId, LOCAL_CHANGE_TOOLS[name], enforcePolicy);
@@ -2959,8 +3063,10 @@ export class WebringMcpServer {
 
     try {
       switch (method) {
-        case 'initialize':
-          this.recordActivity('initialize', 'MCP Client initialized session', true);
+        case 'initialize': {
+          const info = (params?.clientInfo || {}) as { name?: unknown; version?: unknown };
+          this.clientName = typeof info.name === 'string' ? info.name.slice(0, 80) : '';
+          this.recordActivity('initialize', `MCP client connected${this.clientName ? `: ${this.clientName}` : ''}`, true);
           return {
             jsonrpc: '2.0',
             id,
@@ -2978,6 +3084,7 @@ export class WebringMcpServer {
               instructions: MCP_SERVER_INSTRUCTIONS,
             },
           };
+        }
 
         case 'ping':
           return {

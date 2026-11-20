@@ -939,12 +939,16 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       });
 
       // 5. Agent exports the signed static site via MCP and verifies over Loopback HTTP /mcp endpoint
+      // The export folder is chosen in the app (saved here); MCP can't pick another one
       const exportOutDir = path.join(tempRoot, 'mcp-exported-site');
-      const exportRes = await mcpServer.executeToolCall('webring_export_static_site', {
-        targetDir: exportOutDir,
-      });
+      const studioDb = manager.getActiveContext().db;
+      studioDb.updateProfile({ publishSettings: { ...studioDb.getProfile().publishSettings, exportPath: exportOutDir } });
+      const elsewhere = path.join(tempRoot, 'agent-chosen-folder');
+      const exportRes = await mcpServer.executeToolCall('webring_export_static_site', { targetDir: elsewhere });
       expect((exportRes.data as { success: boolean }).success).toBe(true);
+      expect((exportRes.data as { ignoredTargetDir?: string }).ignoredTargetDir).toBe(elsewhere);
       expect(fs.existsSync(path.join(exportOutDir, 'index.html'))).toBe(true);
+      expect(fs.existsSync(elsewhere)).toBe(false);
 
       const httpStatus = await httpServer.start(0);
       expect(httpStatus.running).toBe(true);
