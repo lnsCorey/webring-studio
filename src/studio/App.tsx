@@ -31,6 +31,7 @@ import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesP
 import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
 import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
 import { formatFingerprint } from '../shared/fingerprint';
+import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
@@ -2538,10 +2539,7 @@ export const App: React.FC = () => {
             >
               <img
                 src={
-                  bundle.profile.avatarUrl ||
-                  `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                    bundle.profile.displayName
-                  )}`
+                  bundle.profile.avatarUrl || localAvatarDataUri(bundle.profile.siteUrl || bundle.profile.displayName)
                 }
                 alt={bundle.profile.displayName}
                 className="w-8 h-8 rounded-lg object-cover border border-slate-700 shrink-0"
@@ -4621,12 +4619,8 @@ export const App: React.FC = () => {
                           <>
                         <div className="flex items-start gap-3 min-w-0">
                           <img
-                            src={
-                              friend.avatarUrl ||
-                              `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                                friend.displayName
-                              )}`
-                            }
+                            src={friendAvatarSrc(friend.avatarUrl, friend.siteUrl)}
+                            referrerPolicy="no-referrer"
                             alt={friend.displayName}
                             className="w-12 h-12 rounded-full object-cover bg-slate-800 shrink-0"
                           />
@@ -5077,12 +5071,8 @@ export const App: React.FC = () => {
                             <div className="flex items-start justify-between gap-3">
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
-                                  src={
-                                    entry.friendAvatarUrl ||
-                                    `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                                      entry.friendName
-                                    )}`
-                                  }
+                                  src={friendAvatarSrc(entry.friendAvatarUrl, entry.friendSiteUrl)}
+                                  referrerPolicy="no-referrer"
                                   alt={entry.friendName}
                                   className="w-8 h-8 rounded-full object-cover shrink-0"
                                 />
@@ -9290,10 +9280,7 @@ git push -u origin main --force`}
                           <div className="flex items-center gap-3 min-w-0">
                             <img
                               src={
-                                p.avatarUrl ||
-                                `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                                  p.displayName
-                                )}`
+                                p.avatarUrl || localAvatarDataUri(p.displayName)
                               }
                               alt={p.displayName}
                               className="w-12 h-12 rounded-xl object-cover border border-slate-700 shrink-0"

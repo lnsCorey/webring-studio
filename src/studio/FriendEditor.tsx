@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { CheckCircle2, Trash2 } from 'lucide-react';
 import { FriendConnection, FriendVisibility, normalizeSiteUrl } from '../shared/schema';
+import { friendAvatarSrc } from '../shared/avatar';
 
 /** Editable fields of a friend connection in the local ring. */
 export interface FriendEdit {
@@ -56,11 +57,8 @@ export function FriendEditor(props: {
     }
   })();
 
-  const previewAvatar =
-    draft.avatarUrl.trim() ||
-    `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-      draft.displayName.trim() || friend.displayName
-    )}`;
+  // Only an https image on their own site is loaded; anything else previews as the placeholder
+  const previewAvatar = friendAvatarSrc(draft.avatarUrl.trim(), draft.siteUrl.trim() || friend.siteUrl);
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -96,6 +94,7 @@ export function FriendEditor(props: {
         <div className="flex items-center gap-2.5 min-w-0">
           <img
             src={previewAvatar}
+            referrerPolicy="no-referrer"
             alt={draft.displayName || friend.displayName}
             className="w-9 h-9 rounded-full object-cover bg-slate-800 shrink-0"
           />

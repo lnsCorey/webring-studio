@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Ban, Check, UserPlus, X } from 'lucide-react';
+import { friendAvatarSrc } from '../shared/avatar';
 
 /** Someone who added this persona as a friend (database.ts FriendNotice). Never exported. */
 export interface FriendNoticeView {
@@ -24,8 +25,7 @@ export interface AddBackTarget {
   avatarUrl: string;
 }
 
-const avatarFor = (name: string, url: string) =>
-  url || `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(name)}`;
+const avatarFor = (siteUrl: string, url: string) => friendAvatarSrc(url, siteUrl);
 
 /**
  * "Added you": people whose signed link or verified connections.json says they added this persona.
@@ -101,7 +101,8 @@ export function FriendNoticesPanel(props: {
             <div key={n.siteUrl} className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col gap-2.5">
               <div className="flex items-start gap-3 min-w-0">
                 <img
-                  src={avatarFor(n.displayName, n.avatarUrl)}
+                  src={avatarFor(n.siteUrl, n.avatarUrl)}
+                  referrerPolicy="no-referrer"
                   alt=""
                   className="w-10 h-10 rounded-full object-cover bg-slate-800 shrink-0"
                 />
@@ -177,7 +178,8 @@ export function FriendNoticesPanel(props: {
         <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
           <div className="flex items-start gap-3 min-w-0">
             <img
-              src={avatarFor(sender.displayName, sender.avatarUrl)}
+              src={avatarFor(sender.siteUrl, sender.avatarUrl)}
+              referrerPolicy="no-referrer"
               alt=""
               className="w-12 h-12 rounded-full object-cover bg-slate-800 shrink-0"
             />

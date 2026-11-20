@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
 import { markdownToPlainText, renderMarkdown } from '../../src/shared/markdown';
+import { AVATAR_PAGE_SCRIPT } from '../../src/shared/avatar';
 import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
 import { ENHANCEMENTS_CSS, installPageEnhancements } from './pageEnhancements';
 import {
@@ -931,19 +932,12 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         \`;
       }
 
-      function localAvatarUri(name) {
-        const label = (String(name || '?').trim()[0] || '?').toUpperCase();
-        let hash = 0;
-        for (let i = 0; i < String(name || '').length; i++) hash = (hash * 31 + String(name).charCodeAt(i)) >>> 0;
-        const hue = hash % 360;
-        const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="32" fill="hsl(' + hue + ',55%,38%)"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#fff" font-family="system-ui,sans-serif" font-size="28" font-weight="700">' + esc(label) + '</text></svg>';
-        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-      }
-
+      // Friends' avatars only from their own site over https; otherwise a local placeholder (src/shared/avatar.ts)
+${AVATAR_PAGE_SCRIPT}
       function renderFriend(friend) {
         return \`
           <a href="\${safeUrl(friend.siteUrl)}" target="_blank" rel="noopener noreferrer" class="card-surface rounded-xl p-3.5 flex items-center gap-3 hover:border-indigo-400/50 transition">
-            <img src="\${friend.avatarUrl ? safeUrl(friend.avatarUrl) : localAvatarUri(friend.displayName)}" class="w-12 h-12 rounded-full object-cover border border-white/20" />
+            <img src="\${esc(safeAvatarUrl(friend.avatarUrl, friend.siteUrl) || localAvatarDataUri(friend.siteUrl))}" referrerpolicy="no-referrer" alt="" class="w-12 h-12 rounded-full object-cover border border-white/20" />
             <div class="min-w-0 flex-1">
               <h4 class="font-bold text-sm truncate">\${esc(friend.displayName)}</h4>
               <p class="text-xs opacity-70 truncate">\${esc(friend.siteUrl)}</p>
