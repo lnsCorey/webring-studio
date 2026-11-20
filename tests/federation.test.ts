@@ -31,6 +31,7 @@ import {
   type LayoutBlock,
   type ProfileTheme,
   parseWebringUri,
+  isUrlWithinSite,
   signDocument,
   siteUrlToDidWeb,
   verifyDocumentSignature,
@@ -7056,5 +7057,25 @@ describe('Security Phase 6: reviewed key trust', () => {
     const hex = 'ab'.repeat(32);
     expect(formatFingerprint(hex)).toBe('ABAB ABAB ABAB ABAB ABAB ABAB ABAB ABAB\nABAB ABAB ABAB ABAB ABAB ABAB ABAB ABAB');
     expect(formatFingerprint('0123 4567 89ab')).toBe('0123 4567 89AB');
+  });
+});
+
+describe('Security Phase 6: network guard and endorsement matching', () => {
+  it('blocks IPv4-compatible and site-local IPv6 addresses, and hex IPv4-mapped loopback', () => {
+    for (const ip of ['::7f00:1', '::a00:1', '::', '::1', 'fec0::1', 'feff::1', '::ffff:7f00:1', '::ffff:a9fe:a9fe']) {
+      expect(isPrivateNetworkAddress(ip), ip).toBe(true);
+    }
+    for (const ip of ['2606:4700:4700::1111', '::ffff:808:808', '8.8.8.8']) {
+      expect(isPrivateNetworkAddress(ip), ip).toBe(false);
+    }
+  });
+
+  it('matches endorsements of our items by origin and path, not by text prefix', () => {
+    expect(isUrlWithinSite('https://me.com.evil.net/x', 'https://me.com')).toBe(false);
+    expect(isUrlWithinSite('https://me.com:8443/x', 'https://me.com')).toBe(false);
+    expect(isUrlWithinSite('https://me.com/blog/x', 'https://me.com')).toBe(true);
+    expect(isUrlWithinSite('https://me.com/blogger/x', 'https://me.com/blog')).toBe(false);
+    expect(isUrlWithinSite('https://me.com/blog', 'https://me.com/blog')).toBe(true);
+    expect(isUrlWithinSite('https://me.com/blog/post', 'https://me.com/blog/')).toBe(true);
   });
 });

@@ -26,8 +26,7 @@ for (const [network, prefix] of [
   blockedRanges.addSubnet(network, prefix, 'ipv4');
 }
 for (const [network, prefix] of [
-  ['::', 128], // unspecified
-  ['::1', 128], // loopback
+  ['::', 96], // IPv4-compatible (deprecated), including :: (unspecified) and ::1 (loopback)
   ['64:ff9b::', 96], // NAT64
   ['64:ff9b:1::', 48], // NAT64 local-use
   ['100::', 64], // discard-only
@@ -40,6 +39,7 @@ for (const [network, prefix] of [
   ['3fff::', 20], // documentation
   ['fc00::', 7], // unique local
   ['fe80::', 10], // link-local
+  ['fec0::', 10], // site-local (deprecated)
   ['ff00::', 8], // multicast
 ] as const) {
   blockedRanges.addSubnet(network, prefix, 'ipv6');
@@ -68,6 +68,13 @@ export function isPrivateNetworkAddress(address: string): boolean {
     const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
     if (mapped) {
       return blockedRanges.check(mapped[1], 'ipv4');
+    }
+    // The same in hex (::ffff:7f00:1)
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(address);
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1], 16);
+      const lo = parseInt(mappedHex[2], 16);
+      return blockedRanges.check(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`, 'ipv4');
     }
     return blockedRanges.check(address, 'ipv6');
   }

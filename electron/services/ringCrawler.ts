@@ -918,7 +918,8 @@ export class RingCrawler {
             itemsIndexed++;
 
             // Check if this friend liked/shared/recommended/commented on an item or photo belonging to OUR site!
-            if (item.targetUrl.startsWith(mySiteUrl)) {
+            // Same origin and under our site's path: a prefix match would also take https://me.com.evil.net
+            if (isUrlWithinSite(item.targetUrl, mySiteUrl)) {
               this.db.upsertEndorsement({
                 targetCanonicalUrl: item.targetUrl,
                 authorSiteUrl: normalizedFriendUrl,
