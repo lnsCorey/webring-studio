@@ -343,6 +343,25 @@ function imageErrorText(err: unknown): string {
   return text || "This image is too large or couldn't be processed.";
 }
 
+/** The live MCP connection config: the token goes in a header, never the URL. */
+function mcpLiveConfig(status: { endpointUrl?: string; accessToken?: string } | undefined, withToken: boolean): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        'webring-studio-live': {
+          type: 'http',
+          url: status?.endpointUrl || 'http://127.0.0.1:<port>/mcp',
+          headers: {
+            Authorization: `Bearer ${withToken && status?.accessToken ? status.accessToken : '<your access token>'}`,
+          },
+        },
+      },
+    },
+    null,
+    2
+  );
+}
+
 /** Shown with the "Allow agents to read private data" toggle and its confirmation. */
 const PRIVATE_DATA_EXPLANATION =
   'Includes private friends, saved posts and private profile fields. Content from friends’ posts can contain instructions aimed at your agent; only enable this for agents you trust.';
@@ -459,7 +478,8 @@ declare global {
         joinedRings: JoinedRing[];
         hostedRings: HostedRing[];
         publishedUpToDate: boolean;
-        previewHtml: string;
+        /** The live preview page, served from the loopback preview server. */
+        previewUrl?: string;
         savedPosts?: SavedPostView[];
         feedRetentionDays?: number;
         friendNotices?: FriendNoticeView[];
@@ -659,8 +679,7 @@ declare global {
           port: number;
           endpointUrl: string;
           sseUrl: string;
-          authorizedEndpointUrl?: string;
-          authorizedSseUrl?: string;
+          accessToken?: string;
           toolCount: number;
           resourceCount: number;
           promptCount: number;
@@ -693,6 +712,7 @@ declare global {
         }>;
         readOnlyMode?: boolean;
         allowPrivateData?: boolean;
+        devTools?: boolean;
         pendingApprovals?: McpApprovalView[];
         approvalHistory?: McpApprovalView[];
       }>;
@@ -704,7 +724,7 @@ declare global {
       ) => Promise<{ ok: boolean; approval?: unknown; result?: unknown; error?: string }>;
       denyAllMcpApprovals?: () => Promise<{ denied: number }>;
       onMcpApprovalRequested?: (cb: (approval: McpApprovalView) => void) => () => void;
-      callMcpTool?: (
+      devRunMcpTool?: (
         toolName: string,
         args?: Record<string, unknown>
       ) => Promise<{
@@ -806,7 +826,7 @@ export const App: React.FC = () => {
   const [bannerUrl, setBannerUrl] = useState('');
   const [interestsInput, setInterestsInput] = useState('');
   const [theme, setTheme] = useState<ProfileTheme>('neo-webring');
-  const [previewHtml, setPreviewHtml] = useState('');
+  const [livePreviewUrl, setLivePreviewUrl] = useState('');
   const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
   const [atprotoHandle, setAtprotoHandle] = useState('');
   const [customLinks, setCustomLinks] = useState<Array<{ label: string; url: string }>>([]);
@@ -953,8 +973,7 @@ export const App: React.FC = () => {
       port: number;
       endpointUrl: string;
       sseUrl: string;
-      authorizedEndpointUrl?: string;
-      authorizedSseUrl?: string;
+      accessToken?: string;
       toolCount: number;
       resourceCount: number;
       promptCount: number;
@@ -975,6 +994,7 @@ export const App: React.FC = () => {
     }>;
     readOnlyMode?: boolean;
     allowPrivateData?: boolean;
+    devTools?: boolean;
     pendingApprovals?: McpApprovalView[];
     approvalHistory?: McpApprovalView[];
   } | null>(null);
@@ -1279,7 +1299,7 @@ export const App: React.FC = () => {
     setBannerUrl(p.bannerUrl);
     setInterestsInput((p.interests || []).join(', '));
     setTheme(p.theme);
-    setPreviewHtml(data.previewHtml || '');
+    setLivePreviewUrl(data.previewUrl || '');
     setAtprotoHandle(p.atprotoHandle || '');
     setCustomLinks((p.customLinks || []).map((l) => ({ label: l.label, url: l.url })));
     if (p.publishSettings) {
@@ -2404,7 +2424,7 @@ export const App: React.FC = () => {
     if (!window.studioApi) return;
     const options = await confirmPublishWithHeldChanges();
     if (!options) return;
-    const res = await window.studioApi.exportLocal(publishSettings.exportPath || undefined, options);
+    const res = await window.studioApi.exportLocal(undefined, options);
     void refreshSecurityStatus();
     await refreshStudioData();
     notify(res.message);
@@ -5855,7 +5875,7 @@ export const App: React.FC = () => {
                 ) : (
                   <iframe
                     ref={previewFrameRef}
-                    srcDoc={previewHtml}
+                    src={livePreviewUrl || 'about:blank'}
                     sandbox="allow-scripts"
                     allow="fullscreen"
                     title="Site preview"
@@ -7386,97 +7406,72 @@ export const App: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => {
-                        const snippet = JSON.stringify(
-                          {
-                            mcpServers: {
-                              'webring-studio-live': {
-                                url:
-                                  mcpInfo?.status.authorizedEndpointUrl ||
-                                  'http://127.0.0.1:<port>/mcp?token=<token>',
-                              },
-                            },
-                          },
-                          null,
-                          2
-                        );
-                        navigator.clipboard.writeText(snippet);
-                        notify('Copied Live HTTP MCP configuration to clipboard!');
+                        navigator.clipboard.writeText(mcpLiveConfig(mcpInfo?.status, true));
+                        notify('Copied the MCP configuration (with your access token) to the clipboard.');
                       }}
                       className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5"
                     >
-                      <Copy className="w-3.5 h-3.5" /> Copy URL Config
+                      <Copy className="w-3.5 h-3.5" /> Copy config
                     </button>
                   </div>
                   <p className="text-xs text-slate-400">
                     Connects directly to this running Studio window on <code>127.0.0.1</code>. Any
                     posts, comments, persona switches, or crawls performed by your agent update this
-                    UI in real time! The port stays the same across restarts. Use the URLs below,
-                    which include your access token: clients running inside a browser or Electron
-                    window (anything that sends an <code>Origin</code> header) are refused without
-                    it, so web pages can't control Studio. Treat the token like a password.
+                    UI in real time! The port stays the same across restarts. Every request must send
+                    your access token in an <code>Authorization: Bearer</code> header; a token in the
+                    URL isn't accepted (URLs end up in logs and history). Treat the token like a
+                    password.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={() => {
-                        if (!mcpInfo?.status.authorizedSseUrl) return;
-                        navigator.clipboard.writeText(mcpInfo.status.authorizedSseUrl);
-                        notify('Copied SSE URL (with access token) to clipboard!');
+                        if (!mcpInfo?.status.endpointUrl || !mcpInfo.status.accessToken) return;
+                        navigator.clipboard.writeText(
+                          `claude mcp add --transport http webring-studio ${mcpInfo.status.endpointUrl} --header "Authorization: Bearer ${mcpInfo.status.accessToken}"`
+                        );
+                        notify('Copied the Claude Code command (with your access token) to the clipboard.');
                       }}
                       className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5"
                     >
-                      <Copy className="w-3.5 h-3.5" /> Copy SSE URL
+                      <Copy className="w-3.5 h-3.5" /> Copy Claude Code command
                     </button>
                     <button
                       type="button"
                       onClick={() => {
-                        if (!mcpInfo?.status.authorizedEndpointUrl) return;
-                        navigator.clipboard.writeText(mcpInfo.status.authorizedEndpointUrl);
-                        notify('Copied HTTP URL (with access token) to clipboard!');
+                        if (!mcpInfo?.status.accessToken) return;
+                        navigator.clipboard.writeText(mcpInfo.status.accessToken);
+                        notify('Copied the access token to the clipboard.');
                       }}
                       className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5"
                     >
-                      <Copy className="w-3.5 h-3.5" /> Copy HTTP URL
+                      <Copy className="w-3.5 h-3.5" /> Copy access token
                     </button>
                   </div>
                   <pre className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-[11px] font-mono text-indigo-300 overflow-x-auto">
-                    {JSON.stringify(
-                      {
-                        mcpServers: {
-                          'webring-studio-live': {
-                            url:
-                              mcpInfo?.status.authorizedEndpointUrl ||
-                              'http://127.0.0.1:<port>/mcp?token=<token>',
-                            sseUrl:
-                              mcpInfo?.status.authorizedSseUrl ||
-                              'http://127.0.0.1:<port>/mcp/sse?token=<token>',
-                          },
-                        },
-                      },
-                      null,
-                      2
-                    )}
+                    {mcpLiveConfig(mcpInfo?.status, false)}
                   </pre>
                 </div>
               </div>
 
-              {/* Interactive MCP Tool Tester & One-Click Automation Runner */}
+              {/* Developer tools: dev builds only, and through the same MCP policy as an agent */}
+              {mcpInfo?.devTools && (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="font-bold text-lg">
-                      Interactive MCP Tool Console ({mcpInfo?.tools.length || 21} Tools Available)
+                      Developer tools (dev builds only): MCP Tool Console ({mcpInfo?.tools.length || 21} tools)
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Test any MCP tool directly against your active persona or trigger a 1-click
-                      agent workflow below.
+                      Runs tools as an agent would: the same tiers, read-only mode and approval
+                      prompts. This console isn't in packaged builds.
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await window.studioApi?.callMcpTool?.(
+                        const res = await window.studioApi?.devRunMcpTool?.(
                           'webring_create_post',
                           {
                             commentary:
@@ -7497,7 +7492,7 @@ export const App: React.FC = () => {
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await window.studioApi?.callMcpTool?.(
+                        const res = await window.studioApi?.devRunMcpTool?.(
                           'webring_crawl_all_friends',
                           {}
                         );
@@ -7614,7 +7609,7 @@ export const App: React.FC = () => {
                       onClick={async () => {
                         try {
                           const parsedArgs = JSON.parse(mcpToolArgsJson || '{}');
-                          const res = await window.studioApi?.callMcpTool?.(
+                          const res = await window.studioApi?.devRunMcpTool?.(
                             selectedMcpTool,
                             parsedArgs
                           );
@@ -7648,6 +7643,7 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               </div>
+              )}
 
               {/* Example Natural-Language Prompts & Live Agent Activity Log */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

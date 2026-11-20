@@ -206,6 +206,29 @@ function scheduleWebringHubFollowUp(personaId: string): void {
 }
 
 /** After a scheduled job or an auto-publish: hub follow-ups, failure notice, tray and UI refresh. */
+/** The export folder picker: the only way to set the export folder. Checks it, then saves it. */
+async function pickExportFolder(): Promise<string | null> {
+  if (!mainWindow) return null;
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose Export Folder for Static Profile Website',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (res.canceled || res.filePaths.length === 0) return null;
+  const chosen = res.filePaths[0];
+  const ctx = personaManager.getActiveContext();
+  const saved = ctx.db.getProfile().publishSettings.exportPath;
+  if (!checkExportFolder(chosen, saved).ok) {
+    await dialog.showMessageBox(mainWindow, {
+      type: 'error',
+      title: 'Folder not used',
+      message: new ExportFolderRefusedError().message,
+    });
+    return null;
+  }
+  ctx.db.updateProfile({ publishSettings: { ...ctx.db.getProfile().publishSettings, exportPath: chosen } });
+  return chosen;
+}
+
 function handleJobFinished(personaId: string, job: ScheduledJobKind, result: JobResult, title: string): void {
   if (job === 'publish' && result.status === 'ok') scheduleWebringHubFollowUp(personaId);
   // Held for review isn't a failure: say why it didn't publish, once
@@ -564,7 +587,24 @@ function createWindow(show = true) {
   });
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
-  if (devServerUrl) {
+  if (devServerUrl && !app.isPackaged) {
+    // Development only: the window's own pages also get the CSP as a header. It's the relaxed
+    // dev policy (Vite needs inline scripts and a websocket); packaged builds load index.html from
+    // disk, where its strict meta CSP applies.
+    const origin = new URL(devServerUrl).origin;
+    session.defaultSession.webRequest.onHeadersReceived({ urls: [`${origin}/*`] }, (details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self'; script-src 'self' 'unsafe-inline' http://localhost:*; style-src 'self' 'unsafe-inline'; " +
+              "img-src 'self' data: https: studio-media:; media-src 'self' studio-media:; font-src 'self' data:; " +
+              "connect-src 'self' ws://localhost:* http://localhost:*; frame-src http://127.0.0.1:*; object-src 'none'; " +
+              "base-uri 'none'; form-action 'none'",
+          ],
+        },
+      });
+    });
     mainWindow.loadURL(devServerUrl);
   } else {
     const indexHtmlPath = path.join(__dirname, '../../dist/index.html');
@@ -694,7 +734,7 @@ app.on('before-quit', () => {
 });
 
 function registerIpcHandlers() {
-  ipcMain.handle('studio:get-bundle', () => {
+  ipcMain.handle('studio:get-bundle', async () => {
     const ctx = personaManager.getActiveContext();
     const bundle = ctx.db.buildSignedSiteBundle();
     const publishedBundle = ctx.db.buildSignedSiteBundle({ publish: true });
@@ -724,7 +764,11 @@ function registerIpcHandlers() {
         ctx.siteGenerator.contentFingerprint(publishedBundle) ===
           profileWithSettings.publishSettings.lastPublishedFingerprint,
       // The preview shows the published page: recent items, with older ones under "Older posts"
-      previewHtml: ctx.siteGenerator.buildStandaloneProfileHtml(publishedBundle, { preview: true }),
+      // Served from the loopback preview server: the window's CSP (script-src 'self') would block
+      // the page's own scripts in a srcdoc frame, which inherits it
+      previewUrl: await localPreviewServer.serveLivePreview(
+        ctx.siteGenerator.buildStandaloneProfileHtml(publishedBundle, { preview: true })
+      ),
       savedPosts: ctx.db.getSavedPosts(),
       feedRetentionDays: ctx.db.getFeedRetentionDays(),
       friendNotices: ctx.db.getFriendNotices(),
@@ -1029,8 +1073,10 @@ function registerIpcHandlers() {
     );
   };
 
+  // Syncs one friend by site address. Reading a local folder as their site is for development only.
   ipcMain.handle('studio:crawl-friend', async (_e, siteUrl: string, localDirOverride?: string) => {
-    return withActiveLock((_personaId, ctx) => ctx.ringCrawler.crawlFriendSite(siteUrl, localDirOverride));
+    const localDir = !app.isPackaged && typeof localDirOverride === 'string' && localDirOverride ? localDirOverride : undefined;
+    return withActiveLock((_personaId, ctx) => ctx.ringCrawler.crawlFriendSite(String(siteUrl || ''), localDir));
   });
 
   ipcMain.handle('studio:crawl-all-friends', async (event) => {
@@ -1248,32 +1294,20 @@ function registerIpcHandlers() {
 
   // The only way to change the export folder: the user picks it here, and it's checked and saved
   // in main (the window can't set the path, and MCP never can)
-  ipcMain.handle('studio:choose-export-folder', async () => {
-    if (!mainWindow) return null;
-    const res = await dialog.showOpenDialog(mainWindow, {
-      title: 'Choose Export Folder for Static Profile Website',
-      properties: ['openDirectory', 'createDirectory'],
-    });
-    if (res.canceled || res.filePaths.length === 0) return null;
-    const chosen = res.filePaths[0];
-    const ctx = personaManager.getActiveContext();
-    const saved = ctx.db.getProfile().publishSettings.exportPath;
-    if (!checkExportFolder(chosen, saved).ok) {
-      await dialog.showMessageBox(mainWindow, {
-        type: 'error',
-        title: 'Folder not used',
-        message: new ExportFolderRefusedError().message,
-      });
-      return null;
-    }
-    ctx.db.updateProfile({ publishSettings: { ...ctx.db.getProfile().publishSettings, exportPath: chosen } });
-    return chosen;
-  });
+  ipcMain.handle('studio:choose-export-folder', () => pickExportFolder());
 
-  ipcMain.handle('studio:export-local', (_e, targetDir?: string, options?: { includeAgentChanges?: boolean }) => {
+  // Exports to the saved folder; with none saved, the user picks one first. The window never
+  // supplies a path (any first argument is ignored).
+  ipcMain.handle('studio:export-local', async (_e, _ignored?: unknown, options?: { includeAgentChanges?: boolean }) => {
+    if (!personaManager.getActiveContext().db.getProfile().publishSettings.exportPath) {
+      const chosen = await pickExportFolder();
+      if (!chosen) {
+        return { success: false, mode: 'local', destination: '', filesPublished: 0, message: 'Export cancelled: no folder chosen.' };
+      }
+    }
     return withActiveLock(async (personaId, ctx) => {
       releaseHeldChangesFor(personaId, ctx, options?.includeAgentChanges === true);
-      const result = await publishTo(ctx, 'local', publishPaths(), { targetDir });
+      const result = await publishTo(ctx, 'local', publishPaths());
       if (result.success) scheduleWebringHubFollowUp(personaId);
       return result;
     });
@@ -1383,9 +1417,13 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:open-path', async (_e, targetPath: string) => {
     if (typeof targetPath !== 'string' || !targetPath.trim()) return { ok: false };
     const resolved = path.resolve(targetPath);
+    // Only the persona's own folders: its export, its test preview, its media library and the logs
+    const ctx = personaManager.getActiveContext();
     const allowedRoots = [
-      path.resolve(app.getPath('userData')),
-      personaManager.getActiveContext().db.getProfile().publishSettings?.exportPath,
+      ctx.db.getProfile().publishSettings?.exportPath,
+      path.join(app.getPath('userData'), `test-preview-site-${ctx.persona.id}`),
+      ctx.mediaLibrary.rootDir,
+      app.getPath('logs'),
     ]
       .filter((p): p is string => Boolean(p && p.trim()))
       .map((p) => path.resolve(p));
@@ -1393,7 +1431,7 @@ function registerIpcHandlers() {
       (root) => resolved === root || resolved.startsWith(root + path.sep)
     );
     if (!isAllowed) {
-      throw new Error('Refusing to open path outside Webring Studio data or export folders.');
+      throw new Error("Studio only opens this persona's export, preview, media and log folders.");
     }
     await shell.openPath(resolved);
     return { ok: true };
@@ -1403,6 +1441,8 @@ function registerIpcHandlers() {
     const cliScriptPath = path.resolve(__dirname, 'mcp/cli.js');
     return {
       status: mcpHttpServer.getStatus(),
+      // The developer tool runner exists only in dev builds
+      devTools: !app.isPackaged,
       cliScriptPath,
       userDataDir: app.getPath('userData'),
       tools: webringMcpServer.getTools(),
@@ -1432,11 +1472,14 @@ function registerIpcHandlers() {
   });
   ipcMain.handle('studio:deny-all-mcp-approvals', () => ({ denied: webringMcpServer.denyAllApprovals() }));
 
-  ipcMain.handle(
-    'studio:call-mcp-tool',
-    async (_e, toolName: string, args?: Record<string, unknown>) => {
-      return await webringMcpServer.executeToolCall(toolName, args);
-    }
-  );
+  // Developer builds only: run an MCP tool from the MCP tab as an agent would (same tiers,
+  // read-only mode and approval modal). Packaged builds have no way for the window to call tools.
+  if (!app.isPackaged) {
+    ipcMain.handle('studio:dev-run-mcp-tool', async (_e, toolName: string, args?: Record<string, unknown>) =>
+      webringMcpServer.executeToolCall(String(toolName), args && typeof args === 'object' ? args : {}, {
+        enforcePolicy: true,
+      })
+    );
+  }
 }
 

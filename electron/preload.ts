@@ -145,8 +145,9 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.on('studio:mcp-approval-requested', listener);
     return () => ipcRenderer.removeListener('studio:mcp-approval-requested', listener);
   },
-  callMcpTool: (toolName: string, args?: Record<string, unknown>) =>
-    ipcRenderer.invoke('studio:call-mcp-tool', toolName, args),
+  // Development builds only (main registers it only when not packaged); goes through MCP policy
+  devRunMcpTool: (toolName: string, args?: Record<string, unknown>) =>
+    ipcRenderer.invoke('studio:dev-run-mcp-tool', toolName, args),
   onMcpActivity: (callback: (entry: unknown) => void) => {
     const listener = (_event: unknown, entry: unknown) => callback(entry);
     ipcRenderer.on('studio:mcp-activity', listener);

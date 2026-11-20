@@ -11,9 +11,11 @@ export interface McpHttpServerStatus {
   toolCount: number;
   resourceCount: number;
   promptCount: number;
-  /** URLs carrying the access token, for MCP clients that send an Origin header (e.g. Electron apps). */
-  authorizedEndpointUrl?: string;
-  authorizedSseUrl?: string;
+  /**
+   * The access token, sent as `Authorization: Bearer <token>` (never in a URL, where it would end
+   * up in logs and history). Left out of /mcp/health.
+   */
+  accessToken?: string;
 }
 
 export interface McpHttpServerOptions {
@@ -90,7 +92,26 @@ export class McpHttpServer {
       const srv = http.createServer(async (req, res) => {
         const urlObj = new URL(req.url || '/', `http://127.0.0.1:${this.port || 80}`);
         const origin = req.headers.origin;
-        const hasToken = this.hasValidToken(req, urlObj);
+        const hasToken = this.hasValidToken(req);
+
+        // A CORS preflight can't carry the Authorization header: answer it (it reveals nothing)
+        // so browser-context clients can send the real request, which still needs the token
+        if (req.method === 'OPTIONS' && origin !== undefined) {
+          const host = (req.headers.host || '').toLowerCase();
+          if (host !== `127.0.0.1:${this.port}` && host !== `localhost:${this.port}`) {
+            res.writeHead(403);
+            res.end();
+            return;
+          }
+          res.writeHead(204, {
+            'Access-Control-Allow-Origin': origin,
+            Vary: 'Origin',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
+          });
+          res.end();
+          return;
+        }
 
         // Loopback alone doesn't stop web pages open in the user's browser, so browser-style
         // traffic is refused unless it carries the access token (which pages can't know):
@@ -109,16 +130,11 @@ export class McpHttpServer {
           res.setHeader('Vary', 'Origin');
           res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
           res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
-          if (req.method === 'OPTIONS') {
-            res.writeHead(204);
-            res.end();
-            return;
-          }
         }
 
         // 1. Health & Metadata Check
         if (req.method === 'GET' && urlObj.pathname === '/mcp/health') {
-          const { authorizedEndpointUrl: _e, authorizedSseUrl: _s, ...publicStatus } = this.getStatus();
+          const { accessToken: _token, ...publicStatus } = this.getStatus();
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(publicStatus, null, 2));
           return;
@@ -131,9 +147,8 @@ export class McpHttpServer {
             'Cache-Control': 'no-cache',
             Connection: 'keep-alive',
           });
-          const messageUrl = `http://127.0.0.1:${this.port}/mcp/message${
-            hasToken ? `?token=${this.settings.token}` : ''
-          }`;
+          // The client sends its Authorization header with each message too
+          const messageUrl = `http://127.0.0.1:${this.port}/mcp/message`;
           res.write(`event: endpoint\ndata: ${messageUrl}\n\n`);
           this.sseClients.add(res);
           req.on('close', () => {
@@ -214,11 +229,11 @@ export class McpHttpServer {
   }
 
   /**
-   * Accepts the token as `?token=` (works for SSE URLs and CORS preflights) or `Authorization: Bearer`.
+   * The token comes only in `Authorization: Bearer <token>`. A `?token=` in the URL isn't
+   * accepted: URLs end up in logs, shell history and process lists.
    */
-  private hasValidToken(req: http.IncomingMessage, urlObj: URL): boolean {
-    const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1];
-    const supplied = urlObj.searchParams.get('token') || bearer || '';
+  private hasValidToken(req: http.IncomingMessage): boolean {
+    const supplied = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1]?.trim() || '';
     const expected = Buffer.from(this.settings.token);
     const given = Buffer.from(supplied);
     return given.length === expected.length && crypto.timingSafeEqual(given, expected);
@@ -238,8 +253,9 @@ export class McpHttpServer {
     }
     if (!hasToken) {
       return {
-        status: 403,
-        message: 'A valid access token is required (see the MCP tab in Webring Studio).',
+        status: 401,
+        message:
+          'A valid access token is required as "Authorization: Bearer <token>" (see the MCP tab in Webring Studio). Tokens in the URL are not accepted.',
       };
     }
     return null;
@@ -271,12 +287,7 @@ export class McpHttpServer {
       port: this.port,
       endpointUrl: running ? `http://127.0.0.1:${this.port}/mcp` : '',
       sseUrl: running ? `http://127.0.0.1:${this.port}/mcp/sse` : '',
-      authorizedEndpointUrl: running
-        ? `http://127.0.0.1:${this.port}/mcp?token=${this.settings.token}`
-        : '',
-      authorizedSseUrl: running
-        ? `http://127.0.0.1:${this.port}/mcp/sse?token=${this.settings.token}`
-        : '',
+      accessToken: running ? this.settings.token : '',
       toolCount: this.mcpServer.getTools().length,
       resourceCount: this.mcpServer.getResources().length,
       promptCount: this.mcpServer.getPrompts().length,

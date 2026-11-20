@@ -10,6 +10,7 @@ import { AutoPublisher } from '../electron/services/autoPublisher';
 import { runScheduledPublish } from '../electron/services/jobs';
 import { Scheduler } from '../electron/services/scheduler';
 import { checkExportFolder, EXPORT_MARKER, ExportFolderRefusedError } from '../electron/services/siteGenerator';
+import { LocalPreviewServer } from '../electron/services/localPreviewServer';
 import { runWithoutNetwork } from '../electron/security/networkPolicy';
 import { requestPublicJson } from '../electron/services/ringCrawler';
 import { EXPECTED_TOOL_TIERS } from './mcpToolTiers.expected';
@@ -588,6 +589,60 @@ describe('Security Phase 7: the export folder', () => {
       expect(checkExportFolder(path.join(dir, 'empty')).ok).toBe(true);
     } finally {
       manager.closeAll();
+    }
+  });
+});
+
+describe('Security Phase 7: renderer boundary and MCP token', () => {
+  const root = path.join(__dirname, '..');
+  const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
+
+  it('gives the window no way to call MCP tools in packaged builds', () => {
+    const preload = read('electron/preload.ts');
+    expect(preload).not.toMatch(/callMcpTool|studio:call-mcp-tool/);
+    const main = read('electron/main.ts');
+    expect(main).not.toContain("'studio:call-mcp-tool'");
+    // The developer runner is registered only when not packaged, and goes through agent policy
+    expect(main).toMatch(/if \(!app\.isPackaged\) \{\s*ipcMain\.handle\('studio:dev-run-mcp-tool'[\s\S]{0,300}enforcePolicy: true/);
+  });
+
+  it('ships a strict CSP in index.html, relaxed only by the dev server', () => {
+    const html = read('index.html');
+    const csp = /http-equiv="Content-Security-Policy" content="([^"]+)"/.exec(html)?.[1] || '';
+    expect(csp).toContain("script-src 'self';");
+    expect(csp).not.toMatch(/unsafe-eval/);
+    expect(csp.split(';').find((d) => d.trim().startsWith('script-src'))).not.toContain('unsafe-inline');
+    for (const directive of ["object-src 'none'", "base-uri 'none'", "form-action 'none'", 'frame-src http://127.0.0.1:*']) {
+      expect(csp).toContain(directive);
+    }
+    const vite = read('vite.config.ts');
+    expect(vite).toMatch(/apply: 'serve'/);
+    // A build in this checkout keeps it (checked when dist exists)
+    if (fs.existsSync(path.join(root, 'dist/index.html'))) {
+      expect(read('dist/index.html')).toContain(`content="${csp}"`);
+    }
+  });
+
+  it('takes no paths from the window for exports or syncing a friend', () => {
+    const main = read('electron/main.ts');
+    const exportHandler = main.slice(main.indexOf("ipcMain.handle('studio:export-local'"), main.indexOf("ipcMain.handle('studio:export-local'") + 900);
+    expect(exportHandler).toContain("publishTo(ctx, 'local', publishPaths())");
+    expect(exportHandler).not.toMatch(/targetDir/);
+    const crawl = main.slice(main.indexOf("ipcMain.handle('studio:crawl-friend'"), main.indexOf("ipcMain.handle('studio:crawl-friend'") + 400);
+    expect(crawl).toMatch(/!app\.isPackaged && typeof localDirOverride === 'string'/);
+  });
+
+  it('serves the live preview from loopback, so it never runs inside the strict window CSP', async () => {
+    const server = new LocalPreviewServer();
+    try {
+      const url = await server.serveLivePreview('<!doctype html><p>live preview</p>');
+      expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/__studio-live-preview\?v=1$/);
+      const res = await fetch(url);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('live preview');
+      expect(await server.serveLivePreview('<p>again</p>')).toMatch(/\?v=2$/);
+    } finally {
+      await server.stop();
     }
   });
 });

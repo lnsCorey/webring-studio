@@ -3,6 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Strict in every build; vite.config.ts relaxes it only on the dev server (Vite needs inline scripts and a websocket) -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: studio-media:; media-src 'self' studio-media:; font-src 'self' data:; connect-src 'self'; frame-src http://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'none'" />
     <title>Webring Studio — Decentralized Profile & Ring Manager</title>
     <link rel="icon" type="image/png" href="./favicon.png" />
   </head>
