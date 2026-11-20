@@ -5,7 +5,8 @@ import { AlertTriangle, Info, ShieldAlert, X } from 'lucide-react';
 export interface SecurityStatusView {
   keyVaultAvailable: boolean;
   proxyUnavailable: boolean;
-  agentChangesHeld: boolean;
+  /** How many agent changes wait for review (0 when none). */
+  agentChangesHeld: number;
 }
 
 export interface SecurityBannerProps {
@@ -121,6 +122,65 @@ export function PlaintextConsentDialog(props: { secretLabel: string; onAnswer: (
             className="px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold"
           >
             Store unencrypted
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A yes/no question for a safeguard (turning one off, releasing held changes). Cancel is focused,
+ * Escape cancels, and Enter doesn't confirm: only clicking the confirm button does.
+ */
+export function ConfirmDialog(props: {
+  title: string;
+  message: React.ReactNode;
+  confirmLabel: string;
+  cancelLabel?: string;
+  tone?: 'warning' | 'danger';
+  onAnswer: (confirmed: boolean) => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    cancelRef.current?.focus();
+  }, []);
+  const confirmClass = props.tone === 'danger' ? 'bg-rose-600 hover:bg-rose-500' : 'bg-amber-600 hover:bg-amber-500';
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') props.onAnswer(false);
+      }}
+    >
+      <div
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        className="bg-slate-900 border border-amber-500/40 rounded-2xl p-6 w-full max-w-md space-y-4"
+      >
+        <h2 id="confirm-dialog-title" className="font-bold text-base flex items-center gap-2">
+          <AlertTriangle className="w-5 h-5 text-amber-300" /> {props.title}
+        </h2>
+        <div className="text-sm text-slate-300 space-y-2">{props.message}</div>
+        <div className="flex justify-end gap-2">
+          <button
+            ref={cancelRef}
+            type="button"
+            onClick={() => props.onAnswer(false)}
+            className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold"
+          >
+            {props.cancelLabel || 'Cancel'}
+          </button>
+          <button
+            type="button"
+            onClick={() => props.onAnswer(true)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.preventDefault();
+            }}
+            className={`px-3 py-2 rounded-lg text-white text-xs font-semibold ${confirmClass}`}
+          >
+            {props.confirmLabel}
           </button>
         </div>
       </div>

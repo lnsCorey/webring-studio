@@ -30,7 +30,9 @@ import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
 import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
 import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
-import { PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
+import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
+import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
+import { HeldAgentChangeView, HeldChangesPanel } from './HeldChangesPanel';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -231,9 +233,15 @@ type SchedulePreset =
   | { kind: 'daily'; time: string }
   | { kind: 'weekly'; weekday: number; time: string };
 
+/** A manual publish while agent changes are held goes ahead only with this (after the user confirms). */
+interface PublishHeldOptions {
+  includeAgentChanges?: boolean;
+}
+
 interface ScheduleJobResult {
   at: string;
-  status: 'ok' | 'skipped' | 'failed';
+  /** held: not published because an agent's changes wait for review. */
+  status: 'ok' | 'skipped' | 'failed' | 'held';
   message: string;
 }
 
@@ -334,6 +342,29 @@ function imageErrorText(err: unknown): string {
   const text = (err instanceof Error ? err.message : String(err)).replace(/^Error invoking remote method '[^']+': (\w*Error: )?/, '');
   return text || "This image is too large or couldn't be processed.";
 }
+
+/** The live MCP connection config: the token goes in a header, never the URL. */
+function mcpLiveConfig(status: { endpointUrl?: string; accessToken?: string } | undefined, withToken: boolean): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        'webring-studio-live': {
+          type: 'http',
+          url: status?.endpointUrl || 'http://127.0.0.1:<port>/mcp',
+          headers: {
+            Authorization: `Bearer ${withToken && status?.accessToken ? status.accessToken : '<your access token>'}`,
+          },
+        },
+      },
+    },
+    null,
+    2
+  );
+}
+
+/** Shown with the "Allow agents to read private data" toggle and its confirmation. */
+const PRIVATE_DATA_EXPLANATION =
+  'Includes private friends, saved posts and private profile fields. Content from friends’ posts can contain instructions aimed at your agent; only enable this for agents you trust.';
 
 /** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
 function mediaSrc(url: string): string {
@@ -447,7 +478,8 @@ declare global {
         joinedRings: JoinedRing[];
         hostedRings: HostedRing[];
         publishedUpToDate: boolean;
-        previewHtml: string;
+        /** The live preview page, served from the loopback preview server. */
+        previewUrl?: string;
         savedPosts?: SavedPostView[];
         feedRetentionDays?: number;
         friendNotices?: FriendNoticeView[];
@@ -489,6 +521,9 @@ declare global {
       }>;
       updateProfile: (updates: unknown, options?: { allowPlaintext?: boolean }) => Promise<unknown>;
       getSecurityStatus?: () => Promise<SecurityStatusView>;
+      getAgentChanges?: () => Promise<HeldAgentChangeView[]>;
+      releaseAgentChanges?: () => Promise<unknown>;
+      onShowAutoPublish?: (cb: () => void) => () => void;
       onSecurityStatusChanged?: (cb: (status: SecurityStatusView) => void) => () => void;
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
@@ -588,11 +623,14 @@ declare global {
         personaId: string,
         job: 'sync' | 'publish'
       ) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
-      autoPublishNow?: (personaId: string) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
+      autoPublishNow?: (
+        personaId: string,
+        options?: PublishHeldOptions
+      ) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
       autoPublishCancel?: (personaId: string) => Promise<ScheduleOverview>;
       onScheduleUpdated?: (cb: () => void) => () => void;
       chooseExportFolder: () => Promise<string | null>;
-      exportLocal: (targetDir?: string) => Promise<{
+      exportLocal: (targetDir?: string, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
         filesPublished: number;
@@ -601,13 +639,13 @@ declare global {
       testExportPreview: (openInBrowser?: boolean) => Promise<TestExportPreviewState>;
       openExternal: (url: string) => Promise<unknown>;
       openMedia: (url: string) => Promise<{ ok: boolean }>;
-      publishRemote: (settings: unknown) => Promise<{
+      publishRemote: (settings: unknown, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
         filesPublished: number;
         message: string;
       }>;
-      publishGithub: (settings: unknown) => Promise<{
+      publishGithub: (settings: unknown, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
         filesPublished: number;
@@ -622,7 +660,7 @@ declare global {
       ) => ReturnType<SetupApi['githubLoginPoll']>;
       githubConnectToken?: (token: string, options?: { allowPlaintext?: boolean }) => ReturnType<SetupApi['githubConnectToken']>;
       setupConfigureSite?: SetupApi['setupConfigureSite'];
-      setupPublish?: SetupApi['setupPublish'];
+      setupPublish?: (options?: PublishHeldOptions) => ReturnType<SetupApi['setupPublish']>;
       setupCheckLive?: SetupApi['setupCheckLive'];
       setupDismiss?: SetupApi['setupDismiss'];
       checkGithubRepo: (settings: unknown) => Promise<{
@@ -641,8 +679,7 @@ declare global {
           port: number;
           endpointUrl: string;
           sseUrl: string;
-          authorizedEndpointUrl?: string;
-          authorizedSseUrl?: string;
+          accessToken?: string;
           toolCount: number;
           resourceCount: number;
           promptCount: number;
@@ -674,21 +711,20 @@ declare global {
           success: boolean;
         }>;
         readOnlyMode?: boolean;
-        pendingApprovals?: Array<{
-          id: string;
-          toolName: string;
-          tier: string;
-          args: Record<string, unknown>;
-          requestedAt: string;
-          status: string;
-        }>;
+        allowPrivateData?: boolean;
+        devTools?: boolean;
+        pendingApprovals?: McpApprovalView[];
+        approvalHistory?: McpApprovalView[];
       }>;
       setMcpReadOnly?: (enabled: boolean) => Promise<{ readOnlyMode: boolean }>;
+      setMcpPrivateData?: (enabled: boolean) => Promise<{ allowPrivateData: boolean }>;
       resolveMcpApproval?: (
         id: string,
         approved: boolean
-      ) => Promise<{ ok: boolean; approval?: unknown; result?: unknown }>;
-      callMcpTool?: (
+      ) => Promise<{ ok: boolean; approval?: unknown; result?: unknown; error?: string }>;
+      denyAllMcpApprovals?: () => Promise<{ denied: number }>;
+      onMcpApprovalRequested?: (cb: (approval: McpApprovalView) => void) => () => void;
+      devRunMcpTool?: (
         toolName: string,
         args?: Record<string, unknown>
       ) => Promise<{
@@ -790,7 +826,7 @@ export const App: React.FC = () => {
   const [bannerUrl, setBannerUrl] = useState('');
   const [interestsInput, setInterestsInput] = useState('');
   const [theme, setTheme] = useState<ProfileTheme>('neo-webring');
-  const [previewHtml, setPreviewHtml] = useState('');
+  const [livePreviewUrl, setLivePreviewUrl] = useState('');
   const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
   const [atprotoHandle, setAtprotoHandle] = useState('');
   const [customLinks, setCustomLinks] = useState<Array<{ label: string; url: string }>>([]);
@@ -937,8 +973,7 @@ export const App: React.FC = () => {
       port: number;
       endpointUrl: string;
       sseUrl: string;
-      authorizedEndpointUrl?: string;
-      authorizedSseUrl?: string;
+      accessToken?: string;
       toolCount: number;
       resourceCount: number;
       promptCount: number;
@@ -958,14 +993,10 @@ export const App: React.FC = () => {
       success: boolean;
     }>;
     readOnlyMode?: boolean;
-    pendingApprovals?: Array<{
-      id: string;
-      toolName: string;
-      tier: string;
-      args: Record<string, unknown>;
-      requestedAt: string;
-      status: string;
-    }>;
+    allowPrivateData?: boolean;
+    devTools?: boolean;
+    pendingApprovals?: McpApprovalView[];
+    approvalHistory?: McpApprovalView[];
   } | null>(null);
   const [selectedMcpTool, setSelectedMcpTool] = useState<string>('webring_list_personas');
   const [mcpToolArgsJson, setMcpToolArgsJson] = useState<string>('{}');
@@ -997,7 +1028,7 @@ export const App: React.FC = () => {
   const [securityStatus, setSecurityStatus] = useState<SecurityStatusView>({
     keyVaultAvailable: true,
     proxyUnavailable: false,
-    agentChangesHeld: false,
+    agentChangesHeld: 0,
   });
   const [vaultBannerDismissed, setVaultBannerDismissed] = useState(false);
   const refreshSecurityStatus = async () => {
@@ -1013,6 +1044,116 @@ export const App: React.FC = () => {
   const [consentRequest, setConsentRequest] = useState<{ label: string; resolve: (allow: boolean) => void } | null>(null);
   const askConsent = (label: string) =>
     new Promise<boolean>((resolve) => setConsentRequest({ label, resolve }));
+
+  // Yes/no questions for safeguards (ConfirmDialog)
+  const [confirmRequest, setConfirmRequest] = useState<{
+    title: string;
+    message: React.ReactNode;
+    confirmLabel: string;
+    tone?: 'warning' | 'danger';
+    resolve: (confirmed: boolean) => void;
+  } | null>(null);
+  // Agent requests waiting for approval: the modal opens when one arrives
+  const [approvalModalOpen, setApprovalModalOpen] = useState(false);
+  const [approvalFocusId, setApprovalFocusId] = useState<string | null>(null);
+  const reloadMcpInfo = async () => {
+    const info = await window.studioApi?.getMcpInfo?.().catch(() => undefined);
+    if (info) setMcpInfo(info);
+    return info;
+  };
+  useEffect(() => {
+    void reloadMcpInfo();
+    return window.studioApi?.onMcpApprovalRequested?.(() => {
+      void reloadMcpInfo().then(() => setApprovalModalOpen(true));
+    });
+  }, []);
+  const resolveApproval = async (item: McpApprovalView, approved: boolean) => {
+    const res = await window.studioApi?.resolveMcpApproval?.(item.id, approved);
+    const info = await reloadMcpInfo();
+    if (!info?.pendingApprovals?.length) setApprovalModalOpen(false);
+    setApprovalFocusId(null);
+    if (!res?.ok) {
+      notify(res?.error || 'That request is no longer waiting.');
+      return;
+    }
+    if (approved) await refreshStudioData();
+    notify(`${approved ? 'Approved' : 'Denied'}: ${item.summary}`);
+  };
+  const denyAllApprovals = async () => {
+    const res = await window.studioApi?.denyAllMcpApprovals?.();
+    await reloadMcpInfo();
+    setApprovalModalOpen(false);
+    notify(`Denied ${res?.denied ?? 0} agent request(s).`);
+  };
+
+  // Agent changes held from publishing until the user reviews them
+  const [heldChanges, setHeldChanges] = useState<HeldAgentChangeView[]>([]);
+  const [heldPanelOpen, setHeldPanelOpen] = useState(true);
+  useEffect(() => {
+    void window.studioApi?.getAgentChanges?.().then((list) => setHeldChanges(list || []), () => setHeldChanges([]));
+    if (securityStatus.agentChangesHeld > 0) setHeldPanelOpen(true);
+  }, [securityStatus.agentChangesHeld, activePersonaId]);
+  const showHeldChanges = () => {
+    setHeldPanelOpen(true);
+    setActiveTab('publish');
+    setTimeout(
+      () => document.getElementById('held-changes-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+      100
+    );
+  };
+  useEffect(
+    () =>
+      window.studioApi?.onShowAutoPublish?.(() => {
+        setActiveTab('publish');
+        setTimeout(
+          () => document.getElementById('auto-publish-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+          100
+        );
+      }),
+    []
+  );
+  /**
+   * Before a manual publish: while agent changes are held, ask whether to publish them too.
+   * Returns null when the user cancels; otherwise the options for the publish call.
+   */
+  const confirmPublishWithHeldChanges = async (): Promise<{ includeAgentChanges?: boolean } | null> => {
+    const list = (await window.studioApi?.getAgentChanges?.().catch(() => [])) || [];
+    if (!list.length) return {};
+    const confirmed = await askConfirm({
+      title: 'Publish including agent changes?',
+      message: (
+        <>
+          <p>An agent made these changes, which haven't been reviewed. Publishing now puts them on your site:</p>
+          <ul className="list-disc list-inside text-xs text-slate-200 space-y-0.5 max-h-40 overflow-y-auto">
+            {list.map((change, i) => (
+              <li key={`${change.at}-${i}`}>{change.summary}</li>
+            ))}
+          </ul>
+        </>
+      ),
+      confirmLabel: 'Publish including agent changes',
+    });
+    return confirmed ? { includeAgentChanges: true } : null;
+  };
+  const releaseHeldChanges = async () => {
+    const confirmed = await askConfirm({
+      title: 'Release these changes for publishing?',
+      message: 'These changes will be published with your next publish.',
+      confirmLabel: 'Release for publishing',
+    });
+    if (!confirmed) return;
+    await window.studioApi?.releaseAgentChanges?.();
+    await refreshSecurityStatus();
+    setHeldChanges([]);
+    notify('Agent changes released. They go out with your next publish.');
+  };
+
+  const askConfirm = (request: {
+    title: string;
+    message: React.ReactNode;
+    confirmLabel: string;
+    tone?: 'warning' | 'danger';
+  }) => new Promise<boolean>((resolve) => setConfirmRequest({ ...request, resolve }));
 
   /**
    * Saves profile changes. A newly typed password or token needs the user's consent when the
@@ -1081,7 +1222,14 @@ export const App: React.FC = () => {
             return window.studioApi!.githubConnectToken!(token, allowPlaintext ? { allowPlaintext } : undefined);
           },
           setupConfigureSite: window.studioApi.setupConfigureSite,
-          setupPublish: window.studioApi.setupPublish,
+          // Guided setup's publish asks about held agent changes like any manual publish
+          setupPublish: async () => {
+            const options = await confirmPublishWithHeldChanges();
+            if (!options) return { success: false, message: 'Publish cancelled: agent changes are waiting for your review.' };
+            const res = await window.studioApi!.setupPublish!(options);
+            void refreshSecurityStatus();
+            return res;
+          },
           setupCheckLive: window.studioApi.setupCheckLive,
           setupDismiss: window.studioApi.setupDismiss,
           openExternal: window.studioApi.openExternal,
@@ -1151,7 +1299,7 @@ export const App: React.FC = () => {
     setBannerUrl(p.bannerUrl);
     setInterestsInput((p.interests || []).join(', '));
     setTheme(p.theme);
-    setPreviewHtml(data.previewHtml || '');
+    setLivePreviewUrl(data.previewUrl || '');
     setAtprotoHandle(p.atprotoHandle || '');
     setCustomLinks((p.customLinks || []).map((l) => ({ label: l.label, url: l.url })));
     if (p.publishSettings) {
@@ -2124,8 +2272,11 @@ export const App: React.FC = () => {
 
   const handleAutoPublishNow = async () => {
     if (!window.studioApi?.autoPublishNow) return;
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
     notify('Publishing now...');
-    const { result, overview } = await window.studioApi.autoPublishNow(activePersonaId);
+    const { result, overview } = await window.studioApi.autoPublishNow(activePersonaId, options);
+    void refreshSecurityStatus();
     setScheduleOverview(overview);
     await refreshStudioData();
     notify(result.message);
@@ -2138,6 +2289,18 @@ export const App: React.FC = () => {
   };
 
   const renderAutoPublishPill = () => {
+    if (securityStatus.agentChangesHeld > 0) {
+      return (
+        <button
+          type="button"
+          onClick={showHeldChanges}
+          className="w-full text-left text-xs px-3 py-1.5 rounded-full bg-amber-500/15 text-amber-200 border border-amber-500/40 hover:bg-amber-500/25"
+          title="An agent's changes won't be published until you review them"
+        >
+          Held — agent changes need review
+        </button>
+      );
+    }
     if (!autoPublishStatus) return null;
     if (autoPublishStatus.state === 'pending' && autoPublishStatus.dueAt) {
       return (
@@ -2241,13 +2404,17 @@ export const App: React.FC = () => {
           className={
             job.lastResult.status === 'failed'
               ? 'text-rose-300'
-              : job.lastResult.status === 'skipped'
+              : job.lastResult.status === 'held'
+                ? 'text-amber-300'
+                : job.lastResult.status === 'skipped'
                 ? 'text-slate-400'
                 : 'text-emerald-300'
           }
           title={job.lastResult.at}
         >
-          Last run {formatRelativeTime(job.lastResult.at)}: {job.lastResult.message}
+          {job.lastResult.status === 'held'
+            ? 'Last run: skipped (agent changes held)'
+            : `Last run ${formatRelativeTime(job.lastResult.at)}: ${job.lastResult.message}`}
         </div>
       )}
     </div>
@@ -2255,7 +2422,10 @@ export const App: React.FC = () => {
 
   const handleExportLocalSite = async () => {
     if (!window.studioApi) return;
-    const res = await window.studioApi.exportLocal(publishSettings.exportPath || undefined);
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
+    const res = await window.studioApi.exportLocal(undefined, options);
+    void refreshSecurityStatus();
     await refreshStudioData();
     notify(res.message);
   };
@@ -2275,11 +2445,11 @@ export const App: React.FC = () => {
 
   const handleChooseExportFolder = async () => {
     if (!window.studioApi) return;
+    // Main checks the folder (empty, or one Studio exported to) and saves it
     const chosen = await window.studioApi.chooseExportFolder();
     if (chosen) {
-      const nextSettings = { ...publishSettings, exportPath: chosen };
-      setPublishSettings(nextSettings);
-      await saveProfile({ publishSettings: nextSettings });
+      setPublishSettings((prev) => ({ ...prev, exportPath: chosen }));
+      await refreshStudioData();
       notify(`Saved local export folder: ${chosen}`);
     }
   };
@@ -2321,8 +2491,11 @@ export const App: React.FC = () => {
     e.preventDefault();
     if (!window.studioApi) return;
     await saveProfile({ publishSettings });
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
     notify(`Saved settings & connecting to ${publishSettings.protocol.toUpperCase()} host ${publishSettings.host}...`);
-    const res = await window.studioApi.publishRemote(publishSettings);
+    const res = await window.studioApi.publishRemote(publishSettings, options);
+    void refreshSecurityStatus();
     await refreshStudioData();
     notify(res.message);
   };
@@ -2374,10 +2547,13 @@ export const App: React.FC = () => {
     e.preventDefault();
     if (!window.studioApi) return;
     await saveProfile({ publishSettings });
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
     notify(`Saved settings & deploying to github.com/${publishSettings.githubOwner}/${publishSettings.githubRepo}...`);
     setGithubDeploying(true);
     try {
-      const res = await window.studioApi.publishGithub(publishSettings);
+      const res = await window.studioApi.publishGithub(publishSettings, options);
+      void refreshSecurityStatus();
       await refreshStudioData();
       notify(res.message);
     } finally {
@@ -2568,6 +2744,7 @@ export const App: React.FC = () => {
       label: 'AI Agent (MCP)',
       icon: <Sparkles className="w-4 h-4" />,
       badge: mcpInfo?.status.toolCount || 24,
+      alert: mcpInfo?.pendingApprovals?.length ? `${mcpInfo.pendingApprovals.length} waiting for approval` : undefined,
     },
     { id: 'help', label: 'Help & Deploy Guide', icon: <BookOpen className="w-4 h-4" /> },
   ];
@@ -2818,6 +2995,17 @@ export const App: React.FC = () => {
                 },
               },
             ]}
+          />
+        )}
+        {securityStatus.agentChangesHeld > 0 && (
+          <SecurityBanner
+            severity="warning"
+            title="Agent changes held."
+            message={`An agent made ${securityStatus.agentChangesHeld} change${
+              securityStatus.agentChangesHeld === 1 ? '' : 's'
+            } that won't be published until you review them.`}
+            actions={[{ label: 'Review', onClick: showHeldChanges }]}
+            dismissible={false}
           />
         )}
         {!securityStatus.keyVaultAvailable && !vaultBannerDismissed && (
@@ -5687,7 +5875,7 @@ export const App: React.FC = () => {
                 ) : (
                   <iframe
                     ref={previewFrameRef}
-                    srcDoc={previewHtml}
+                    src={livePreviewUrl || 'about:blank'}
                     sandbox="allow-scripts"
                     allow="fullscreen"
                     title="Site preview"
@@ -5961,7 +6149,15 @@ export const App: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                  {heldPanelOpen && (
+                    <HeldChangesPanel
+                      changes={heldChanges}
+                      onPreview={() => setActiveTab('preview')}
+                      onRelease={releaseHeldChanges}
+                      onKeepHolding={() => setHeldPanelOpen(false)}
+                    />
+                  )}
+                  <div id="auto-publish-card" className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
                     <label className="flex items-center gap-2 text-sm font-semibold">
                       <input
                         type="checkbox"
@@ -6217,18 +6413,18 @@ export const App: React.FC = () => {
                   <input
                     type="text"
                     value={publishSettings.exportPath}
-                    onChange={(e) =>
-                      setPublishSettings((prev) => ({ ...prev, exportPath: e.target.value }))
-                    }
+                    readOnly
+                    aria-label="Export folder"
+                    title="Change it with Change folder…"
                     placeholder="Default: AppData/webring-studio/exported-profile-site"
-                    className="flex-1 px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    className="flex-1 px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono text-slate-300"
                   />
                   <button
                     type="button"
                     onClick={handleChooseExportFolder}
                     className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium"
                   >
-                    Choose Folder...
+                    Change folder…
                   </button>
                 </div>
 
@@ -7054,6 +7250,13 @@ export const App: React.FC = () => {
                       >
                         {mcpInfo?.readOnlyMode !== false ? 'Read-Only' : 'Writes Allowed'}
                       </span>
+                      <span
+                        className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${
+                          mcpInfo?.allowPrivateData ? 'bg-amber-500/20 text-amber-300' : 'bg-slate-700/60 text-slate-300'
+                        }`}
+                      >
+                        {mcpInfo?.allowPrivateData ? 'Private data: visible to agents' : 'Private data: hidden'}
+                      </span>
                     </h3>
                     <p className="text-xs text-slate-400 mt-1">
                       Read-Only mode blocks external MCP writes by default. When writes are allowed,
@@ -7080,60 +7283,47 @@ export const App: React.FC = () => {
                   </button>
                 </div>
 
-                {(mcpInfo?.pendingApprovals?.length || 0) > 0 && (
-                  <div className="border-t border-slate-800 pt-3 space-y-2">
-                    <div className="text-xs font-bold text-amber-300">
-                      Pending Confirmations ({mcpInfo?.pendingApprovals?.length})
-                    </div>
-                    <div className="space-y-2">
-                      {mcpInfo?.pendingApprovals?.map((item) => (
-                        <div
-                          key={item.id}
-                          className="p-3 rounded-xl bg-slate-950 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3"
-                        >
-                          <div className="min-w-0 flex-1">
-                            <div className="text-xs font-mono font-bold text-white">
-                              {item.toolName}{' '}
-                              <span className="text-[10px] font-normal text-amber-300">
-                                ({item.tier})
-                              </span>
-                            </div>
-                            <pre className="text-[11px] text-slate-400 mt-1 overflow-x-auto max-h-24">
-                              {JSON.stringify(item.args, null, 2)}
-                            </pre>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                await window.studioApi?.resolveMcpApproval?.(item.id, true);
-                                const info = await window.studioApi?.getMcpInfo?.();
-                                if (info) setMcpInfo(info);
-                                await refreshStudioData();
-                                notify(`Approved and ran ${item.toolName}.`);
-                              }}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
-                            >
-                              Approve &amp; Run
-                            </button>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                await window.studioApi?.resolveMcpApproval?.(item.id, false);
-                                const info = await window.studioApi?.getMcpInfo?.();
-                                if (info) setMcpInfo(info);
-                                notify(`Denied ${item.toolName}.`);
-                              }}
-                              className="px-3 py-1.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 border border-rose-500/40 text-rose-200 text-xs font-semibold"
-                            >
-                              Deny
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                <div className="border-t border-slate-800 pt-3">
+                  <label className="flex items-start gap-2 text-xs text-slate-200 max-w-2xl">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(mcpInfo?.allowPrivateData)}
+                      onChange={async (e) => {
+                        const next = e.target.checked;
+                        // Turning it on is a decision; turning it off needs no confirmation
+                        if (
+                          next &&
+                          !(await askConfirm({
+                            title: 'Allow agents to read private data?',
+                            message: PRIVATE_DATA_EXPLANATION,
+                            confirmLabel: 'Allow',
+                          }))
+                        ) {
+                          return;
+                        }
+                        await window.studioApi?.setMcpPrivateData?.(next);
+                        const info = await window.studioApi?.getMcpInfo?.();
+                        if (info) setMcpInfo(info);
+                        notify(next ? 'Agents can now read private data.' : 'Private data is hidden from agents again.');
+                      }}
+                      className="accent-amber-500 mt-0.5"
+                    />
+                    <span>
+                      <span className="font-semibold">Allow agents to read private data</span>
+                      <span className="block text-slate-400 mt-0.5">{PRIVATE_DATA_EXPLANATION}</span>
+                    </span>
+                  </label>
+                </div>
+
+                <McpApprovalPanel
+                  pending={mcpInfo?.pendingApprovals || []}
+                  history={mcpInfo?.approvalHistory || []}
+                  onReview={(item) => {
+                    setApprovalFocusId(item.id);
+                    setApprovalModalOpen(true);
+                  }}
+                  onResolve={resolveApproval}
+                />
               </div>
 
               {/* Dual Transport Configuration Cards */}
@@ -7216,97 +7406,72 @@ export const App: React.FC = () => {
                     <button
                       type="button"
                       onClick={() => {
-                        const snippet = JSON.stringify(
-                          {
-                            mcpServers: {
-                              'webring-studio-live': {
-                                url:
-                                  mcpInfo?.status.authorizedEndpointUrl ||
-                                  'http://127.0.0.1:<port>/mcp?token=<token>',
-                              },
-                            },
-                          },
-                          null,
-                          2
-                        );
-                        navigator.clipboard.writeText(snippet);
-                        notify('Copied Live HTTP MCP configuration to clipboard!');
+                        navigator.clipboard.writeText(mcpLiveConfig(mcpInfo?.status, true));
+                        notify('Copied the MCP configuration (with your access token) to the clipboard.');
                       }}
                       className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5"
                     >
-                      <Copy className="w-3.5 h-3.5" /> Copy URL Config
+                      <Copy className="w-3.5 h-3.5" /> Copy config
                     </button>
                   </div>
                   <p className="text-xs text-slate-400">
                     Connects directly to this running Studio window on <code>127.0.0.1</code>. Any
                     posts, comments, persona switches, or crawls performed by your agent update this
-                    UI in real time! The port stays the same across restarts. Use the URLs below,
-                    which include your access token: clients running inside a browser or Electron
-                    window (anything that sends an <code>Origin</code> header) are refused without
-                    it, so web pages can't control Studio. Treat the token like a password.
+                    UI in real time! The port stays the same across restarts. Every request must send
+                    your access token in an <code>Authorization: Bearer</code> header; a token in the
+                    URL isn't accepted (URLs end up in logs and history). Treat the token like a
+                    password.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={() => {
-                        if (!mcpInfo?.status.authorizedSseUrl) return;
-                        navigator.clipboard.writeText(mcpInfo.status.authorizedSseUrl);
-                        notify('Copied SSE URL (with access token) to clipboard!');
+                        if (!mcpInfo?.status.endpointUrl || !mcpInfo.status.accessToken) return;
+                        navigator.clipboard.writeText(
+                          `claude mcp add --transport http webring-studio ${mcpInfo.status.endpointUrl} --header "Authorization: Bearer ${mcpInfo.status.accessToken}"`
+                        );
+                        notify('Copied the Claude Code command (with your access token) to the clipboard.');
                       }}
                       className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5"
                     >
-                      <Copy className="w-3.5 h-3.5" /> Copy SSE URL
+                      <Copy className="w-3.5 h-3.5" /> Copy Claude Code command
                     </button>
                     <button
                       type="button"
                       onClick={() => {
-                        if (!mcpInfo?.status.authorizedEndpointUrl) return;
-                        navigator.clipboard.writeText(mcpInfo.status.authorizedEndpointUrl);
-                        notify('Copied HTTP URL (with access token) to clipboard!');
+                        if (!mcpInfo?.status.accessToken) return;
+                        navigator.clipboard.writeText(mcpInfo.status.accessToken);
+                        notify('Copied the access token to the clipboard.');
                       }}
                       className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5"
                     >
-                      <Copy className="w-3.5 h-3.5" /> Copy HTTP URL
+                      <Copy className="w-3.5 h-3.5" /> Copy access token
                     </button>
                   </div>
                   <pre className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-[11px] font-mono text-indigo-300 overflow-x-auto">
-                    {JSON.stringify(
-                      {
-                        mcpServers: {
-                          'webring-studio-live': {
-                            url:
-                              mcpInfo?.status.authorizedEndpointUrl ||
-                              'http://127.0.0.1:<port>/mcp?token=<token>',
-                            sseUrl:
-                              mcpInfo?.status.authorizedSseUrl ||
-                              'http://127.0.0.1:<port>/mcp/sse?token=<token>',
-                          },
-                        },
-                      },
-                      null,
-                      2
-                    )}
+                    {mcpLiveConfig(mcpInfo?.status, false)}
                   </pre>
                 </div>
               </div>
 
-              {/* Interactive MCP Tool Tester & One-Click Automation Runner */}
+              {/* Developer tools: dev builds only, and through the same MCP policy as an agent */}
+              {mcpInfo?.devTools && (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="font-bold text-lg">
-                      Interactive MCP Tool Console ({mcpInfo?.tools.length || 21} Tools Available)
+                      Developer tools (dev builds only): MCP Tool Console ({mcpInfo?.tools.length || 21} tools)
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Test any MCP tool directly against your active persona or trigger a 1-click
-                      agent workflow below.
+                      Runs tools as an agent would: the same tiers, read-only mode and approval
+                      prompts. This console isn't in packaged builds.
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await window.studioApi?.callMcpTool?.(
+                        const res = await window.studioApi?.devRunMcpTool?.(
                           'webring_create_post',
                           {
                             commentary:
@@ -7327,7 +7492,7 @@ export const App: React.FC = () => {
                     <button
                       type="button"
                       onClick={async () => {
-                        const res = await window.studioApi?.callMcpTool?.(
+                        const res = await window.studioApi?.devRunMcpTool?.(
                           'webring_crawl_all_friends',
                           {}
                         );
@@ -7444,7 +7609,7 @@ export const App: React.FC = () => {
                       onClick={async () => {
                         try {
                           const parsedArgs = JSON.parse(mcpToolArgsJson || '{}');
-                          const res = await window.studioApi?.callMcpTool?.(
+                          const res = await window.studioApi?.devRunMcpTool?.(
                             selectedMcpTool,
                             parsedArgs
                           );
@@ -7478,6 +7643,7 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               </div>
+              )}
 
               {/* Example Natural-Language Prompts & Live Agent Activity Log */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -8479,10 +8645,10 @@ git push -u origin main --force`}
                         <p className="text-xs text-slate-400 leading-relaxed">
                           Every route on the loopback MCP server (<code>/mcp</code>,{' '}
                           <code>/mcp/message</code>, <code>/mcp/sse</code>, and{' '}
-                          <code>/mcp/health</code>) requires your <strong>access token</strong>{' '}
-                          (<code>?token=…</code> or <code>Authorization: Bearer</code>),
-                          regardless of whether an <code>Origin</code> header is sent. Web pages are
-                          always refused.
+                          <code>/mcp/health</code>) requires your <strong>access token</strong> in an{' '}
+                          <code>Authorization: Bearer</code> header, whether or not an{' '}
+                          <code>Origin</code> header is sent. A token in the URL isn&apos;t accepted. Web
+                          pages are always refused.
                         </p>
                       </div>
                     </div>
@@ -8490,23 +8656,24 @@ git push -u origin main --force`}
                     {/* Electron / browser-based client setup */}
                     <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-500/30 space-y-2">
                       <h4 className="font-bold text-sm text-emerald-300">
-                        Connecting an Electron or browser-based MCP client (SSE)
+                        Connecting a client to the live app (HTTP)
                       </h4>
                       <ol className="text-xs text-slate-300 list-decimal list-inside space-y-1">
-                        <li>Open Webring Studio (it must be running for SSE).</li>
+                        <li>Open Webring Studio (it must be running).</li>
                         <li>
-                          In the <strong>AI Agent (MCP)</strong> tab, click{' '}
-                          <strong>Copy SSE URL</strong>. It includes your access token.
+                          In the <strong>AI Agent (MCP)</strong> tab, click <strong>Copy Claude Code
+                          command</strong> or <strong>Copy config</strong>. Both carry your token as an{' '}
+                          <code>Authorization: Bearer</code> header.
                         </li>
                         <li>
-                          In your client, add a server with transport <strong>SSE</strong> and paste
-                          the URL. Leave the command, arguments and environment variables empty.
+                          For any other client: add a Streamable HTTP server at the <code>/mcp</code>{' '}
+                          address above, with that header on every request.
                         </li>
                       </ol>
                       <p className="text-xs text-slate-400 leading-relaxed">
-                        Treat the token like a password: anything that has it can control Studio. To
-                        issue a new one, quit Studio, delete <code>mcp-http.json</code> from the Studio
-                        data folder, and reopen it.
+                        Treat the token like a password: anything that has it can use Studio as an agent.
+                        It&apos;s kept in <code>mcp-http.json</code> in Studio&apos;s data folder, inside your
+                        user profile. To issue a new one, quit Studio, delete that file, and reopen it.
                       </p>
                     </div>
 
@@ -8517,14 +8684,26 @@ git push -u origin main --force`}
                       </h4>
                       <ul className="text-xs text-slate-300 list-disc list-inside space-y-1">
                         <li>
-                          <strong>Read-Only by default:</strong> External MCP connections start in
-                          Read-Only mode so agents cannot modify your data until you allow writes.
+                          <strong>Read-only by default, and remembered:</strong> agents can read but not
+                          change anything, and Studio makes no network requests for them, until you allow
+                          writes. The setting survives restarts.
                         </li>
                         <li>
-                          <strong>Human confirmation queue:</strong> Outward, destructive, and
-                          local-file-import tools (publishing, deleting, trusting/rotating keys,
-                          changing proxy settings, enabling auto-publish or changing publish
-                          destinations) are queued for your explicit approval in Studio.
+                          <strong>Private data hidden:</strong> until you turn on{' '}
+                          <strong>Allow agents to read private data</strong>, agents see only public
+                          friends, no saved posts, and no publishing settings or add-on ids. Results say
+                          what was left out.
+                        </li>
+                        <li>
+                          <strong>Approval for outward actions:</strong> publishing, deleting, keys, the
+                          proxy, profile and site address changes, add-ons, GitHub sign-in, hubs, personas
+                          and turning on scheduled or automatic publishing pop up an approval showing what
+                          the agent wants, for which persona. Deny is the default; Enter never approves.
+                          Requests expire after 30 minutes.
+                        </li>
+                        <li>
+                          <strong>Each call in its own persona:</strong> switching persona in Studio during
+                          a call doesn&apos;t redirect it.
                         </li>
                         <li>
                           <strong>Untrusted feed isolation:</strong>{' '}
@@ -8532,8 +8711,11 @@ git push -u origin main --force`}
                           entries by default and labels peer-authored text as untrusted data.
                         </li>
                         <li>
-                          <strong>Auto-publish hold:</strong> Local changes made by an MCP agent are
-                          held from automatic publishing until you review them or publish manually.
+                          <strong>Agent changes held:</strong> anything an agent changes that would appear
+                          on your site waits for your review. Auto-publish, scheduled publishes and the
+                          agent&apos;s own publish skip it, even after a restart. Release it from the{' '}
+                          <strong>Agent changes waiting for your review</strong> panel, or publish manually
+                          (Studio asks first).
                         </li>
                       </ul>
                     </div>
@@ -9351,6 +9533,32 @@ git push -u origin main --force`}
       </main>
 
       {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {approvalModalOpen && (mcpInfo?.pendingApprovals?.length || 0) > 0 && (
+        <McpApprovalModal
+          pending={mcpInfo?.pendingApprovals || []}
+          focusId={approvalFocusId}
+          onResolve={resolveApproval}
+          onDenyAll={denyAllApprovals}
+          onClose={() => {
+            setApprovalModalOpen(false);
+            setApprovalFocusId(null);
+          }}
+        />
+      )}
+
+      {confirmRequest && (
+        <ConfirmDialog
+          title={confirmRequest.title}
+          message={confirmRequest.message}
+          confirmLabel={confirmRequest.confirmLabel}
+          tone={confirmRequest.tone}
+          onAnswer={(confirmed) => {
+            confirmRequest.resolve(confirmed);
+            setConfirmRequest(null);
+          }}
+        />
+      )}
+
       {consentRequest && (
         <PlaintextConsentDialog
           secretLabel={consentRequest.label}

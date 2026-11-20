@@ -18,7 +18,8 @@ export type ScheduledJobKind = 'sync' | 'publish';
 
 export interface JobResult {
   at: string;
-  status: 'ok' | 'skipped' | 'failed';
+  /** held: not published, because an agent's changes wait for the user's review. */
+  status: 'ok' | 'skipped' | 'failed' | 'held';
   message: string;
 }
 

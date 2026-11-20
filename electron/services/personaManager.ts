@@ -144,7 +144,7 @@ export class PersonaManager {
     }
 
     if (this.activeContext) {
-      this.activeContext.db.close();
+      this.releaseActiveContext(this.activeContext);
       this.activeContext = null;
     }
 
@@ -210,6 +210,41 @@ export class PersonaManager {
   /** Persona ids and labels without opening any database. */
   public listPersonaRecords(): Array<{ id: string; label: string }> {
     return this.registry.personas.map((p) => ({ id: p.id, label: p.label }));
+  }
+
+  /** How many calls are using each context that was active when they started (withActiveContext). */
+  private contextsInUse = new Map<ActivePersonaContext, number>();
+  /** Contexts that stopped being active while in use: closed when their last call finishes. */
+  private closeWhenIdle = new Set<ActivePersonaContext>();
+
+  /** Closes a context that's no longer active, or defers that until the calls using it finish. */
+  private releaseActiveContext(ctx: ActivePersonaContext): void {
+    if ((this.contextsInUse.get(ctx) || 0) > 0) {
+      this.closeWhenIdle.add(ctx);
+    } else {
+      ctx.db.close();
+    }
+  }
+
+  /**
+   * Runs `fn` with the active persona's context, which stays usable (and stays that persona) for
+   * the whole call even if the user switches persona meanwhile: its database is closed only once
+   * the call finishes.
+   */
+  public async withActiveContext<T>(fn: (ctx: ActivePersonaContext) => Promise<T>): Promise<T> {
+    const ctx = this.getActiveContext();
+    this.contextsInUse.set(ctx, (this.contextsInUse.get(ctx) || 0) + 1);
+    try {
+      return await fn(ctx);
+    } finally {
+      const left = (this.contextsInUse.get(ctx) || 1) - 1;
+      if (left > 0) {
+        this.contextsInUse.set(ctx, left);
+      } else {
+        this.contextsInUse.delete(ctx);
+        if (this.closeWhenIdle.delete(ctx)) ctx.db.close();
+      }
+    }
   }
 
   public getActiveContext(): ActivePersonaContext {

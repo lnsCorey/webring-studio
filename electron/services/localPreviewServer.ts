@@ -44,10 +44,27 @@ const MIME_TYPES: Record<string, string> = {
  * exported files (`index.html`, `/api/*.json`, `/.well-known/did.json`, `/media/*`)
  * in their browser or inside Webring Studio before publishing.
  */
+const LIVE_PREVIEW_PATH = '/__studio-live-preview';
+
 export class LocalPreviewServer {
   private server: http.Server | null = null;
   private currentRootDir: string | null = null;
   private currentPort: number = 0;
+  /** Studio's live preview page (in memory), served at LIVE_PREVIEW_PATH. */
+  private liveHtml = '';
+  private liveVersion = 0;
+
+  /**
+   * Serves the live preview page from this loopback server and returns its address. The Studio
+   * window shows it in an iframe; a srcdoc frame would inherit the window's strict CSP and
+   * couldn't run the page's own scripts.
+   */
+  public async serveLivePreview(html: string): Promise<string> {
+    this.liveHtml = html;
+    this.liveVersion++;
+    await this.ensureServerStarted();
+    return `http://127.0.0.1:${this.currentPort}${LIVE_PREVIEW_PATH}?v=${this.liveVersion}`;
+  }
 
   public async runTestExportAndServe(
     siteGenerator: StaticSiteGenerator,
@@ -105,6 +122,11 @@ export class LocalPreviewServer {
         if (host !== `127.0.0.1:${this.currentPort}` && host !== `localhost:${this.currentPort}`) {
           res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
           res.end('Forbidden');
+          return;
+        }
+        if ((req.url || '').split('?')[0] === LIVE_PREVIEW_PATH) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(this.liveHtml);
           return;
         }
         if (!this.currentRootDir) {

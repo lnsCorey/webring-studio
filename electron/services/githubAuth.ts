@@ -12,6 +12,7 @@
  * development builds can use their own with WEBRING_GITHUB_CLIENT_ID.
  */
 export const GITHUB_OAUTH_CLIENT_ID = '';
+import { assertNetworkAllowed } from '../security/networkPolicy';
 
 /**
  * Create public repos and push to them. A repo named `<login>.github.io` is served by GitHub Pages
@@ -61,7 +62,10 @@ export class GitHubDeviceLogin {
   private pending = new Map<string, PendingLogin>();
 
   constructor(
-    private fetchImpl: FetchLike = (url, init) => fetch(url, init),
+    private fetchImpl: FetchLike = (url, init) => {
+      assertNetworkAllowed();
+      return fetch(url, init);
+    },
     private clientId: () => string = githubClientId,
     private now: () => number = Date.now
   ) {}

@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { assertNetworkAllowed } from '../security/networkPolicy';
 import * as path from 'path';
 import SftpClient from 'ssh2-sftp-client';
 import * as ftp from 'basic-ftp';
@@ -701,6 +702,7 @@ export class SitePublisher {
     body?: unknown,
     attempt = 1
   ): Promise<{ status: number; body: unknown }> {
+    assertNetworkAllowed();
     const res = await fetch(`${GITHUB_API_BASE}${urlPath}`, {
       method,
       headers: {

@@ -910,11 +910,17 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       const peerOutDir = path.join(peerDataDir, 'public_html');
       new StaticSiteGenerator(peerDb).generateToDirectory(peerOutDir);
 
-      const crawlRes = await mcpServer.executeToolCall('webring_crawl_friend', {
+      // Agents can't read a local folder as a friend's site (phase 7); the app syncs it here
+      const refused = await mcpServer.executeToolCall('webring_crawl_friend', {
         siteUrl: 'https://friend-peer.ring.test',
         localDirOverride: peerOutDir,
       });
-      expect((crawlRes.data as { verifiedSignature: boolean }).verifiedSignature).toBe(true);
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0].text).toMatch(/localDirOverride is not available to agents/);
+      const crawlRes = await manager
+        .getActiveContext()
+        .ringCrawler.crawlFriendSite('https://friend-peer.ring.test', peerOutDir);
+      expect(crawlRes.verifiedSignature).toBe(true);
 
       // Agent reads Neighborhood Feed via MCP and replies to Peer Friend's post
       const feedRes = await mcpServer.executeToolCall('webring_get_neighborhood_feed', {
@@ -933,20 +939,25 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       });
 
       // 5. Agent exports the signed static site via MCP and verifies over Loopback HTTP /mcp endpoint
+      // The export folder is chosen in the app (saved here); MCP can't pick another one
       const exportOutDir = path.join(tempRoot, 'mcp-exported-site');
-      const exportRes = await mcpServer.executeToolCall('webring_export_static_site', {
-        targetDir: exportOutDir,
-      });
+      const studioDb = manager.getActiveContext().db;
+      studioDb.updateProfile({ publishSettings: { ...studioDb.getProfile().publishSettings, exportPath: exportOutDir } });
+      const elsewhere = path.join(tempRoot, 'agent-chosen-folder');
+      const exportRes = await mcpServer.executeToolCall('webring_export_static_site', { targetDir: elsewhere });
       expect((exportRes.data as { success: boolean }).success).toBe(true);
+      expect((exportRes.data as { ignoredTargetDir?: string }).ignoredTargetDir).toBe(elsewhere);
       expect(fs.existsSync(path.join(exportOutDir, 'index.html'))).toBe(true);
+      expect(fs.existsSync(elsewhere)).toBe(false);
 
       const httpStatus = await httpServer.start(0);
       expect(httpStatus.running).toBe(true);
       expect(httpStatus.port).toBeGreaterThan(0);
 
-      const httpRpcResp = await fetch(httpStatus.authorizedEndpointUrl!, {
+      const bearer = { Authorization: `Bearer ${httpStatus.accessToken}` };
+      const httpRpcResp = await fetch(httpStatus.endpointUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...bearer },
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 99,
@@ -985,55 +996,63 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       const loopbackHost = `127.0.0.1:${httpStatus.port}`;
       expect(
         await rawPost({ Host: loopbackHost, 'Content-Type': 'application/json', Origin: 'https://evil.example' })
-      ).toBe(403);
+      ).toBe(401);
       expect(await rawPost({ Host: loopbackHost, 'Content-Type': 'text/plain' })).toBe(415);
       expect(await rawPost({ Host: 'evil.example', 'Content-Type': 'application/json' })).toBe(403);
       expect(manager.getActiveContext().db.getItems()).toHaveLength(2);
 
       // An Electron-style client holding the token is allowed, with CORS for its origin
       const electronOrigin = 'app://mcp-client';
-      const tokenUrl = httpStatus.authorizedEndpointUrl!;
-      const preflight = await fetch(tokenUrl, {
+      const preflight = await fetch(httpStatus.endpointUrl, {
         method: 'OPTIONS',
-        headers: { Origin: electronOrigin },
+        headers: { Origin: electronOrigin, 'Access-Control-Request-Headers': 'authorization,content-type' },
       });
       expect(preflight.status).toBe(204);
       expect(preflight.headers.get('access-control-allow-origin')).toBe(electronOrigin);
-      const tokenResp = await fetch(tokenUrl, {
+      expect(preflight.headers.get('access-control-allow-headers')).toMatch(/Authorization/);
+      const tokenResp = await fetch(httpStatus.endpointUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Origin: electronOrigin },
+        headers: { 'Content-Type': 'application/json', Origin: electronOrigin, ...bearer },
         body: JSON.stringify({ jsonrpc: '2.0', id: 101, method: 'tools/list' }),
       });
       expect(tokenResp.status).toBe(200);
       expect(tokenResp.headers.get('access-control-allow-origin')).toBe(electronOrigin);
-      const wrongToken = await fetch(tokenUrl.replace(/token=[0-9a-f]+/, 'token=nope'), {
+      const wrongToken = await fetch(httpStatus.endpointUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Origin: electronOrigin },
+        headers: { 'Content-Type': 'application/json', Origin: electronOrigin, Authorization: 'Bearer nope' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 102, method: 'tools/list' }),
       });
-      expect(wrongToken.status).toBe(403);
+      expect(wrongToken.status).toBe(401);
 
-      // The SSE handshake hands token-holding clients a message URL that keeps the token
+      // The token is accepted only in the header: in the URL it's refused (phase 7)
+      const inUrl = await fetch(`${httpStatus.endpointUrl}?token=${httpStatus.accessToken}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 103, method: 'tools/list' }),
+      });
+      expect(inUrl.status).toBe(401);
+
+      // The SSE handshake's message URL carries no token; the client keeps sending its header
       const sseController = new AbortController();
-      const sseResp = await fetch(httpStatus.authorizedSseUrl!, {
-        headers: { Origin: electronOrigin },
+      const sseResp = await fetch(httpStatus.sseUrl, {
+        headers: { Origin: electronOrigin, ...bearer },
         signal: sseController.signal,
       });
       const firstChunk = new TextDecoder().decode((await sseResp.body!.getReader().read()).value);
       sseController.abort();
-      expect(firstChunk).toContain('/mcp/message?token=');
+      expect(firstChunk).toContain('/mcp/message');
+      expect(firstChunk).not.toContain('token');
 
       // Unauthenticated requests (even without Origin) are refused on all routes
       const unauthHealth = await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`);
-      expect(unauthHealth.status).toBe(403);
+      expect(unauthHealth.status).toBe(401);
       const unauthPost = await rawPost({ Host: loopbackHost, 'Content-Type': 'application/json' });
-      expect(unauthPost).toBe(403);
+      expect(unauthPost).toBe(401);
       const authHealth = await (
-        await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`, {
-          headers: { Authorization: `Bearer ${new URL(httpStatus.authorizedEndpointUrl!).searchParams.get('token')}` },
-        })
+        await fetch(`http://127.0.0.1:${httpStatus.port}/mcp/health`, { headers: bearer })
       ).text();
-      expect(authHealth).not.toContain('token');
+      expect(authHealth).not.toContain('accessToken');
+      expect(authHealth).not.toContain(httpStatus.accessToken!);
     } finally {
       await httpServer.stop();
       peerDb.close();
@@ -1484,7 +1503,7 @@ describe('Loopback MCP HTTP Settings', () => {
       await second.stop();
 
       expect(secondStatus.port).toBe(firstStatus.port);
-      expect(secondStatus.authorizedSseUrl).toBe(firstStatus.authorizedSseUrl);
+      expect(secondStatus.accessToken).toBe(firstStatus.accessToken);
       // Windows has no POSIX permission bits (Node reports 666 for any writable file)
       if (process.platform !== 'win32') {
         expect((fs.statSync(settingsPath).mode & 0o777).toString(8)).toBe('600');
@@ -2440,10 +2459,12 @@ describe('Auto-publish after changes', () => {
         onLocalChange: (personaId, reason) => changes.push(`${personaId}:${reason}`),
       });
 
+      // A change counts when it alters what the site would publish (phase 7): a post does; a read
+      // and a private friend (never published) don't
       await mcp.executeToolCall('webring_create_post', { commentary: 'Hello ring' });
       await mcp.executeToolCall('webring_list_items', {});
       await mcp.executeToolCall('webring_add_friend', { siteUrl: 'https://friend.ring.test', displayName: 'Friend' });
-      expect(changes).toEqual([`${ctx.persona.id}:post`, `${ctx.persona.id}:friend`]);
+      expect(changes).toEqual([`${ctx.persona.id}:Published Wall Post "Hello ring"`]);
 
       // Settings through MCP
       const set = await mcp.executeToolCall('webring_set_schedule', { autoPublishEnabled: true, autoPublishDelaySeconds: 600 });
@@ -2743,7 +2764,7 @@ describe('Media Library', () => {
     fs.mkdirSync(path.join(out, 'media/albums/old'), { recursive: true });
     fs.writeFileSync(path.join(out, 'README.md'), 'mine'); // not Studio's: must survive
     fs.writeFileSync(path.join(out, 'media/albums/old/stale.jpg'), 'old'); // Studio's old photo area
-    fs.writeFileSync(path.join(out, '.webring-studio'), 'webring-studio\n'); // a folder Studio published before
+    fs.writeFileSync(path.join(out, '.webring-studio-export'), 'webring-studio export\n'); // a folder Studio exported to before
     expect(site.publisher.publishToLocalDirectory(out).success).toBe(true);
 
     const manifestPath = path.join(out, `media/albums/${album.id}/manifest.json`);
@@ -6161,8 +6182,8 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
     const httpServer = new McpHttpServer(mcpServer);
     try {
       const status = await httpServer.start(0);
-      expect((await fetch(`http://127.0.0.1:${status.port}/mcp/health`)).status).toBe(403);
-      expect((await fetch(`http://127.0.0.1:${status.port}/mcp/sse`)).status).toBe(403);
+      expect((await fetch(`http://127.0.0.1:${status.port}/mcp/health`)).status).toBe(401);
+      expect((await fetch(`http://127.0.0.1:${status.port}/mcp/sse`)).status).toBe(401);
       expect(
         (
           await fetch(status.endpointUrl, {
@@ -6171,9 +6192,9 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
             body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
           })
         ).status
-      ).toBe(403);
+      ).toBe(401);
 
-      const token = new URL(status.authorizedEndpointUrl!).searchParams.get('token')!;
+      const token = status.accessToken!;
       expect(
         (
           await fetch(`http://127.0.0.1:${status.port}/mcp/health`, {
@@ -6383,12 +6404,12 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
       expect(html).toContain('.flex{display:flex}');
       expect(csp).not.toContain('https://giscus.app');
       expect(csp).not.toContain('https://utteranc.es');
-      expect(fs.existsSync(path.join(outDir, '.webring-studio'))).toBe(true);
+      expect(fs.existsSync(path.join(outDir, '.webring-studio-export'))).toBe(true);
 
       const nonStudioDir = path.join(tempRoot, 'foreign');
       fs.mkdirSync(nonStudioDir);
       fs.writeFileSync(path.join(nonStudioDir, 'important.txt'), 'keep me');
-      expect(() => new StaticSiteGenerator(db).generateToDirectory(nonStudioDir)).toThrow(/marker/);
+      expect(() => new StaticSiteGenerator(db).generateToDirectory(nonStudioDir)).toThrow(/wasn't created by Studio/);
     } finally {
       db.close();
     }

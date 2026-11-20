@@ -248,7 +248,7 @@ Schedules run while Studio is running. With **background mode** on (the default)
 
 ## Connecting an MCP agent
 
-Studio includes a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI agent (Claude Code, Claude Desktop, Cursor, or your own scripts) can read and manage your personas, posts, friends, rings, schedules and publishing. The **AI Agent (MCP)** tab lists every tool and has a console for trying them.
+Studio includes a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI agent (Claude Code, Claude Desktop, Cursor, or your own scripts) can read and manage your personas, posts, friends, rings, schedules and publishing. The **AI Agent (MCP)** tab lists every tool, shows the agent's requests and recent decisions, and (in development builds only) has a console for trying tools.
 
 **Guided setup by an agent.** The server tells agents about the `guided-setup` prompt, which walks a new user through signing in to GitHub, creating their site, publishing and checking it's live. It uses the same steps as the in-app wizard. The tools are `webring_get_setup_status`, `webring_github_login_start` / `webring_github_login_poll` (the user approves a code on github.com, and the agent never sees the token), `webring_setup_github_site`, `webring_publish` and `webring_check_live_site`. Signing in, creating the site and publishing need the live connection below.
 
@@ -260,16 +260,25 @@ There are two ways to connect.
 
 While Studio is open, it serves MCP on `127.0.0.1` with a fixed port. This is the only route that can **publish**, since signing needs the keychain, and agent actions show up in the app immediately.
 
-- In the **AI Agent (MCP)** tab, click **Copy SSE URL** (or **Copy HTTP URL**). The URL includes an access token.
-- In your MCP client, add a server with transport **SSE** (or Streamable HTTP) and paste the URL.
+- In the **AI Agent (MCP)** tab, click **Copy config** (a JSON block for clients that take one) or **Copy Claude Code command**. For Claude Code that's:
 
-Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the access token (`?token=` or `Authorization: Bearer <token>`), regardless of whether an `Origin` header is sent. Web pages are always refused. Treat the token like a password. To issue a new one, quit Studio, delete `mcp-http.json` from the data folder, and reopen it.
+  ```bash
+  claude mcp add --transport http webring-studio http://127.0.0.1:<port>/mcp --header "Authorization: Bearer <token>"
+  ```
+
+- Any other client: add a Streamable HTTP server at `http://127.0.0.1:<port>/mcp` and send the header `Authorization: Bearer <token>` with every request.
+
+Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the token in that header, whether or not an `Origin` header is sent. A token in the URL (`?token=`) isn't accepted: URLs end up in logs, shell history and process lists. Web pages are always refused. Treat the token like a password. It's kept in `mcp-http.json` in Studio's data folder, which is inside your user profile; on Windows that's what protects it (the file's `0600` mode has no effect there). To issue a new token, quit Studio, delete `mcp-http.json`, and reopen it.
 
 **MCP safety controls:**
 
-- **Read-Only by default:** External MCP connections start in Read-Only mode so agents can read your personas, feed, and setup status without modifying anything until you allow writes.
-- **Tool tiers & human confirmation:** Tools are split into `read`, `local-write`, and `outward` (publishing, deleting, trusting/rotating keys, proxy settings, `webring_set_schedule` auto-publish/destination changes, and local-path photo imports). External `outward` tool calls are queued for in-app human confirmation rather than running immediately.
-- **Untrusted feed isolation & auto-publish hold:** `webring_get_neighborhood_feed` excludes unverified entries by default and labels peer-authored content as untrusted data. Local changes made by an MCP agent are held from auto-publish until you review or publish manually.
+- **Read-only by default, and remembered.** Agents start in read-only mode: they can read, but not change anything, and Studio makes **no network requests** for them (a hub list comes from what's stored; searching a hub or checking the live site needs writes allowed). **Allow Local Writes** in the MCP tab lifts it. The choice is saved, and the command-line server follows it.
+- **Private data stays private.** Until you turn on **Allow agents to read private data**, agents see only public friends, no saved posts, and your profile without publishing settings (hosts, user names, local paths) or add-on ids. Results say what was left out. Content from friends' posts can contain instructions aimed at your agent, so only allow this for agents you trust. No tool can change either setting.
+- **Each call stays in its persona.** A call for another persona (`personaId`) never touches the active one, and switching persona in the app during a call doesn't redirect it. Switching or creating a persona is itself an outward action.
+- **Outward actions need your approval.** Tools are `read`, `local-write` or `outward`. Outward ones (publishing, deleting, keys, the proxy, profile and site address changes, analytics/ad add-ons, GitHub sign-in, adding or removing a hub, and turning on scheduled or automatic publishing) pop up an approval: what the agent wants in plain words, the persona, and any local file in full. **Deny** is the default and Enter never approves. A request expires after 30 minutes; at most 20 wait at once. The MCP tab keeps the last decisions.
+- **Agent changes are held from publishing.** Anything an agent changes that would appear on your site is held: auto-publish, scheduled publishes and an agent's own publish skip it ("Held — agent changes need review"), even after a restart. Review it in the **Agent changes waiting for your review** panel and **Release for publishing**, or publish manually (Studio asks first).
+- **The export folder is yours to choose.** Only **Change folder…** in the app sets it, and Studio only writes into an empty folder or one it exported to before (marked `.webring-studio-export`). An agent's export always goes to that folder.
+- **Untrusted feed isolation:** `webring_get_neighborhood_feed` excludes unverified entries by default and labels peer-authored content as untrusted data.
 
 **2. Standalone stdio server**
 

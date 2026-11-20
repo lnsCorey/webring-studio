@@ -414,6 +414,13 @@ export interface NetworkFeedEntry {
 /** A friend's post or photo the user saved: a private copy kept outside the feed window. */
 export type FriendNoticeSource = 'link' | 'ring';
 
+/** A change an agent made, held from publishing until the user releases it. */
+export interface HeldAgentChange {
+  tool: string;
+  summary: string;
+  at: string;
+}
+
 export type FriendSyncNoticeKind = 'rollback_blocked';
 
 /**
@@ -3617,6 +3624,43 @@ export class StudioDatabase {
         .run(key, updatedAt);
     }
     return true;
+  }
+
+  /**
+   * Changes an agent made that aren't published yet: no auto-publish, scheduled publish or agent
+   * publish puts them on the site until the user releases them. Stored per persona, so the hold
+   * survives a restart.
+   */
+  public getHeldAgentChanges(): HeldAgentChange[] {
+    const row = this.db.prepare("SELECT value FROM local_settings WHERE key = 'agent_changes_held'").get() as
+      | { value: string }
+      | undefined;
+    if (!row?.value) return [];
+    try {
+      const parsed = JSON.parse(row.value) as unknown;
+      return Array.isArray(parsed)
+        ? parsed
+            .filter((c): c is HeldAgentChange => Boolean(c) && typeof (c as HeldAgentChange).summary === 'string')
+            .map((c) => ({ tool: String(c.tool || ''), summary: c.summary, at: String(c.at || '') }))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  public addHeldAgentChange(change: HeldAgentChange): HeldAgentChange[] {
+    const next = [...this.getHeldAgentChanges(), change].slice(-200);
+    this.db
+      .prepare(
+        "INSERT INTO local_settings (key, value) VALUES ('agent_changes_held', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      )
+      .run(JSON.stringify(next));
+    return next;
+  }
+
+  /** Releases the hold (the user reviewed the changes). */
+  public clearHeldAgentChanges(): void {
+    this.db.prepare("DELETE FROM local_settings WHERE key = 'agent_changes_held'").run();
   }
 
   /** The `updatedAt` of the newest verified copy of a document, as recorded by checkDocumentFreshness. */

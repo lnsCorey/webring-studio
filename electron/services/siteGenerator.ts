@@ -103,21 +103,31 @@ export class StaticSiteGenerator {
     const apiDir = path.join(outputDir, 'api');
     const mediaOutDir = path.join(outputDir, 'media');
 
-    if (fs.existsSync(outputDir)) {
-      const existingEntries = fs.readdirSync(outputDir);
-      const hasMarker =
-        fs.existsSync(path.join(outputDir, '.webring-studio')) ||
-        fs.existsSync(path.join(outputDir, 'api', 'manifest.json'));
-      if (existingEntries.length > 0 && !hasMarker) {
-        throw new Error(
-          `Refusing to write into non-empty folder "${outputDir}" without a .webring-studio marker.`
-        );
-      }
+    // Only an empty folder or one Studio exported to (its marker) is written into; a lock token
+    // narrows the gap between checking the folder and writing to it
+    const lockPath = claimExportFolder(outputDir, this.db.getProfile().publishSettings.exportPath);
+    try {
+      return this.writeSite(outputDir, bundle, filesWritten, wellKnownDir, apiDir, mediaOutDir, compiledProfileHtml);
+    } finally {
+      if (lockPath) fs.rmSync(lockPath, { force: true });
     }
+  }
+
+  private writeSite(
+    outputDir: string,
+    bundle: ReturnType<StudioDatabase['buildSignedSiteBundle']>,
+    filesWritten: string[],
+    wellKnownDir: string,
+    apiDir: string,
+    mediaOutDir: string,
+    compiledProfileHtml?: string
+  ): GeneratedSiteResult {
     fs.mkdirSync(wellKnownDir, { recursive: true });
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(mediaOutDir, { recursive: true });
-    fs.writeFileSync(path.join(outputDir, '.webring-studio'), 'webring-studio\n', 'utf8');
+    fs.writeFileSync(path.join(outputDir, EXPORT_MARKER), 'webring-studio export\n', 'utf8');
+    // The marker's old name, from earlier builds
+    fs.rmSync(path.join(outputDir, '.webring-studio'), { force: true });
 
     const writeJson = (relPath: string, data: unknown) => {
       const fullPath = path.join(outputDir, relPath);
@@ -1280,6 +1290,53 @@ function embedJson(value: unknown): string {
 
 /** Where "What's Webring Studio?" on a published page points. */
 const WEBRING_STUDIO_URL = 'https://github.com/lnsCorey/webring-studio';
+
+/** Marks a folder Studio exports to. Only this makes a non-empty folder Studio's to write into. */
+export const EXPORT_MARKER = '.webring-studio-export';
+
+export class ExportFolderRefusedError extends Error {
+  constructor() {
+    super("This folder isn't empty and wasn't created by Studio. Choose an empty folder or one Studio exported to before.");
+    this.name = 'ExportFolderRefusedError';
+  }
+}
+
+/**
+ * Whether Studio may write into `dir`: it doesn't exist, it's empty, or it has Studio's export
+ * marker. The saved export folder from an older build (marked .webring-studio, or holding an
+ * api/manifest.json) is accepted once and gets the new marker. Nothing else is: any site has an
+ * api/manifest.json, so that alone proves nothing.
+ */
+export function checkExportFolder(dir: string, savedExportPath?: string): { ok: boolean; migrate?: boolean } {
+  if (!fs.existsSync(dir)) return { ok: true };
+  if (!fs.statSync(dir).isDirectory()) return { ok: false };
+  if (fs.readdirSync(dir).length === 0) return { ok: true };
+  if (fs.existsSync(path.join(dir, EXPORT_MARKER))) return { ok: true };
+  const isSaved = Boolean(savedExportPath) && path.resolve(savedExportPath!) === path.resolve(dir);
+  const legacy = fs.existsSync(path.join(dir, '.webring-studio')) || fs.existsSync(path.join(dir, 'api', 'manifest.json'));
+  return isSaved && legacy ? { ok: true, migrate: true } : { ok: false };
+}
+
+/**
+ * Claims an export folder before writing: refuses one that isn't Studio's, then writes a lock
+ * file with a random token and reads it back with the marker, so a folder swapped in between the
+ * check and the write is caught. Returns the lock path to remove afterwards (null when none).
+ */
+function claimExportFolder(dir: string, savedExportPath?: string): string | null {
+  const check = checkExportFolder(dir, savedExportPath);
+  if (!check.ok) throw new ExportFolderRefusedError();
+  if (!fs.existsSync(dir) || fs.readdirSync(dir).length === 0) return null;
+  const marker = path.join(dir, EXPORT_MARKER);
+  if (check.migrate) fs.writeFileSync(marker, 'webring-studio export\n', 'utf8');
+  const lockPath = path.join(dir, `${EXPORT_MARKER}.lock`);
+  const token = crypto.randomBytes(16).toString('hex');
+  fs.writeFileSync(lockPath, token, 'utf8');
+  if (fs.readFileSync(lockPath, 'utf8') !== token || !fs.existsSync(marker)) {
+    fs.rmSync(lockPath, { force: true });
+    throw new ExportFolderRefusedError();
+  }
+  return lockPath;
+}
 
 /**
  * Studio preview only (sandboxed iframe): links never navigate the preview. webring:// actions

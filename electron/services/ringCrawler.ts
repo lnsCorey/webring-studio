@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { assertNetworkAllowed } from '../security/networkPolicy';
 import * as path from 'path';
 import * as http from 'http';
 import * as https from 'https';
@@ -232,6 +233,8 @@ function isConnectionReset(err: unknown): boolean {
  * is retried once; timeouts aren't, so an unreachable site costs one timeout.
  */
 async function fetchPublic(rawUrl: string, options: PublicFetchOptions): Promise<PublicFetchResult> {
+  // Every peer, hub and image request comes through here: none in a read-only agent call
+  assertNetworkAllowed();
   try {
     return await fetchPublicOnce(rawUrl, options);
   } catch (err) {
