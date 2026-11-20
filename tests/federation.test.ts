@@ -2755,7 +2755,7 @@ describe('Media Library', () => {
     fs.mkdirSync(path.join(out, 'media/albums/old'), { recursive: true });
     fs.writeFileSync(path.join(out, 'README.md'), 'mine'); // not Studio's: must survive
     fs.writeFileSync(path.join(out, 'media/albums/old/stale.jpg'), 'old'); // Studio's old photo area
-    fs.writeFileSync(path.join(out, '.webring-studio'), 'webring-studio\n'); // a folder Studio published before
+    fs.writeFileSync(path.join(out, '.webring-studio-export'), 'webring-studio export\n'); // a folder Studio exported to before
     expect(site.publisher.publishToLocalDirectory(out).success).toBe(true);
 
     const manifestPath = path.join(out, `media/albums/${album.id}/manifest.json`);
@@ -6395,12 +6395,12 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
       expect(html).toContain('.flex{display:flex}');
       expect(csp).not.toContain('https://giscus.app');
       expect(csp).not.toContain('https://utteranc.es');
-      expect(fs.existsSync(path.join(outDir, '.webring-studio'))).toBe(true);
+      expect(fs.existsSync(path.join(outDir, '.webring-studio-export'))).toBe(true);
 
       const nonStudioDir = path.join(tempRoot, 'foreign');
       fs.mkdirSync(nonStudioDir);
       fs.writeFileSync(path.join(nonStudioDir, 'important.txt'), 'keep me');
-      expect(() => new StaticSiteGenerator(db).generateToDirectory(nonStudioDir)).toThrow(/marker/);
+      expect(() => new StaticSiteGenerator(db).generateToDirectory(nonStudioDir)).toThrow(/wasn't created by Studio/);
     } finally {
       db.close();
     }

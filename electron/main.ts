@@ -24,6 +24,7 @@ import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
 import { DEMO_PEER_FOLDER_NAME } from './db/legacyDemoContent';
+import { checkExportFolder, ExportFolderRefusedError } from './services/siteGenerator';
 import { spkiFingerprint } from './db/database';
 import { isRingMemberFlagged } from './services/ringService';
 import {
@@ -794,6 +795,11 @@ function registerIpcHandlers() {
   // allowPlaintext: the user agreed to store a new password or token unencrypted (no keychain)
   ipcMain.handle('studio:update-profile', (_e, updates, options?: { allowPlaintext?: boolean }) => {
     const ctx = personaManager.getActiveContext();
+    // The export folder is set only through the folder picker (studio:choose-export-folder)
+    if (updates?.publishSettings && typeof updates.publishSettings === 'object') {
+      updates = { ...updates, publishSettings: { ...updates.publishSettings } };
+      delete updates.publishSettings.exportPath;
+    }
     const profile = ctx.db.updateProfile(updates, { allowPlaintext: options?.allowPlaintext === true });
     // A replaced profile photo or banner that was uploaded to the library is deleted here
     if (updates && typeof updates === 'object' && ('avatarUrl' in updates || 'bannerUrl' in updates)) {
@@ -1240,6 +1246,8 @@ function registerIpcHandlers() {
     }
   );
 
+  // The only way to change the export folder: the user picks it here, and it's checked and saved
+  // in main (the window can't set the path, and MCP never can)
   ipcMain.handle('studio:choose-export-folder', async () => {
     if (!mainWindow) return null;
     const res = await dialog.showOpenDialog(mainWindow, {
@@ -1247,7 +1255,19 @@ function registerIpcHandlers() {
       properties: ['openDirectory', 'createDirectory'],
     });
     if (res.canceled || res.filePaths.length === 0) return null;
-    return res.filePaths[0];
+    const chosen = res.filePaths[0];
+    const ctx = personaManager.getActiveContext();
+    const saved = ctx.db.getProfile().publishSettings.exportPath;
+    if (!checkExportFolder(chosen, saved).ok) {
+      await dialog.showMessageBox(mainWindow, {
+        type: 'error',
+        title: 'Folder not used',
+        message: new ExportFolderRefusedError().message,
+      });
+      return null;
+    }
+    ctx.db.updateProfile({ publishSettings: { ...ctx.db.getProfile().publishSettings, exportPath: chosen } });
+    return chosen;
   });
 
   ipcMain.handle('studio:export-local', (_e, targetDir?: string, options?: { includeAgentChanges?: boolean }) => {

@@ -9,6 +9,7 @@ import { describeToolCall } from '../electron/mcp/describeToolCall';
 import { AutoPublisher } from '../electron/services/autoPublisher';
 import { runScheduledPublish } from '../electron/services/jobs';
 import { Scheduler } from '../electron/services/scheduler';
+import { checkExportFolder, EXPORT_MARKER, ExportFolderRefusedError } from '../electron/services/siteGenerator';
 import { runWithoutNetwork } from '../electron/security/networkPolicy';
 import { requestPublicJson } from '../electron/services/ringCrawler';
 import { EXPECTED_TOOL_TIERS } from './mcpToolTiers.expected';
@@ -535,5 +536,58 @@ describe('Security Phase 7: agent changes are held from every kind of publishing
     expect(auto.status('default').reasons).toContain('edit during publish');
     expect(armed).toHaveLength(2);
     auto.dispose();
+  });
+});
+
+describe('Security Phase 7: the export folder', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p7-export-'));
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows may still hold a database file
+    }
+  });
+
+  const someonesSite = (name: string) => {
+    const folder = path.join(dir, name);
+    fs.mkdirSync(path.join(folder, 'api'), { recursive: true });
+    fs.writeFileSync(path.join(folder, 'api', 'manifest.json'), '{}');
+    fs.writeFileSync(path.join(folder, 'index.html'), '<p>not Studio</p>');
+    return folder;
+  };
+
+  it("refuses a non-empty folder that only has an api/manifest.json, and migrates the saved one once", () => {
+    const manager = new PersonaManager(path.join(dir, 'studio'));
+    try {
+      const ctx = manager.getActiveContext();
+      ctx.db.updateProfile({ siteUrl: 'https://me.export.test', displayName: 'Me' });
+
+      const stranger = someonesSite('stranger');
+      expect(checkExportFolder(stranger).ok).toBe(false);
+      expect(() => ctx.siteGenerator.generateToDirectory(stranger)).toThrow(ExportFolderRefusedError);
+      expect(fs.readFileSync(path.join(stranger, 'index.html'), 'utf8')).toBe('<p>not Studio</p>');
+
+      // The saved export folder from an older build: accepted once, and marked
+      const saved = someonesSite('saved');
+      ctx.db.updateProfile({ publishSettings: { ...ctx.db.getProfile().publishSettings, exportPath: saved } });
+      expect(checkExportFolder(saved, saved)).toEqual({ ok: true, migrate: true });
+      ctx.siteGenerator.generateToDirectory(saved);
+      expect(fs.existsSync(path.join(saved, EXPORT_MARKER))).toBe(true);
+      expect(fs.existsSync(path.join(saved, `${EXPORT_MARKER}.lock`))).toBe(false);
+      expect(checkExportFolder(saved)).toEqual({ ok: true });
+
+      // Empty and new folders are fine
+      expect(checkExportFolder(path.join(dir, 'new-folder')).ok).toBe(true);
+      fs.mkdirSync(path.join(dir, 'empty'));
+      expect(checkExportFolder(path.join(dir, 'empty')).ok).toBe(true);
+    } finally {
+      manager.closeAll();
+    }
   });
 });

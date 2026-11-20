@@ -2425,11 +2425,11 @@ export const App: React.FC = () => {
 
   const handleChooseExportFolder = async () => {
     if (!window.studioApi) return;
+    // Main checks the folder (empty, or one Studio exported to) and saves it
     const chosen = await window.studioApi.chooseExportFolder();
     if (chosen) {
-      const nextSettings = { ...publishSettings, exportPath: chosen };
-      setPublishSettings(nextSettings);
-      await saveProfile({ publishSettings: nextSettings });
+      setPublishSettings((prev) => ({ ...prev, exportPath: chosen }));
+      await refreshStudioData();
       notify(`Saved local export folder: ${chosen}`);
     }
   };
@@ -6393,18 +6393,18 @@ export const App: React.FC = () => {
                   <input
                     type="text"
                     value={publishSettings.exportPath}
-                    onChange={(e) =>
-                      setPublishSettings((prev) => ({ ...prev, exportPath: e.target.value }))
-                    }
+                    readOnly
+                    aria-label="Export folder"
+                    title="Change it with Change folder…"
                     placeholder="Default: AppData/webring-studio/exported-profile-site"
-                    className="flex-1 px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                    className="flex-1 px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono text-slate-300"
                   />
                   <button
                     type="button"
                     onClick={handleChooseExportFolder}
                     className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium"
                   >
-                    Choose Folder...
+                    Change folder…
                   </button>
                 </div>
 
