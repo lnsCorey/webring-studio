@@ -8645,10 +8645,10 @@ git push -u origin main --force`}
                         <p className="text-xs text-slate-400 leading-relaxed">
                           Every route on the loopback MCP server (<code>/mcp</code>,{' '}
                           <code>/mcp/message</code>, <code>/mcp/sse</code>, and{' '}
-                          <code>/mcp/health</code>) requires your <strong>access token</strong>{' '}
-                          (<code>?token=…</code> or <code>Authorization: Bearer</code>),
-                          regardless of whether an <code>Origin</code> header is sent. Web pages are
-                          always refused.
+                          <code>/mcp/health</code>) requires your <strong>access token</strong> in an{' '}
+                          <code>Authorization: Bearer</code> header, whether or not an{' '}
+                          <code>Origin</code> header is sent. A token in the URL isn&apos;t accepted. Web
+                          pages are always refused.
                         </p>
                       </div>
                     </div>
@@ -8656,23 +8656,24 @@ git push -u origin main --force`}
                     {/* Electron / browser-based client setup */}
                     <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-500/30 space-y-2">
                       <h4 className="font-bold text-sm text-emerald-300">
-                        Connecting an Electron or browser-based MCP client (SSE)
+                        Connecting a client to the live app (HTTP)
                       </h4>
                       <ol className="text-xs text-slate-300 list-decimal list-inside space-y-1">
-                        <li>Open Webring Studio (it must be running for SSE).</li>
+                        <li>Open Webring Studio (it must be running).</li>
                         <li>
-                          In the <strong>AI Agent (MCP)</strong> tab, click{' '}
-                          <strong>Copy SSE URL</strong>. It includes your access token.
+                          In the <strong>AI Agent (MCP)</strong> tab, click <strong>Copy Claude Code
+                          command</strong> or <strong>Copy config</strong>. Both carry your token as an{' '}
+                          <code>Authorization: Bearer</code> header.
                         </li>
                         <li>
-                          In your client, add a server with transport <strong>SSE</strong> and paste
-                          the URL. Leave the command, arguments and environment variables empty.
+                          For any other client: add a Streamable HTTP server at the <code>/mcp</code>{' '}
+                          address above, with that header on every request.
                         </li>
                       </ol>
                       <p className="text-xs text-slate-400 leading-relaxed">
-                        Treat the token like a password: anything that has it can control Studio. To
-                        issue a new one, quit Studio, delete <code>mcp-http.json</code> from the Studio
-                        data folder, and reopen it.
+                        Treat the token like a password: anything that has it can use Studio as an agent.
+                        It&apos;s kept in <code>mcp-http.json</code> in Studio&apos;s data folder, inside your
+                        user profile. To issue a new one, quit Studio, delete that file, and reopen it.
                       </p>
                     </div>
 
@@ -8683,14 +8684,26 @@ git push -u origin main --force`}
                       </h4>
                       <ul className="text-xs text-slate-300 list-disc list-inside space-y-1">
                         <li>
-                          <strong>Read-Only by default:</strong> External MCP connections start in
-                          Read-Only mode so agents cannot modify your data until you allow writes.
+                          <strong>Read-only by default, and remembered:</strong> agents can read but not
+                          change anything, and Studio makes no network requests for them, until you allow
+                          writes. The setting survives restarts.
                         </li>
                         <li>
-                          <strong>Human confirmation queue:</strong> Outward, destructive, and
-                          local-file-import tools (publishing, deleting, trusting/rotating keys,
-                          changing proxy settings, enabling auto-publish or changing publish
-                          destinations) are queued for your explicit approval in Studio.
+                          <strong>Private data hidden:</strong> until you turn on{' '}
+                          <strong>Allow agents to read private data</strong>, agents see only public
+                          friends, no saved posts, and no publishing settings or add-on ids. Results say
+                          what was left out.
+                        </li>
+                        <li>
+                          <strong>Approval for outward actions:</strong> publishing, deleting, keys, the
+                          proxy, profile and site address changes, add-ons, GitHub sign-in, hubs, personas
+                          and turning on scheduled or automatic publishing pop up an approval showing what
+                          the agent wants, for which persona. Deny is the default; Enter never approves.
+                          Requests expire after 30 minutes.
+                        </li>
+                        <li>
+                          <strong>Each call in its own persona:</strong> switching persona in Studio during
+                          a call doesn&apos;t redirect it.
                         </li>
                         <li>
                           <strong>Untrusted feed isolation:</strong>{' '}
@@ -8698,8 +8711,11 @@ git push -u origin main --force`}
                           entries by default and labels peer-authored text as untrusted data.
                         </li>
                         <li>
-                          <strong>Auto-publish hold:</strong> Local changes made by an MCP agent are
-                          held from automatic publishing until you review them or publish manually.
+                          <strong>Agent changes held:</strong> anything an agent changes that would appear
+                          on your site waits for your review. Auto-publish, scheduled publishes and the
+                          agent&apos;s own publish skip it, even after a restart. Release it from the{' '}
+                          <strong>Agent changes waiting for your review</strong> panel, or publish manually
+                          (Studio asks first).
                         </li>
                       </ul>
                     </div>
