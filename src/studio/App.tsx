@@ -46,6 +46,7 @@ import type { SetupStatus } from '../shared/setup';
 import {
   BookOpen,
   Camera,
+  AlertTriangle,
   CheckCircle2,
   Code2,
   Compass,
@@ -314,6 +315,8 @@ interface CrawlSiteResult {
   deferred?: boolean;
   retryAfter?: string;
   error?: string;
+  /** Documents the sync couldn't use; the friend shows a "Sync problem" badge. */
+  documentErrors?: Array<{ doc: string; message: string }>;
 }
 
 /** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
@@ -955,6 +958,10 @@ export const App: React.FC = () => {
       setStatusMessage((prev) => (prev === msg ? null : prev));
     }, 5000);
   };
+  // The Sync All message that mentions friends with sync problems; clicking it shows just those
+  const [syncProblemsMessage, setSyncProblemsMessage] = useState<string | null>(null);
+  const [friendsFilter, setFriendsFilter] = useState<'all' | 'sync-problems'>('all');
+  const [openSyncProblemId, setOpenSyncProblemId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!bundle || !setupStatus || showSetupWizard) return;
@@ -1801,8 +1808,10 @@ export const App: React.FC = () => {
       const blocked = results.filter((r) => r.blocked).length;
       const deferred = results.filter((r) => r.deferred).length;
       const keyChanged = results.filter((r) => r.keyChangedWarning).length;
+      const withProblems = results.filter((r) => r.success && r.documentErrors?.length).length;
       const rejected = results.reduce((acc, r) => acc + (r.entriesRejected || 0), 0);
       const parts = [`${ok} synced`];
+      if (withProblems) parts.push(`${withProblems} with problems (click to see them)`);
       if (failed) parts.push(`${failed} failed`);
       if (blocked) parts.push(`${blocked} blocked (skipped)`);
       if (deferred) parts.push(`${deferred} unreachable lately (skipped for now)`);
@@ -1814,7 +1823,9 @@ export const App: React.FC = () => {
       if (newMember) parts.push(`${newMember} ring(s) current`);
       if (removedFrom.length) parts.push(`no longer in ${removedFrom.map((r) => `"${r.name}"`).join(', ')}`);
       if (leavers) parts.push(`${leavers} member(s) left your rings`);
-      notify(`Sync: ${parts.join(', ')}.`);
+      const message = `Sync: ${parts.join(', ')}.`;
+      setSyncProblemsMessage(withProblems ? message : null);
+      notify(message);
     } finally {
       setIsSyncingFriends(false);
     }
@@ -2636,11 +2647,26 @@ export const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-3">
-            {statusMessage && (
-              <div className="px-3 py-1 rounded-lg bg-indigo-500/20 border border-indigo-500/40 text-indigo-200 text-xs flex items-center gap-1.5">
-                <CheckCircle2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            {statusMessage && statusMessage === syncProblemsMessage ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setFriendsFilter('sync-problems');
+                  setActiveTab('friends');
+                }}
+                title="Show the friends whose last sync had a problem"
+                className="px-3 py-1 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-200 hover:bg-amber-500/25 text-xs flex items-center gap-1.5"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span className="truncate max-w-md">{statusMessage}</span>
-              </div>
+              </button>
+            ) : (
+              statusMessage && (
+                <div className="px-3 py-1 rounded-lg bg-indigo-500/20 border border-indigo-500/40 text-indigo-200 text-xs flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                  <span className="truncate max-w-md">{statusMessage}</span>
+                </div>
+              )
             )}
             <button
               onClick={handleSyncAllFriends}
@@ -4487,9 +4513,44 @@ export const App: React.FC = () => {
                     Local Ring Friends ({allFriends.length} Total •{' '}
                     {bundle.connections.friends.length} Exported to Public JSON)
                   </h3>
+                  {(friendsFilter === 'sync-problems' || allFriends.some((f) => f.lastSyncError)) && (
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setFriendsFilter('all')}
+                        className={`px-2.5 py-1 rounded-full border ${
+                          friendsFilter === 'all'
+                            ? 'bg-slate-700 border-slate-600 text-slate-100'
+                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFriendsFilter('sync-problems')}
+                        aria-pressed={friendsFilter === 'sync-problems'}
+                        className={`px-2.5 py-1 rounded-full border flex items-center gap-1 ${
+                          friendsFilter === 'sync-problems'
+                            ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-amber-200'
+                        }`}
+                      >
+                        <AlertTriangle className="w-3 h-3" /> Sync problems (
+                        {allFriends.filter((f) => f.lastSyncError).length})
+                      </button>
+                    </div>
+                  )}
                 </div>
+                {friendsFilter === 'sync-problems' && !allFriends.some((f) => f.lastSyncError) && (
+                  <p className="text-xs text-slate-500 mb-3">
+                    No friends have sync problems now. The last sync could use every document they publish.
+                  </p>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {allFriends.map((friend) => {
+                  {allFriends
+                    .filter((f) => friendsFilter === 'all' || f.lastSyncError)
+                    .map((friend) => {
                     const isPublic = friend.visibility === 'public';
                     const isActuallyExported =
                       isPublic && Boolean(publishSettings.publishFriendsList);
@@ -4570,7 +4631,39 @@ export const App: React.FC = () => {
                                   🚨 Key Changed Warning!
                                 </span>
                               )}
+                              {friend.lastSyncError && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenSyncProblemId((open) => (open === friend.id ? null : friend.id))
+                                  }
+                                  aria-expanded={openSyncProblemId === friend.id}
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30"
+                                  title={`${friend.lastSyncError} — last attempt ${
+                                    friend.lastSyncErrorAt ? formatRelativeTime(friend.lastSyncErrorAt) : 'recently'
+                                  }`}
+                                >
+                                  ⚠ Sync problem
+                                </button>
+                              )}
                             </div>
+                            {friend.lastSyncError && openSyncProblemId === friend.id && (
+                              <div className="mt-1.5 p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 space-y-1">
+                                <p className="break-words">
+                                  {friend.lastSyncError}
+                                  {friend.lastSyncErrorAt && (
+                                    <span className="text-amber-300/70">
+                                      {' '}
+                                      — last attempt {formatRelativeTime(friend.lastSyncErrorAt)}
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-amber-300/70">
+                                  Studio kept what it already had for these documents. It's usually a problem
+                                  on their site: let them know, then use Sync JSON to try again.
+                                </p>
+                              </div>
+                            )}
                             <p className="text-xs text-indigo-400 font-mono truncate mt-1.5" title={friend.siteUrl}>
                               {friend.siteUrl}
                             </p>
@@ -4656,6 +4749,9 @@ export const App: React.FC = () => {
                                     (res.entriesPruned ? `, ${res.entriesPruned} removed` : '') +
                                     (res.entriesRejected
                                       ? `, ${res.entriesRejected} spoofed entries rejected`
+                                      : '') +
+                                    (res.documentErrors?.length
+                                      ? `. Couldn't use ${res.documentErrors.map((e) => e.doc).join(', ')} (see Sync problem)`
                                       : '') +
                                     '.'
                                 );

@@ -83,6 +83,25 @@ type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
  */
 export const STORED_SECRET_PLACEHOLDER = '••••••••';
 
+const sha256Hex = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
+
+/** A friend's feed row: one per (friend, canonical URL), so two friends never share a row. */
+export const feedRowId = (friendUrl: string, url: string) => `feed-${sha256Hex(`${friendUrl}\0${url}`)}`;
+
+/** An endorsement row: one per (author, source item URL). */
+export const endorsementRowId = (authorUrl: string, url: string) => `end-${sha256Hex(`${authorUrl}\0${url}`)}`;
+
+/**
+ * A versioned schema change, run once in order of `version` and recorded in `PRAGMA user_version`.
+ * The column probes in initializeSchema are the version 0 baseline.
+ */
+interface SchemaMigration {
+  version: number;
+  name: string;
+  /** Runs inside a transaction; throwing rolls it back. */
+  up: () => void;
+}
+
 /** The published files behind a Media Library photo (see electron/services/mediaLibrary.ts). */
 export interface LocalPhotoMedia {
   url: string;
@@ -1123,6 +1142,184 @@ export class StudioDatabase {
     `);
 
     this.migrateLegacyAbsoluteCustomLinks();
+
+    // Everything above is the version 0 baseline; versioned changes follow
+    this.runMigrations();
+  }
+
+  /** The schema version this database is at (`PRAGMA user_version`). */
+  public getSchemaVersion(): number {
+    const row = this.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
+    return Number(row?.user_version || 0);
+  }
+
+  /**
+   * Runs each migration above the stored `user_version`, in order, each in its own transaction
+   * with the version bump. A failure rolls that migration back and is thrown, naming it, so a
+   * half-upgraded database is never used silently.
+   */
+  private runMigrations(): void {
+    const current = this.getSchemaVersion();
+    for (const migration of this.schemaMigrations()) {
+      if (migration.version <= current) continue;
+      this.db.exec('BEGIN');
+      try {
+        migration.up();
+        this.db.exec(`PRAGMA user_version = ${Math.floor(migration.version)}`);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Database upgrade ${migration.version} (${migration.name}) failed: ${message}`);
+      }
+      console.info(`[webring-studio] Database upgraded to version ${migration.version} (${migration.name}).`);
+    }
+  }
+
+  private schemaMigrations(): SchemaMigration[] {
+    return [
+      {
+        version: 1,
+        name: 'feed_endorsement_scoped_unique',
+        up: () => this.migrateFeedAndEndorsementKeys(),
+      },
+    ];
+  }
+
+  /**
+   * Migration 1. Feed and endorsement rows were unique per URL across all friends, and rows saved
+   * before phase 3 used a shorter id, so every later upsert of them hit the URL constraint and the
+   * friend's feed silently stopped updating. Rows are now unique per (friend, URL) and their ids
+   * are recomputed. When two old rows map to the same new key, the verified one is kept (the
+   * newest if both are verified).
+   */
+  private migrateFeedAndEndorsementKeys(): void {
+    const keepBetter = <T extends { verified_signature: number; created_at: string }>(a: T, b: T): T => {
+      if (Boolean(a.verified_signature) !== Boolean(b.verified_signature)) return a.verified_signature ? a : b;
+      return b.created_at >= a.created_at ? b : a;
+    };
+
+    this.db.exec(`
+      CREATE TABLE network_feed_v1 (
+        id TEXT PRIMARY KEY,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL,
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        friend_did TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        canonical_url TEXT NOT NULL,
+        target_url TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0,
+        album_url TEXT NOT NULL DEFAULT '',
+        photo_count INTEGER NOT NULL DEFAULT 0,
+        new_count INTEGER NOT NULL DEFAULT 0,
+        peek_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (friend_site_url, canonical_url)
+      );
+      CREATE TABLE endorsements_v1 (
+        id TEXT PRIMARY KEY,
+        target_canonical_url TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        author_avatar_url TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        source_item_url TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (author_site_url, source_item_url)
+      );
+    `);
+
+    type FeedRow = Record<string, unknown> & { verified_signature: number; created_at: string };
+    const feed = new Map<string, FeedRow>();
+    for (const row of this.db.prepare('SELECT * FROM network_feed').all() as FeedRow[]) {
+      const id = feedRowId(String(row.friend_site_url), String(row.canonical_url));
+      const existing = feed.get(id);
+      feed.set(id, existing ? keepBetter(existing, row) : row);
+    }
+    const insertFeed = this.db.prepare(`
+      INSERT INTO network_feed_v1 (
+        id, friend_site_url, friend_name, friend_avatar_url, friend_did, entry_type, title,
+        canonical_url, target_url, commentary, media_url, tags_json, created_at, verified_signature,
+        album_url, photo_count, new_count, peek_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [id, r] of feed) {
+      insertFeed.run(
+        id,
+        String(r.friend_site_url),
+        String(r.friend_name ?? ''),
+        String(r.friend_avatar_url ?? ''),
+        String(r.friend_did ?? ''),
+        String(r.entry_type),
+        String(r.title ?? ''),
+        String(r.canonical_url),
+        String(r.target_url ?? ''),
+        String(r.commentary ?? ''),
+        String(r.media_url ?? ''),
+        String(r.tags_json ?? '[]'),
+        String(r.created_at),
+        r.verified_signature ? 1 : 0,
+        String(r.album_url ?? ''),
+        Number(r.photo_count ?? 0),
+        Number(r.new_count ?? 0),
+        String(r.peek_json ?? '[]')
+      );
+    }
+
+    type EndorsementRow = Record<string, unknown> & { verified_signature: number; created_at: string };
+    const endorsements = new Map<string, EndorsementRow>();
+    for (const row of this.db.prepare('SELECT * FROM endorsements').all() as EndorsementRow[]) {
+      const id = endorsementRowId(String(row.author_site_url), String(row.source_item_url));
+      const existing = endorsements.get(id);
+      endorsements.set(id, existing ? keepBetter(existing, row) : row);
+    }
+    const insertEndorsement = this.db.prepare(`
+      INSERT INTO endorsements_v1 (
+        id, target_canonical_url, author_site_url, author_name, author_avatar_url,
+        type, commentary, source_item_url, created_at, verified_signature
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [id, r] of endorsements) {
+      insertEndorsement.run(
+        id,
+        String(r.target_canonical_url),
+        String(r.author_site_url),
+        String(r.author_name ?? ''),
+        String(r.author_avatar_url ?? ''),
+        String(r.type),
+        String(r.commentary ?? ''),
+        String(r.source_item_url),
+        String(r.created_at),
+        r.verified_signature ? 1 : 0
+      );
+    }
+
+    this.db.exec(`
+      DROP TABLE network_feed;
+      ALTER TABLE network_feed_v1 RENAME TO network_feed;
+      DROP TABLE endorsements;
+      ALTER TABLE endorsements_v1 RENAME TO endorsements;
+      CREATE INDEX IF NOT EXISTS idx_network_feed_friend ON network_feed(friend_site_url);
+      CREATE INDEX IF NOT EXISTS idx_network_feed_created ON network_feed(created_at);
+      CREATE INDEX IF NOT EXISTS idx_network_feed_album ON network_feed(album_url);
+      CREATE INDEX IF NOT EXISTS idx_endorsements_author ON endorsements(author_site_url);
+    `);
+
+    // Why a friend's last sync couldn't use one of their documents (local only, never exported)
+    const friendColumns = this.db.prepare('PRAGMA table_info(friends)').all() as Array<{ name: string }>;
+    if (!friendColumns.some((c) => c.name === 'last_sync_error')) {
+      this.db.exec("ALTER TABLE friends ADD COLUMN last_sync_error TEXT NOT NULL DEFAULT ''");
+    }
+    if (!friendColumns.some((c) => c.name === 'last_sync_error_at')) {
+      this.db.exec("ALTER TABLE friends ADD COLUMN last_sync_error_at TEXT NOT NULL DEFAULT ''");
+    }
   }
 
   /**
@@ -2101,6 +2298,9 @@ export class StudioDatabase {
         : 'unverified') as FriendKeyStatus,
       lastCrawledAt: r.last_crawled_at ? String(r.last_crawled_at) : undefined,
       addedAt: String(r.added_at),
+      ...(r.last_sync_error
+        ? { lastSyncError: String(r.last_sync_error), lastSyncErrorAt: String(r.last_sync_error_at || '') }
+        : {}),
     };
   }
 
@@ -2653,6 +2853,17 @@ export class StudioDatabase {
     this.db
       .prepare('UPDATE friends SET sync_failures = 0, retry_after = NULL WHERE site_url = ? AND sync_failures > 0')
       .run(normalizeSiteUrl(siteUrl));
+  }
+
+  /**
+   * Records why the last sync couldn't use one of a friend's documents (or clears it with '').
+   * Local only: shown as "Sync problem" in the friends list, never exported.
+   */
+  public setFriendSyncError(siteUrl: string, message: string): void {
+    const clean = message.replace(/\s+/g, ' ').trim().slice(0, 500);
+    this.db
+      .prepare('UPDATE friends SET last_sync_error = ?, last_sync_error_at = ? WHERE site_url = ?')
+      .run(clean, clean ? new Date().toISOString() : '', normalizeSiteUrl(siteUrl));
   }
 
   /** Forgets cached validators (all, or one site's), so the next sync downloads everything. */
@@ -3676,34 +3887,26 @@ export class StudioDatabase {
   }
 
   public upsertEndorsement(input: Omit<EndorsementItem, 'id'>): void {
-    const id = `end-${crypto
-      .createHash('sha256')
-      .update(`${input.authorSiteUrl}\0${input.sourceItemUrl}`)
-      .digest('hex')}`;
-    const existing = this.db
-      .prepare('SELECT author_site_url, verified_signature FROM endorsements WHERE id = ? OR source_item_url = ?')
-      .get(id, input.sourceItemUrl) as { author_site_url: string; verified_signature: number } | undefined;
-    if (existing) {
-      if (existing.author_site_url !== input.authorSiteUrl) return;
-      if (existing.verified_signature && !input.verifiedSignature) return;
-    }
+    // Rows are scoped per author, so another site can't take over this one. An unverified copy
+    // never replaces a verified row.
     this.db
       .prepare(
         `INSERT INTO endorsements (
           id, target_canonical_url, author_site_url, author_name, author_avatar_url,
           type, commentary, source_item_url, created_at, verified_signature
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        ON CONFLICT(author_site_url, source_item_url) DO UPDATE SET
           target_canonical_url = excluded.target_canonical_url,
           author_name = excluded.author_name,
           author_avatar_url = excluded.author_avatar_url,
           type = excluded.type,
           commentary = excluded.commentary,
           created_at = excluded.created_at,
-          verified_signature = excluded.verified_signature`
+          verified_signature = excluded.verified_signature
+        WHERE excluded.verified_signature = 1 OR endorsements.verified_signature = 0`
       )
       .run(
-        id,
+        endorsementRowId(input.authorSiteUrl, input.sourceItemUrl),
         input.targetCanonicalUrl,
         input.authorSiteUrl,
         input.authorName,
@@ -3944,17 +4147,9 @@ export class StudioDatabase {
   }
 
   public upsertNetworkFeedEntry(entry: Omit<NetworkFeedEntry, 'id'>): void {
-    const id = `feed-${crypto
-      .createHash('sha256')
-      .update(`${entry.friendSiteUrl}\0${entry.canonicalUrl}`)
-      .digest('hex')}`;
-    const existing = this.db
-      .prepare('SELECT friend_site_url, verified_signature FROM network_feed WHERE id = ? OR canonical_url = ?')
-      .get(id, entry.canonicalUrl) as { friend_site_url: string; verified_signature: number } | undefined;
-    if (existing) {
-      if (existing.friend_site_url !== entry.friendSiteUrl) return;
-      if (existing.verified_signature && !entry.verifiedSignature) return;
-    }
+    // Rows are scoped per friend: two friends publishing the same URL get a row each. An
+    // unverified copy never replaces a verified row.
+    const id = feedRowId(entry.friendSiteUrl, entry.canonicalUrl);
     this.db
       .prepare(
         `INSERT INTO network_feed (
@@ -3963,7 +4158,7 @@ export class StudioDatabase {
           media_url, tags_json, created_at, verified_signature,
           album_url, photo_count, new_count, peek_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        ON CONFLICT(friend_site_url, canonical_url) DO UPDATE SET
           friend_name = excluded.friend_name,
           friend_avatar_url = excluded.friend_avatar_url,
           friend_did = excluded.friend_did,
@@ -3978,7 +4173,8 @@ export class StudioDatabase {
           album_url = excluded.album_url,
           photo_count = excluded.photo_count,
           new_count = excluded.new_count,
-          peek_json = excluded.peek_json`
+          peek_json = excluded.peek_json
+        WHERE excluded.verified_signature = 1 OR network_feed.verified_signature = 0`
       )
       .run(
         id,

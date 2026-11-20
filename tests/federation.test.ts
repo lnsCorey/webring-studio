@@ -40,7 +40,7 @@ import {
 import { parseProxyUrl } from '../electron/security/proxyAgent';
 import { planWindowProxy } from '../electron/security/windowProxy';
 import { encodeQrMatrix } from '../src/studio/QrCodeSvg';
-import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
+import { endorsementRowId, feedRowId, STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { buildRingDirectoryHtml, StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { renderTemplatePage } from '../electron/services/siteTemplates';
@@ -6414,9 +6414,14 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
         createdAt: '2026-11-16T11:00:00.000Z',
         verifiedSignature: false,
       });
+      // Rows are scoped per friend (phase 6): Mallory's write is a separate row of Mallory's and
+      // can't touch Alice's, and Alice's unverified copy doesn't replace her verified one
       const feed = myDb.getNetworkFeed();
-      expect(feed).toHaveLength(1);
-      expect(feed[0].commentary).toBe('Verified content');
+      const alices = feed.filter((e) => e.friendSiteUrl === 'https://alice.sec.test');
+      expect(alices).toHaveLength(1);
+      expect(alices[0].commentary).toBe('Verified content');
+      expect(alices[0].verifiedSignature).toBe(true);
+      expect(feed.filter((e) => e.friendSiteUrl === 'https://mallory.sec.test')).toHaveLength(1);
     } finally {
       myDb.close();
       friendDb.close();
@@ -6528,6 +6533,195 @@ describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', ()
       expect(badHost).toBe(403);
     } finally {
       await server.stop();
+    }
+  });
+});
+
+describe('Security Phase 6: upgrade migrations', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  /** Alice's published site with one post, for a friend to sync. */
+  const publishAlice = () => {
+    const aliceDb = new StudioDatabase(path.join(tempRoot, 'alice'), 'alice.sqlite');
+    aliceDb.updateProfile({ siteUrl: 'https://alice.p6.test', displayName: 'Alice' });
+    const post = aliceDb.createItem({ type: 'post', title: 'New title', commentary: 'Hello from the new build' });
+    const out = path.join(tempRoot, 'alice-out');
+    new StaticSiteGenerator(aliceDb).generateToDirectory(out);
+    return { aliceDb, post, out };
+  };
+
+  /**
+   * A persona database as builds before phase 3 left it: feed and endorsement rows unique per URL
+   * across all friends, with the old 10-hex-digit ids.
+   */
+  const writeV0Database = (
+    dir: string,
+    rows: {
+      feed: Array<{ id: string; friend: string; title: string; url: string; createdAt: string; verified: boolean }>;
+      endorsements: Array<{ id: string; target: string; author: string; url: string; createdAt: string }>;
+    }
+  ) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const raw = new DatabaseSync(path.join(dir, 'legacy.sqlite'));
+    raw.exec(`
+      CREATE TABLE endorsements (
+        id TEXT PRIMARY KEY,
+        target_canonical_url TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        author_avatar_url TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        source_item_url TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE network_feed (
+        id TEXT PRIMARY KEY,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL,
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        friend_did TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        canonical_url TEXT NOT NULL UNIQUE,
+        target_url TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const feed = raw.prepare(
+      `INSERT INTO network_feed (id, friend_site_url, friend_name, entry_type, title, canonical_url, target_url, created_at, verified_signature)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const r of rows.feed) feed.run(r.id, r.friend, 'Alice', 'post', r.title, r.url, '', r.createdAt, r.verified ? 1 : 0);
+    const end = raw.prepare(
+      `INSERT INTO endorsements (id, target_canonical_url, author_site_url, author_name, type, source_item_url, created_at, verified_signature)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+    );
+    for (const r of rows.endorsements) end.run(r.id, r.target, r.author, 'Alice', 'like', r.url, r.createdAt);
+    raw.close();
+  };
+
+  it('upgrades a pre-phase-3 database: ids recomputed, and sync updates, prunes and reports no error', async () => {
+    const { aliceDb, post, out } = publishAlice();
+    const bobDir = path.join(tempRoot, 'bob');
+    const gone = 'https://alice.p6.test/posts/deleted';
+    writeV0Database(bobDir, {
+      feed: [
+        { id: 'feed-0123456789', friend: 'https://alice.p6.test', title: 'Old title', url: post.canonicalUrl, createdAt: post.createdAt, verified: true },
+        { id: 'feed-abcdef0123', friend: 'https://alice.p6.test', title: 'Removed post', url: gone, createdAt: post.createdAt, verified: true },
+      ],
+      endorsements: [
+        { id: 'end-0123456789', target: 'https://bob.p6.test/posts/1', author: 'https://alice.p6.test', url: 'https://alice.p6.test/likes/1', createdAt: '2026-01-01T00:00:00.000Z' },
+      ],
+    });
+
+    const bobDb = new StudioDatabase(bobDir, 'legacy.sqlite');
+    try {
+      expect(bobDb.getSchemaVersion()).toBeGreaterThanOrEqual(1);
+      const ids = bobDb.getNetworkFeed().map((e) => e.id).sort();
+      expect(ids).toEqual([feedRowId('https://alice.p6.test', post.canonicalUrl), feedRowId('https://alice.p6.test', gone)].sort());
+      expect(bobDb.getEndorsements()[0].id).toBe(endorsementRowId('https://alice.p6.test', 'https://alice.p6.test/likes/1'));
+
+      bobDb.updateProfile({ siteUrl: 'https://bob.p6.test', displayName: 'Bob' });
+      const res = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(res.success).toBe(true);
+      expect(res.documentErrors).toBeUndefined();
+      const feed = bobDb.getNetworkFeed().filter((e) => e.friendSiteUrl === 'https://alice.p6.test');
+      // The old row is updated in place (the bug left it frozen), and the removed post is pruned
+      expect(feed.map((e) => e.canonicalUrl)).toEqual([post.canonicalUrl]);
+      expect(feed[0].title).toBe('New title');
+      expect(bobDb.getFriendBySiteUrl('https://alice.p6.test')?.lastSyncError).toBeUndefined();
+    } finally {
+      bobDb.close();
+      aliceDb.close();
+    }
+
+    // Opening again doesn't run the upgrade a second time
+    const reopened = new StudioDatabase(bobDir, 'legacy.sqlite');
+    try {
+      expect(reopened.getNetworkFeed().map((e) => e.title)).toEqual(['New title']);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('gives two friends that publish the same canonical URL a row each', () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'two'), 'two.sqlite');
+    try {
+      for (const friend of ['https://a.p6.test', 'https://b.p6.test']) {
+        db.upsertNetworkFeedEntry({
+          friendSiteUrl: friend,
+          friendName: friend,
+          friendAvatarUrl: '',
+          friendDid: '',
+          entryType: 'post',
+          title: friend,
+          canonicalUrl: 'https://shared.p6.test/post',
+          targetUrl: '',
+          commentary: '',
+          mediaUrl: '',
+          tags: [],
+          createdAt: '2026-11-01T00:00:00.000Z',
+          verifiedSignature: true,
+        });
+      }
+      expect(db.getNetworkFeed().map((e) => e.friendSiteUrl).sort()).toEqual(['https://a.p6.test', 'https://b.p6.test']);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('reports a broken items.json as a sync problem, and clears it once the file is fixed', async () => {
+    const { aliceDb, out } = publishAlice();
+    const bobDb = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    try {
+      bobDb.updateProfile({ siteUrl: 'https://bob.p6.test', displayName: 'Bob', publishSettings: { publishFriendsList: true } });
+      const itemsPath = path.join(out, 'api/items.json');
+      const good = fs.readFileSync(itemsPath, 'utf8');
+      fs.writeFileSync(itemsPath, '{ "items": [ not json', 'utf8');
+
+      const broken = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(broken.success).toBe(true);
+      expect(broken.documentErrors).toHaveLength(1);
+      expect(broken.documentErrors![0].doc).toBe('items.json');
+      const friend = bobDb.getFriendBySiteUrl('https://alice.p6.test')!;
+      expect(friend.lastSyncError).toMatch(/^items\.json: /);
+      expect(friend.lastSyncErrorAt).toBeTruthy();
+
+      // Local only: never in the published friends list
+      bobDb.addOrUpdateFriend({ siteUrl: 'https://alice.p6.test', displayName: 'Alice', visibility: 'public' });
+      const exported = bobDb.buildSignedSiteBundle({ publish: true }).connections.friends;
+      expect(exported).toHaveLength(1);
+      expect(JSON.stringify(exported)).not.toMatch(/lastSyncError|items\.json/);
+
+      // A missing document is normal, not a problem
+      fs.rmSync(itemsPath);
+      const missing = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(missing.documentErrors).toBeUndefined();
+      expect(bobDb.getFriendBySiteUrl('https://alice.p6.test')?.lastSyncError).toBeUndefined();
+
+      fs.writeFileSync(itemsPath, '{ "items": [ not json', 'utf8');
+      await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      fs.writeFileSync(itemsPath, good, 'utf8');
+      const fixed = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(fixed.documentErrors).toBeUndefined();
+      expect(bobDb.getFriendBySiteUrl('https://alice.p6.test')?.lastSyncError).toBeUndefined();
+    } finally {
+      bobDb.close();
+      aliceDb.close();
     }
   });
 });

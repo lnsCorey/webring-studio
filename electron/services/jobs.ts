@@ -42,11 +42,13 @@ export async function notifyWebringHubs(ctx: ActivePersonaContext): Promise<Webr
 export function summarizeSync(result: SyncAllResult): JobResult {
   const failedFriends = result.friends.filter((r) => !r.success && !r.blocked && !r.deferred).length;
   const deferredFriends = result.friends.filter((r) => r.deferred).length;
+  const friendsWithProblems = result.friends.filter((r) => r.success && r.documentErrors?.length).length;
   const ringErrors = result.rings.joined.filter((r) => r.outcome === 'error').length;
   const parts = [`${result.friends.filter((r) => r.success).length}/${result.friends.length} friends synced`];
   if (result.rings.joined.length) parts.push(`${result.rings.joined.length} joined ring(s) checked`);
   const leavers = result.rings.hosted.reduce((acc, r) => acc + r.autoRemoved.length, 0);
   if (leavers) parts.push(`${leavers} member(s) left your rings`);
+  if (friendsWithProblems) parts.push(`${friendsWithProblems} with sync problems`);
   if (failedFriends) parts.push(`${failedFriends} friend site(s) unreachable`);
   if (deferredFriends) parts.push(`${deferredFriends} unreachable lately (skipped for now)`);
   if (ringErrors) parts.push(`${ringErrors} ring(s) couldn't be checked`);

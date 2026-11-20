@@ -533,6 +533,9 @@ export const FriendConnectionSchema = z.object({
   keyStatus: FriendKeyStatusSchema.default('unverified').optional(),
   lastCrawledAt: z.string().optional(),
   addedAt: z.string(),
+  // Local only, never exported: why the last sync couldn't use one of this friend's documents
+  lastSyncError: z.string().optional(),
+  lastSyncErrorAt: z.string().optional(),
 });
 export type FriendConnection = z.infer<typeof FriendConnectionSchema>;
 

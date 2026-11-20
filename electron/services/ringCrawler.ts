@@ -52,6 +52,18 @@ export interface CrawlSiteResult {
   /** After a failed sync: when Sync All will try this friend again. */
   retryAfter?: string;
   error?: string;
+  /**
+   * Documents the crawl couldn't use (a parse error, a rejected write, an HTTP error other than
+   * 404). The crawl itself still succeeded. Missing or unchanged documents aren't listed.
+   */
+  documentErrors?: Array<{ doc: string; message: string }>;
+}
+
+/** A document that's absent (404, or no such file in a local folder) is normal, not a sync problem. */
+function isMissingDocument(err: unknown): boolean {
+  if (err instanceof UnchangedDocument) return true;
+  if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return true;
+  return err instanceof Error && /^HTTP 404 /.test(err.message);
 }
 
 export type JsonFetcher = (url: string) => Promise<unknown>;
@@ -158,7 +170,11 @@ export async function defaultJsonFetcher(urlOrPath: string, proxyUrl?: string): 
     const raw = fs.readFileSync(filePath, 'utf8');
     return JSON.parse(raw);
   }
-  if (!/^https?:\/\//i.test(urlOrPath) && fs.existsSync(urlOrPath)) {
+  if (!/^https?:\/\//i.test(urlOrPath)) {
+    // A local folder (offline ring folders, tests): a missing file is "not found", like a 404
+    if (!fs.existsSync(urlOrPath)) {
+      throw Object.assign(new Error(`No such file: ${urlOrPath}`), { code: 'ENOENT' });
+    }
     const stat = fs.statSync(urlOrPath);
     if (stat.size > MAX_JSON_BYTES) {
       throw new Error(`File exceeds 5MB limit: ${urlOrPath}`);
@@ -476,6 +492,12 @@ export class RingCrawler {
     };
 
     const unchanged: string[] = [];
+    const documentErrors: Array<{ doc: string; message: string }> = [];
+    const noteDocumentError = (doc: string, err: unknown) => {
+      if (isMissingDocument(err)) return;
+      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim().slice(0, 300);
+      documentErrors.push({ doc, message });
+    };
     // The manifest, did.json and profile are small and needed in full every time, so when the
     // manifest lists the same fingerprint as the copy saved when they last verified (no request),
     // or the host answers 304, that copy is used and checked again as if just downloaded.
@@ -784,8 +806,9 @@ export class RingCrawler {
           entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'photos', seenPhotoUrls);
           rememberValidators(albumsFetch);
         }
-      } catch {
-        // Continue if albums.json is missing or unchanged
+      } catch (err) {
+        // Missing or unchanged is normal; anything else is reported, and the rest of the crawl goes on
+        noteDocumentError('albums.json', err);
       }
 
       // Crawl items.json (posts, shares, likes, recommendations, comments) and independently verify its Ed25519 signature
@@ -854,8 +877,8 @@ export class RingCrawler {
           entriesPruned += this.db.pruneEndorsementsFrom(normalizedFriendUrl, seenItemUrls, since);
           rememberValidators(itemsFetch);
         }
-      } catch {
-        // Continue if items.json is missing or unchanged
+      } catch (err) {
+        noteDocumentError('items.json', err);
       }
 
       // connections.json: does this friend list us back ("Mutual")? Only a verified copy that
@@ -882,9 +905,16 @@ export class RingCrawler {
           );
           rememberValidators(connectionsFetch);
         }
-      } catch {
+      } catch (err) {
         // Optional: missing, unchanged or unverifiable leaves "Mutual" as it was
+        noteDocumentError('connections.json', err);
       }
+
+      // Shown as "Sync problem" in the friends list until a sync uses every document again
+      this.db.setFriendSyncError(
+        normalizedFriendUrl,
+        documentErrors.map((e) => `${e.doc}: ${e.message}`).join(' · ')
+      );
 
       // Sync All does this once at the end instead of once per friend
       if (applyFeedWindow) entriesPruned += this.db.pruneFeedOutsideWindow();
@@ -908,6 +938,7 @@ export class RingCrawler {
         verifiedSignature: allVerified,
         keyChangedWarning,
         ...(unchanged.length ? { unchanged } : {}),
+        ...(documentErrors.length ? { documentErrors } : {}),
       };
     } catch (err: unknown) {
       return {
