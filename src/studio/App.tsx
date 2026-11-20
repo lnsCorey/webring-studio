@@ -6912,7 +6912,7 @@ export const App: React.FC = () => {
                                 await window.studioApi?.resolveMcpApproval?.(item.id, true);
                                 const info = await window.studioApi?.getMcpInfo?.();
                                 if (info) setMcpInfo(info);
-                                await refreshData();
+                                await refreshStudioData();
                                 notify(`Approved and ran ${item.toolName}.`);
                               }}
                               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
