@@ -20,7 +20,7 @@ import * as fs from 'fs';
 import { pathToFileURL } from 'url';
 import { ActivePersonaContext, PersonaManager } from './services/personaManager';
 import { buildEditContextMenu } from './editContextMenu';
-import { LocalPreviewServer } from './services/localPreviewServer';
+import { isAllowedPreviewFrameUrl, LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
 import { DEMO_PEER_FOLDER_NAME } from './db/legacyDemoContent';
@@ -409,6 +409,9 @@ async function initServices() {
   // A secret saved without the keychain (with consent) shows the security banner at once
   onKeyVaultFallback(() => pushSecurityStatus(true));
   localPreviewServer = new LocalPreviewServer();
+  localPreviewServer.onIdleStop = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:preview-stopped');
+  };
   webringMcpServer = new WebringMcpServer(
     personaManager,
     userDataDir,
@@ -513,6 +516,22 @@ async function initServices() {
   await mcpHttpServer.start(0);
 }
 
+/**
+ * Studio window's CSP as a header: index.html's policy (relaxed for Vite in development), with
+ * frames limited to the preview server's own origin.
+ */
+function studioWindowCsp(options: { dev: boolean }): string {
+  const port = localPreviewServer?.port;
+  const frameSrc = port ? `http://127.0.0.1:${port}` : "'none'";
+  const script = options.dev ? "'self' 'unsafe-inline' http://localhost:*" : "'self'";
+  const connect = options.dev ? "'self' ws://localhost:* http://localhost:*" : "'self'";
+  return (
+    `default-src 'self'; script-src ${script}; style-src 'self' 'unsafe-inline'; ` +
+    "img-src 'self' data: https: studio-media:; media-src 'self' studio-media:; font-src 'self' data:; " +
+    `connect-src ${connect}; frame-src ${frameSrc}; object-src 'none'; base-uri 'none'; form-action 'none'`
+  );
+}
+
 function createWindow(show = true) {
   mainWindow = new BrowserWindow({
     show,
@@ -537,17 +556,11 @@ function createWindow(show = true) {
     callback(false);
   });
 
-  // Prevent subframes (e.g. preview iframe) from navigating to non-loopback remote origins
+  // Subframes (the site preview) may only show the preview server's own origin: not another
+  // loopback port, a data: URL or the web
   mainWindow.webContents.on('will-frame-navigate', (event) => {
-    const url = event.url || '';
-    if (!url || url.startsWith('about:') || url.startsWith('data:')) return;
-    try {
-      const parsed = new URL(url);
-      if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') return;
-    } catch {
-      // Fall through to prevent
-    }
-    event.preventDefault();
+    if (event.isMainFrame) return; // the window itself is handled by will-navigate
+    if (!isAllowedPreviewFrameUrl(event.url || '', localPreviewServer.port)) event.preventDefault();
   });
 
   // Links inside Studio (Markdown previews, posts) never open in an Electron window, which would
@@ -596,17 +609,23 @@ function createWindow(show = true) {
       callback({
         responseHeaders: {
           ...details.responseHeaders,
-          'Content-Security-Policy': [
-            "default-src 'self'; script-src 'self' 'unsafe-inline' http://localhost:*; style-src 'self' 'unsafe-inline'; " +
-              "img-src 'self' data: https: studio-media:; media-src 'self' studio-media:; font-src 'self' data:; " +
-              "connect-src 'self' ws://localhost:* http://localhost:*; frame-src http://127.0.0.1:*; object-src 'none'; " +
-              "base-uri 'none'; form-action 'none'",
-          ],
+          'Content-Security-Policy': [studioWindowCsp({ dev: true })],
         },
       });
     });
     mainWindow.loadURL(devServerUrl);
   } else {
+    // The meta CSP in index.html allows any loopback port for frames (it can't know the port);
+    // this header narrows it to the preview server's origin
+    session.defaultSession.webRequest.onHeadersReceived({ urls: ['file:///*'] }, (details, callback) => {
+      if (details.resourceType !== 'mainFrame') return callback({});
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [studioWindowCsp({ dev: false })],
+        },
+      });
+    });
     const indexHtmlPath = path.join(__dirname, '../../dist/index.html');
     mainWindow.loadFile(indexHtmlPath);
   }
@@ -686,6 +705,8 @@ if (!gotTheLock) {
       app.dock?.setIcon(nativeImage.createFromPath(assetPath('dock-icon.png')));
     }
     app.setAboutPanelOptions({ applicationName: 'Webring Studio', iconPath: assetPath('app-icon.png') });
+    // The window's CSP names the preview's origin, so pick its port first
+    await localPreviewServer.reservePort().catch(() => 0);
     createWindow(!startHidden && !splashDone);
     if (splashDone) {
       // Show the main window in the splash's place once it has played (unless the tray or a
@@ -731,9 +752,15 @@ app.on('before-quit', () => {
   isQuitting = true;
   scheduler?.stop();
   autoPublisher?.dispose();
+  void localPreviewServer?.stop();
 });
 
 function registerIpcHandlers() {
+  // The preview panel closed: nothing needs the loopback server until the next preview
+  ipcMain.handle('studio:preview-closed', async () => {
+    await localPreviewServer.stop();
+    return { ok: true };
+  });
   ipcMain.handle('studio:get-bundle', async () => {
     const ctx = personaManager.getActiveContext();
     const bundle = ctx.db.buildSignedSiteBundle();

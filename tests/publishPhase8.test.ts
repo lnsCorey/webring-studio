@@ -7,6 +7,7 @@ import { sftpAuthMethodOf, StudioDatabase } from '../electron/db/database';
 import { PersonaManager } from '../electron/services/personaManager';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
 import { inlineScriptHashes, loadSiteCss, StaticSiteGenerator } from '../electron/services/siteGenerator';
+import { isAllowedPreviewFrameUrl, LocalPreviewServer, PREVIEW_IDLE_TIMEOUT_MS } from '../electron/services/localPreviewServer';
 import {
   ftpAccessOptions,
   FtpTlsError,
@@ -378,5 +379,68 @@ describe('Security Phase 8: the published page runs only its own scripts', () =>
     const source = read('electron/services/siteGenerator.ts');
     expect(source).not.toContain('injectHydrationData');
     expect(source).not.toMatch(/__WEBRING_BUNDLE__ = \$\{JSON\.stringify/);
+  });
+});
+
+describe('Security Phase 8: the preview server runs only while needed', () => {
+  const get = (url: string) => fetch(url).then((r) => r.status);
+
+  it('stops on close and restarts on the same origin', async () => {
+    const server = new LocalPreviewServer();
+    const reserved = await server.reservePort();
+    try {
+      const url = await server.serveLivePreview('<p>hi</p>');
+      expect(new URL(url).port).toBe(String(reserved));
+      expect(await get(url)).toBe(200);
+      await server.stop();
+      expect(server.isRunning).toBe(false);
+      await expect(get(url)).rejects.toThrow();
+      const again = await server.serveLivePreview('<p>again</p>');
+      expect(new URL(again).port).toBe(String(reserved));
+      expect(await get(again)).toBe(200);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('stops itself after the idle timeout and says so', async () => {
+    const server = new LocalPreviewServer();
+    server.idleTimeoutMs = 50;
+    const stopped = vi.fn();
+    server.onIdleStop = stopped;
+    try {
+      await server.serveLivePreview('<p>hi</p>');
+      expect(server.isRunning).toBe(true);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(server.isRunning).toBe(false);
+      expect(stopped).toHaveBeenCalledTimes(1);
+      expect(PREVIEW_IDLE_TIMEOUT_MS).toBe(10 * 60 * 1000);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('lets a frame show only the preview server, not another loopback port or a data: URL', () => {
+    expect(isAllowedPreviewFrameUrl('http://127.0.0.1:5000/__studio-live-preview?v=2', 5000)).toBe(true);
+    expect(isAllowedPreviewFrameUrl('about:blank', 5000)).toBe(true);
+    expect(isAllowedPreviewFrameUrl('http://127.0.0.1:5001/', 5000)).toBe(false);
+    expect(isAllowedPreviewFrameUrl('http://localhost:5000/', 5000)).toBe(false);
+    expect(isAllowedPreviewFrameUrl('https://127.0.0.1:5000/', 5000)).toBe(false);
+    expect(isAllowedPreviewFrameUrl('data:text/html,<script>1</script>', 5000)).toBe(false);
+    expect(isAllowedPreviewFrameUrl('https://evil.example/', 5000)).toBe(false);
+    expect(isAllowedPreviewFrameUrl('http://127.0.0.1:5000/', 0)).toBe(false);
+  });
+
+  it('closing the preview, quitting and the window CSP are wired to the server', () => {
+    const main = read('electron/main.ts');
+    expect(main).toMatch(/ipcMain\.handle\('studio:preview-closed', async \(\) => \{\s*await localPreviewServer\.stop\(\);/);
+    expect(main).toMatch(/app\.on\('before-quit', \(\) => \{[^}]*localPreviewServer\?\.stop\(\)/);
+    expect(main).toContain('isAllowedPreviewFrameUrl(event.url ||');
+    expect(main).toContain('frame-src ${frameSrc}');
+    expect(main).not.toMatch(/frame-src http:\/\/127\.0\.0\.1:\*/);
+    expect(read('electron/preload.ts')).toContain("previewClosed: () => ipcRenderer.invoke('studio:preview-closed'),");
+    const app = read('src/studio/App.tsx');
+    expect(app).toContain('void window.studioApi?.previewClosed?.();');
+    expect(app).toContain('Preview stopped — click to restart');
   });
 });

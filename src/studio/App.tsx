@@ -536,6 +536,8 @@ declare global {
       getAgentChanges?: () => Promise<HeldAgentChangeView[]>;
       releaseAgentChanges?: () => Promise<unknown>;
       onShowAutoPublish?: (cb: () => void) => () => void;
+      previewClosed?: () => Promise<unknown>;
+      onPreviewStopped?: (cb: () => void) => () => void;
       onSecurityStatusChanged?: (cb: (status: SecurityStatusView) => void) => () => void;
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
@@ -982,6 +984,10 @@ export const App: React.FC = () => {
   const [testExportResult, setTestExportResult] = useState<TestExportPreviewState | null>(null);
   const [previewRenderMode, setPreviewRenderMode] = useState<'studio' | 'exported-http'>('studio');
   const [iframeRefreshKey, setIframeRefreshKey] = useState<number>(0);
+  // The loopback preview server stopped after 10 idle minutes while the preview was showing
+  const [previewIdleStopped, setPreviewIdleStopped] = useState(false);
+  // It isn't running (preview closed, or idle-stopped): start it again when the preview opens
+  const previewServerStopped = useRef(false);
 
   // MCP Agent Hub state
   const [mcpInfo, setMcpInfo] = useState<{
@@ -1359,6 +1365,35 @@ export const App: React.FC = () => {
       setSelectedAlbumId('');
     }
   };
+
+  // The preview server runs only while needed: closing the preview stops it, and an idle stop
+  // (10 minutes) offers a restart. Getting the bundle starts it again.
+  const restartPreview = async () => {
+    await refreshStudioData();
+    previewServerStopped.current = false;
+    setPreviewIdleStopped(false);
+    setIframeRefreshKey((k) => k + 1);
+  };
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  useEffect(
+    () =>
+      window.studioApi?.onPreviewStopped?.(() => {
+        previewServerStopped.current = true;
+        if (activeTabRef.current === 'preview') setPreviewIdleStopped(true);
+      }),
+    []
+  );
+  useEffect(() => {
+    if (activeTab !== 'preview') return;
+    if (previewServerStopped.current) void restartPreview();
+    return () => {
+      previewServerStopped.current = true;
+      setPreviewIdleStopped(false);
+      void window.studioApi?.previewClosed?.();
+    };
+    // Only entering and leaving the Preview tab matter here
+  }, [activeTab]);
 
   const handleSwitchPersona = async (personaId: string) => {
     if (!window.studioApi || personaId === activePersonaId) return;
@@ -5892,7 +5927,16 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className="rounded-2xl overflow-hidden border border-slate-800 shadow-2xl bg-slate-950">
+              <div className="relative rounded-2xl overflow-hidden border border-slate-800 shadow-2xl bg-slate-950">
+                {previewIdleStopped && (
+                  <button
+                    type="button"
+                    onClick={() => void restartPreview()}
+                    className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/85 text-sm font-semibold text-slate-200 hover:text-white"
+                  >
+                    Preview stopped — click to restart
+                  </button>
+                )}
                 {previewRenderMode === 'exported-http' && testExportResult ? (
                   <iframe
                     key={`${testExportResult.previewUrl}-${iframeRefreshKey}`}

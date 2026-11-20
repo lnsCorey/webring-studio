@@ -1,4 +1,5 @@
 import * as http from 'http';
+import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import { StaticSiteGenerator } from './siteGenerator';
@@ -46,6 +47,25 @@ const MIME_TYPES: Record<string, string> = {
  */
 const LIVE_PREVIEW_PATH = '/__studio-live-preview';
 
+/** The preview server stops after this long with no requests, and starts again when needed. */
+export const PREVIEW_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Whether a frame in Studio's window may navigate to `url`: only the preview server's own origin
+ * (http://127.0.0.1:<its port>), never another loopback port or a data: URL. about:blank is the
+ * empty frame.
+ */
+export function isAllowedPreviewFrameUrl(url: string, previewPort: number): boolean {
+  if (url === 'about:blank' || url === 'about:srcdoc') return true;
+  if (!previewPort) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' && parsed.hostname === '127.0.0.1' && Number(parsed.port) === previewPort;
+  } catch {
+    return false;
+  }
+}
+
 export class LocalPreviewServer {
   private server: http.Server | null = null;
   private currentRootDir: string | null = null;
@@ -53,6 +73,47 @@ export class LocalPreviewServer {
   /** Studio's live preview page (in memory), served at LIVE_PREVIEW_PATH. */
   private liveHtml = '';
   private liveVersion = 0;
+  /** Kept across stops, so a restarted preview has the same origin (the window's CSP names it). */
+  private preferredPort = 0;
+  private idleTimer: NodeJS.Timeout | null = null;
+  private starting: Promise<void> | null = null;
+  public idleTimeoutMs = PREVIEW_IDLE_TIMEOUT_MS;
+  /** Called after the idle timeout stopped the server. */
+  public onIdleStop: (() => void) | null = null;
+
+  /** The port the preview is served on (or will be when it next starts); 0 before any. */
+  public get port(): number {
+    return this.currentPort || this.preferredPort;
+  }
+
+  public get isRunning(): boolean {
+    return Boolean(this.server);
+  }
+
+  /** Picks the preview's port before the window loads, so its CSP can name the one origin. */
+  public async reservePort(): Promise<number> {
+    if (this.preferredPort) return this.preferredPort;
+    this.preferredPort = await new Promise<number>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const addr = probe.address();
+        const port = addr && typeof addr === 'object' ? addr.port : 0;
+        probe.close(() => resolve(port));
+      });
+    });
+    return this.preferredPort;
+  }
+
+  /** Any request (or new preview content) postpones the idle stop. */
+  private touch(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      void this.stop().then(() => this.onIdleStop?.());
+    }, this.idleTimeoutMs);
+    this.idleTimer.unref?.();
+  }
 
   /**
    * Serves the live preview page from this loopback server and returns its address. The Studio
@@ -63,6 +124,7 @@ export class LocalPreviewServer {
     this.liveHtml = html;
     this.liveVersion++;
     await this.ensureServerStarted();
+    this.touch();
     return `http://127.0.0.1:${this.currentPort}${LIVE_PREVIEW_PATH}?v=${this.liveVersion}`;
   }
 
@@ -79,6 +141,7 @@ export class LocalPreviewServer {
     this.currentRootDir = outputDir;
 
     await this.ensureServerStarted();
+    this.touch();
 
     const filesWritten = generated.filesWritten.map((relPath) => {
       const fullPath = path.join(outputDir, relPath);
@@ -115,9 +178,28 @@ export class LocalPreviewServer {
     if (this.server && this.currentPort > 0) {
       return;
     }
+    // Two previews asked for at once share one start
+    if (!this.starting) {
+      this.starting = (async () => {
+        try {
+          await this.listen(this.preferredPort);
+        } catch (err) {
+          // The remembered port was taken while stopped: use any free one
+          if (!this.preferredPort || (err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
+          await this.listen(0);
+        }
+        this.preferredPort = this.currentPort;
+      })().finally(() => {
+        this.starting = null;
+      });
+    }
+    return this.starting;
+  }
 
+  private listen(port: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const srv = http.createServer((req, res) => {
+        this.touch();
         const host = (req.headers.host || '').toLowerCase();
         if (host !== `127.0.0.1:${this.currentPort}` && host !== `localhost:${this.currentPort}`) {
           res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -175,7 +257,7 @@ export class LocalPreviewServer {
         reject(err);
       });
 
-      srv.listen(0, '127.0.0.1', () => {
+      srv.listen(port, '127.0.0.1', () => {
         const addr = srv.address();
         if (addr && typeof addr === 'object') {
           this.currentPort = addr.port;
@@ -186,17 +268,23 @@ export class LocalPreviewServer {
     });
   }
 
+  /** Stops serving (preview closed, idle, or quitting). The next preview starts it again. */
   public stop(): Promise<void> {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     return new Promise((resolve) => {
-      if (!this.server) {
+      const server = this.server;
+      if (!server) {
         resolve();
         return;
       }
-      this.server.close(() => {
-        this.server = null;
-        this.currentPort = 0;
-        resolve();
-      });
+      this.server = null;
+      this.currentPort = 0;
+      server.close(() => resolve());
+      // Keep-alive connections from the frame would otherwise hold the port open
+      server.closeAllConnections?.();
     });
   }
 }

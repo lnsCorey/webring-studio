@@ -51,6 +51,12 @@ contextBridge.exposeInMainWorld('studioApi', {
   getSecurityStatus: () => ipcRenderer.invoke('studio:get-security-status'),
   getAgentChanges: () => ipcRenderer.invoke('studio:get-agent-changes'),
   releaseAgentChanges: () => ipcRenderer.invoke('studio:release-agent-changes'),
+  previewClosed: () => ipcRenderer.invoke('studio:preview-closed'),
+  onPreviewStopped: (cb: () => void) => {
+    const listener = () => cb();
+    ipcRenderer.on('studio:preview-stopped', listener);
+    return () => ipcRenderer.removeListener('studio:preview-stopped', listener);
+  },
   onShowAutoPublish: (cb: () => void) => {
     const listener = () => cb();
     ipcRenderer.on('studio:show-auto-publish', listener);
