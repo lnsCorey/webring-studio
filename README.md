@@ -106,19 +106,25 @@ A persona is a separate online identity: its own SQLite database, Ed25519 key, `
 
 ### Security and privacy
 
-- Your signing key, SFTP/FTP password and GitHub token are encrypted with your operating system's keychain (Keychain on macOS, DPAPI on Windows, libsecret on Linux). Studio never shows them again after you save them, and only unlocks them to sign or to connect when publishing.
+- Your signing key, SFTP/FTP password, GitHub token and a proxy login are encrypted with your operating system's keychain (Keychain on macOS, DPAPI on Windows, libsecret on Linux). Studio never shows them again after you save them, and only unlocks them to sign or to connect when publishing.
+- **No keychain?** Some Linux desktops and remote sessions have none. Studio then shows a yellow **Secure storage unavailable** notice and asks before it stores a new password or token unencrypted; if you cancel, nothing is saved. The command-line MCP never stores one unencrypted. See **Help → 9. Secure Storage & Proxy**.
 - Every document you publish is signed. Friends' keys are pinned the first time Studio sees them, and a changed key is flagged rather than trusted, unless the old key signed off on it (see [Changing your signing key](#changing-your-signing-key)). Unverified friend profiles or friends with a key-change warning never overwrite stored display fields or reach `connections.json`.
+- **Studio only moves forward.** Every document a friend publishes has a date. If their site serves an older copy than one Studio already verified, it's refused: nothing is removed or changed, and **Older copies refused** on Friends & Webrings says which file and when. A file that doesn't match the fingerprint in their signed manifest is refused too, and their card shows **⚠ Sync problem** with the reason.
+- **Avatars only from their own site.** A friend's avatar is shown only if it's an `https` image on their own site; anything else gets a local placeholder, so no other host learns who looks at it.
+- After upgrading, friend names, bios and avatars that Studio saved before it could verify them are reset to the site address and refreshed from each friend's own site on the next sync.
 - Friends are private by default: they aren't listed on your public site unless you mark them public.
 - **Mute** hides a site from your feed. **Block** also stops crawling it and keeps its endorsements off your published site.
 - When crawling, Studio refuses addresses on your own computer or local network, so a peer can't use it to probe devices behind your firewall.
 - **Proxy or Tor, per persona.** On the Publish tab's **Schedule** card, a persona can route its syncing through a `socks5://`, `socks5h://` (Tor, for example `socks5h://127.0.0.1:9050`) or `http://` proxy. That covers syncing friends and rings, checking links people send you, saving a friend's post, and the friends' images and ring pages Studio shows. Publishing (SFTP/FTP, GitHub) and links you open in your browser still connect directly. The setting is stored only in that persona and never exported.
+- **The proxy never falls back to a direct connection.** If a saved proxy can't be unlocked on this device, Studio pauses all of that persona's network activity and shows a red **Network activity paused** notice, rather than revealing your IP address. Re-enter the proxy to continue.
+- **Big photos can't freeze Studio.** Photos are processed in a separate thread with its own memory limit and a 20-second limit; an image that's too large or takes too long is refused with a message.
 - **Schedule jitter.** Scheduled syncs and publishes can start at a random time up to 5, 15 or 30 minutes after their slot, so several personas on one computer don't contact hosts at the same moment and give away that they're linked.
 
 #### Changing your signing key
 
 - **Planned change:** **Rotate Signing Key…** in **Profile & Identity** makes a new key and has the old key sign a *rotation certificate* for it. The certificate is published in `did.json` and `manifest.json`, so after your next publish, friends move to the new key at their next sync with no warning. A certificate the old key didn't sign is ignored, and the friend still sees a key-changed warning.
 - **Lost key:** if the keychain entry is lost, your old key can't be recovered or used to sign a certificate. You'd need a new key, and friends would see a key-changed warning.
-- **When a friend's key changes without a certificate:** their card shows a 🚨 warning and **Trust New Key & Re-sync**. Use it only after you've confirmed with them some other way that they really lost their key.
+- **When a friend's key changes without a certificate:** their card shows a 🚨 warning and **Review New Key…**. The review shows the key you pinned and the new one as fingerprints, and when the new one was first seen. Ask your friend to read you the first and last 8 characters of theirs (shown under **Profile & Identity → Your key fingerprint**) by phone or another channel you already use, and trust it only if they match. If their site has shown more than one new key, Studio warns you: that can mean someone is impersonating them. Trust only ever pins the exact key you reviewed.
 
 ### Site Design
 
@@ -171,6 +177,7 @@ Sync is built to stay quick with hundreds or thousands of friends:
 - **One request when nothing changed.** Your signed manifest lists a fingerprint for each of your files. When a friend's manifest hasn't changed, or lists the same fingerprints as last time, Studio downloads nothing else from them. Publishing unchanged content produces byte-identical files, so a republish doesn't make friends download everything again.
 - **Compressed downloads.** Studio asks for gzip/brotli, which cuts downloads about 5× on hosts that compress JSON (most do, including GitHub Pages).
 - **Unreachable friends wait.** If a friend's site fails, Sync All skips it for 15 minutes, then 30, doubling up to a day, so dead sites don't slow every sync. Syncing that one friend from their card always tries, and a successful sync clears the wait.
+- **Problems are shown, not hidden.** When one of a friend's files can't be used (it doesn't parse, or doesn't match their manifest), the rest of their sync still runs and their card shows **⚠ Sync problem**. The Sync All message counts them; click it to see just those friends. A missing file isn't a problem.
 
 **Expected sync times.** These come from the sync load test (`npm run loadtest:sync`), with a 150 ms round trip to each friend's host, typical for a host on another continent. Hosts nearer to you are faster: at 50 ms, times are about a third of these.
 
