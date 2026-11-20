@@ -942,8 +942,8 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:webring-hub-add', (_e, url: string) =>
     personaManager.getActiveContext().webringHubService.add(String(url || ''))
   );
-  ipcMain.handle('studio:webring-hub-remove', (_e, url: string) =>
-    personaManager.getActiveContext().webringHubService.remove(String(url || ''))
+  ipcMain.handle('studio:webring-hub-remove', (_e, url: string, options?: { force?: boolean }) =>
+    personaManager.getActiveContext().webringHubService.remove(String(url || ''), { force: options?.force === true })
   );
   ipcMain.handle('studio:webring-hub-search', (_e, url: string, query: string, options?: { limit?: number; offset?: number }) =>
     personaManager

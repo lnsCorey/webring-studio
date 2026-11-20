@@ -37,6 +37,7 @@ import {
   WebringHubListingsPanel,
   WebringHubSearchPanel,
   KeyWitnessCheck,
+  ringsForHubSearch,
   useWebringHubs,
 } from './WebringHubPanels';
 import { WebringShareBlock } from './QrCodeSvg';
@@ -147,6 +148,8 @@ interface JoinedRing {
   nextSiteUrl?: string;
   memberCount: number;
   directoryUrl?: string;
+  /** The other sites in rotation at the last sync. */
+  rotationUrls?: string[];
   hubVerified: boolean;
   lastSyncedAt?: string;
   requestToken?: string;
@@ -3835,6 +3838,7 @@ export const App: React.FC = () => {
               <WebringHubSearchPanel
                 api={webringHubApi}
                 webringHubs={webringHubs}
+                webrings={ringsForHubSearch(joinedRings, hostedRings, bundle?.profile.siteUrl || '')}
                 onManage={() => setActiveTab('publish')}
                 onUse={(result) => {
                   // Only the address and a name to edit: the avatar and bio come from the site itself

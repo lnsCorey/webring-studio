@@ -5729,6 +5729,7 @@ describe('Webring Hubs (optional third-party index)', () => {
     expect(listed).toMatchObject({ listMe: true, state: 'listed' });
     expect(hub.calls.at(-1)).toMatchObject({ method: 'POST', body: { siteUrl: SITE } });
     expect(() => service.remove(HUB)).toThrow(/Unlist it/);
+    expect(service.list()).toHaveLength(1);
 
     const unlisted = await service.unlistSite(HUB);
     expect(unlisted).toMatchObject({ listMe: false, state: 'not-listed' });
@@ -5736,6 +5737,27 @@ describe('Webring Hubs (optional third-party index)', () => {
     // The signed request carries a signature, never the key
     expect(JSON.stringify(hub.calls)).not.toContain('PRIVATE KEY');
     expect(service.remove(HUB)).toEqual([]);
+  });
+
+  it('can forget a listed hub that can no longer be reached, but only when forced', async () => {
+    const hub = makeWebringHub();
+    let reachable = true;
+    const request: typeof hub.request = (url, init) => {
+      if (!reachable) return Promise.reject(new Error('write EPROTO SSL alert number 80'));
+      return hub.request(url, init);
+    };
+    const service = new WebringHubService(db, { request, fetchJson: liveSite });
+    await service.add(HUB);
+    expect(publish().success).toBe(true);
+    await service.listSite(HUB);
+
+    reachable = false;
+    await expect(service.unlistSite(HUB)).rejects.toThrow(/EPROTO/);
+    expect(() => service.remove(HUB)).toThrow(/Unlist it/);
+    expect(service.list()).toHaveLength(1);
+
+    expect(service.remove(HUB, { force: true })).toEqual([]);
+    expect(service.list()).toEqual([]);
   });
 
   it('pings listed hubs after publishTo, only once the live site shows that publish', async () => {

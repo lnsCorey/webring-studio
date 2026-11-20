@@ -351,9 +351,14 @@ export class WebringHubService {
   }
 
   /** Forgets a hub. A listed site must be unlisted first, so a listing is never orphaned. */
-  public remove(rawUrl: string): WebringHubRecord[] {
+  /**
+   * Forgets a hub. A hub the site is listed in must be unlisted first, unless `force` is set:
+   * that is for a hub that can no longer be reached (gone, or no valid certificate), where
+   * unlisting can never succeed. The listing then stays on that server, if it still exists.
+   */
+  public remove(rawUrl: string, options: { force?: boolean } = {}): WebringHubRecord[] {
     const record = this.find(rawUrl);
-    if (record.listMe || record.state === 'listed') {
+    if (!options.force && (record.listMe || record.state === 'listed')) {
       throw new Error(`Your site is listed in ${record.title}. Unlist it before removing the Webring Hub.`);
     }
     const next = this.db.getWebringHubs().filter((d) => d.url !== record.url);

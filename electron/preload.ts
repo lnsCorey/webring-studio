@@ -69,7 +69,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   syncRings: () => ipcRenderer.invoke('studio:ring-sync-all'),
   listWebringHubs: () => ipcRenderer.invoke('studio:webring-hub-list'),
   addWebringHub: (url: string) => ipcRenderer.invoke('studio:webring-hub-add', url),
-  removeWebringHub: (url: string) => ipcRenderer.invoke('studio:webring-hub-remove', url),
+  removeWebringHub: (url: string, options?: { force?: boolean }) =>
+    ipcRenderer.invoke('studio:webring-hub-remove', url, options),
   searchWebringHub: (url: string, query: string, options?: { limit?: number; offset?: number }) =>
     ipcRenderer.invoke('studio:webring-hub-search', url, query, options),
   setWebringHubListed: (url: string, listed: boolean) =>
