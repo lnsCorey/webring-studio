@@ -1,16 +1,20 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { sftpAuthMethodOf, StudioDatabase } from '../electron/db/database';
 import { PersonaManager } from '../electron/services/personaManager';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
+import { StaticSiteGenerator } from '../electron/services/siteGenerator';
 import {
   ftpAccessOptions,
   FtpTlsError,
+  gitBlobSha,
+  GITHUB_BRANCH_BUSY_MESSAGE,
   HostKeyMismatchError,
   isFtpTlsFailure,
   resolveSshAgent,
+  SitePublisher,
   verifyOrPinSftpHostKey,
   WINDOWS_OPENSSH_AGENT_PIPE,
 } from '../electron/services/publisher';
@@ -144,5 +148,155 @@ describe('Security Phase 8: unencrypted FTP only on request', () => {
         // Windows may still hold the database file
       }
     }
+  });
+});
+
+describe('Security Phase 8: GitHub publishing when the branch moves', () => {
+  let dir: string;
+  let db: StudioDatabase;
+
+  /** A tiny in-memory GitHub. `beforeRefUpdate` runs before each ref PATCH and may return a status. */
+  function fakeGitHub(beforeRefUpdate: (n: number) => number | void) {
+    const trees = new Map<string, Map<string, string>>();
+    const commits = new Map<string, { tree: string; parents: string[] }>();
+    const refs = new Map<string, string>();
+    const patches: Array<Record<string, unknown>> = [];
+    let blobPosts = 0;
+    let counter = 0;
+    const newId = () => `id${++counter}`;
+    const readme = gitBlobSha(Buffer.from('# repo'));
+    trees.set('t0', new Map([['README.md', readme]]));
+    commits.set('c0', { tree: 't0', parents: [] });
+    refs.set('gh-pages', 'c0');
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    /** Someone else commits a file to the branch. */
+    const commitElsewhere = (file: string) => {
+      const head = refs.get('gh-pages')!;
+      const tree = new Map(trees.get(commits.get(head)!.tree)!);
+      tree.set(file, gitBlobSha(Buffer.from(file)));
+      const t = newId();
+      trees.set(t, tree);
+      const c = newId();
+      commits.set(c, { tree: t, parents: [head] });
+      refs.set('gh-pages', c);
+    };
+    vi.stubGlobal('fetch', async (url: string, init?: { method?: string; body?: string }) => {
+      const route = new URL(url).pathname.replace('/repos/o/r', '');
+      const method = init?.method || 'GET';
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (route === '' && method === 'GET') return json(200, { default_branch: 'main', permissions: { push: true } });
+      if (route.startsWith('/git/ref/heads/')) return json(200, { object: { sha: refs.get('gh-pages') } });
+      if (route.startsWith('/git/commits/') && method === 'GET') {
+        return json(200, { tree: { sha: commits.get(route.slice('/git/commits/'.length))!.tree } });
+      }
+      if (route.startsWith('/git/trees/') && method === 'GET') {
+        const tree = trees.get(route.slice('/git/trees/'.length))!;
+        return json(200, { truncated: false, tree: [...tree].map(([p, sha]) => ({ path: p, type: 'blob', sha })) });
+      }
+      if (route === '/git/blobs') {
+        blobPosts++;
+        return json(201, { sha: gitBlobSha(Buffer.from(body.content, 'base64')) });
+      }
+      if (route === '/git/trees') {
+        const tree = new Map(trees.get(body.base_tree)!);
+        for (const entry of body.tree) {
+          if (entry.sha === null) tree.delete(entry.path);
+          else tree.set(entry.path, entry.sha);
+        }
+        const id = newId();
+        trees.set(id, tree);
+        return json(201, { sha: id });
+      }
+      if (route === '/git/commits') {
+        const id = newId();
+        commits.set(id, { tree: body.tree, parents: body.parents });
+        return json(201, { sha: id });
+      }
+      if (route.startsWith('/git/refs/heads/') && method === 'PATCH') {
+        patches.push(body);
+        const forced = beforeRefUpdate(patches.length);
+        if (forced) return json(forced, { message: 'Update is not a fast forward' });
+        // A real fast-forward check: the new commit must sit on the current head
+        if (!body.force && commits.get(body.sha)!.parents[0] !== refs.get('gh-pages')) {
+          return json(422, { message: 'Update is not a fast forward' });
+        }
+        refs.set('gh-pages', body.sha);
+        return json(200, {});
+      }
+      if (route === '/pages') return json(409, {});
+      return json(404, { message: `unhandled ${method} ${route}` });
+    });
+    const headFiles = () => trees.get(commits.get(refs.get('gh-pages')!)!.tree)!;
+    return { patches, commitElsewhere, headFiles, blobPosts: () => blobPosts };
+  }
+
+  const publish = async () => {
+    const publisher = new SitePublisher(new StaticSiteGenerator(db));
+    publisher.githubRetryDelaysMs = [0, 0];
+    const settings = {
+      ...db.getProfile().publishSettings,
+      githubOwner: 'o',
+      githubRepo: 'r',
+      githubBranch: 'gh-pages',
+      githubToken: 'tok',
+    };
+    return publisher.publishToGitHubPages(settings, fs.mkdtempSync(path.join(dir, 'gh-')));
+  };
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p8-gh-'));
+    db = new StudioDatabase(dir, 'gh.sqlite');
+    db.updateProfile({ siteUrl: 'https://me.ring.test', handle: 'me.ring.test', displayName: 'Me' });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    db.close();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows may still hold the database file
+    }
+  });
+
+  it('rebuilds on the new head when someone else committed mid-publish, keeping their file', async () => {
+    const gh: ReturnType<typeof fakeGitHub> = fakeGitHub((n) => {
+      if (n === 1) gh.commitElsewhere('manual.txt');
+    });
+    const res = await publish();
+    expect(res.success).toBe(true);
+    expect(gh.patches).toHaveLength(2);
+    expect(gh.headFiles().has('manual.txt')).toBe(true);
+    expect(gh.headFiles().has('index.html')).toBe(true);
+    expect(gh.headFiles().has('README.md')).toBe(true);
+    // The retry reuses the blobs it already uploaded: one upload per published file
+    expect(gh.blobPosts()).toBe(gh.headFiles().size - 2);
+  });
+
+  it('gives up after three non-fast-forward attempts with a readable message', async () => {
+    const gh = fakeGitHub(() => 422);
+    const res = await publish();
+    expect(res.success).toBe(false);
+    expect(res.message).toContain(GITHUB_BRANCH_BUSY_MESSAGE);
+    expect(gh.patches).toHaveLength(3);
+  });
+
+  it('never force-pushes', async () => {
+    const gh = fakeGitHub((n) => (n < 3 ? 422 : undefined));
+    expect((await publish()).success).toBe(true);
+    expect(gh.patches).toHaveLength(3);
+    for (const patch of gh.patches) expect(patch.force).toBe(false);
+    expect(read('electron/services/publisher.ts')).not.toMatch(/force:\s*true/);
+  });
+});
+
+describe('Security Phase 8: GitHub token guidance', () => {
+  it('recommends a fine-grained token for one repository and links to create it', () => {
+    const app = read('src/studio/App.tsx');
+    expect(app).toContain("'https://github.com/settings/personal-access-tokens/new'");
+    expect(app).toContain('Avoid classic tokens; they grant access to all your repositories.');
+    expect(app.match(/Create token on GitHub/g)?.length).toBe(2);
+    expect(app).not.toMatch(/Tokens \(classic\)|public_repo/);
   });
 });

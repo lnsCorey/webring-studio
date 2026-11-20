@@ -34,6 +34,11 @@ import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusVi
 import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
 import { HeldAgentChangeView, HeldChangesPanel } from './HeldChangesPanel';
 import { authMethodOf, HostKeyMismatchDialog, SftpHostKeyApi, SftpSecurityControls } from './SftpSecurityControls';
+
+/** Where GitHub creates a fine-grained token (the user picks the one repository there). */
+export const GITHUB_NEW_TOKEN_URL = 'https://github.com/settings/personal-access-tokens/new';
+export const GITHUB_TOKEN_GUIDANCE =
+  'Create a fine-grained personal access token limited to only this repository, with Contents: Read and write and Pages: Read and write. Avoid classic tokens; they grant access to all your repositories.';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -6643,9 +6648,18 @@ export const App: React.FC = () => {
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
                       Pushes the generated site straight to a repo branch via the GitHub API and
-                      enables Pages for it. Needs a token with <code>repo</code> scope (classic) or
-                      Contents + Pages read/write (fine-grained). Stored in this persona's SQLite
-                      database, same as the SFTP/FTP credentials above.
+                      enables Pages for it. Stored in this persona's SQLite database, same as the
+                      SFTP/FTP credentials above.
+                    </p>
+                    <p className="text-xs text-slate-300 mt-1.5">
+                      {GITHUB_TOKEN_GUIDANCE}{' '}
+                      <button
+                        type="button"
+                        onClick={() => window.studioApi?.openExternal(GITHUB_NEW_TOKEN_URL)}
+                        className="text-indigo-300 hover:text-indigo-200 font-semibold underline"
+                      >
+                        Create token on GitHub
+                      </button>
                     </p>
                   </div>
                   {(publishSettings.githubOwner || publishSettings.githubRepo) && (
@@ -8187,11 +8201,14 @@ export const App: React.FC = () => {
                             <strong>Add a README</strong> (Studio can't publish to a repo with no commits).
                           </li>
                           <li>
-                            Create a token at <strong>GitHub → Settings → Developer settings → Personal
-                            access tokens → Tokens (classic) → Generate new token</strong>, with the{' '}
-                            <code>public_repo</code> scope. (A fine-grained token needs{' '}
-                            <strong>Contents: Read and write</strong> and <strong>Pages: Read and
-                            write</strong> on that repository.)
+                            {GITHUB_TOKEN_GUIDANCE}{' '}
+                            <button
+                              type="button"
+                              onClick={() => window.studioApi?.openExternal(GITHUB_NEW_TOKEN_URL)}
+                              className="underline font-semibold"
+                            >
+                              Create token on GitHub
+                            </button>
                           </li>
                           <li>
                             Enter the owner, repository and token. For a{' '}

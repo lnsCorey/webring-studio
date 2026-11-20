@@ -122,6 +122,9 @@ export interface GitHubRepoCheckResult {
 
 const GITHUB_API_BASE = 'https://api.github.com';
 
+export const GITHUB_BRANCH_BUSY_MESSAGE =
+  'The GitHub branch is changing too quickly (another publish or a manual commit). Try again in a minute.';
+
 /** A `<owner>.github.io` repo: GitHub Pages serves it at `https://<owner>.github.io` from its default branch. */
 export function isUserPagesRepo(owner: string, repo: string): boolean {
   return repo.trim().toLowerCase() === `${owner.trim().toLowerCase()}.github.io`;
@@ -200,6 +203,9 @@ export function verifyOrPinSftpHostKey(
 
 export class SitePublisher {
   constructor(private generator: StaticSiteGenerator) {}
+
+  /** Waits before rebuilding on a branch that moved during a publish (3 attempts in all). Tests shorten these. */
+  public githubRetryDelaysMs: number[] = [500, 1000];
 
   /**
    * Exports the generated static website and JSON schemas to a local folder.
@@ -423,8 +429,9 @@ export class SitePublisher {
   /**
    * Generates the site to a staging folder and pushes it to a GitHub repository branch via the
    * GitHub REST "Git Data" API (blobs/trees/commits), then enables/updates GitHub Pages for that
-   * repo to serve from the branch. Requires a Personal Access Token with `repo` scope (classic)
-   * or Contents: Read & Write + Pages: Read & Write (fine-grained).
+   * repo to serve from the branch. Needs a fine-grained token limited to that repository, with
+   * Contents: Read & Write + Pages: Read & Write. A branch that moves mid-publish is rebuilt on its
+   * new head (never force-pushed), up to three attempts.
    */
   public async publishToGitHubPages(
     settings: PublishSettings,
@@ -472,8 +479,8 @@ export class SitePublisher {
       if (repoInfoBody.permissions && repoInfoBody.permissions.push === false) {
         throw new Error(
           `Resource not accessible by personal access token — it can read ${owner}/${repo} but not push to it. ` +
-            `For a classic token, grant the "repo" scope; for a fine-grained token, grant "Contents: Read and write" ` +
-            `(and "Pages: Read and write" to auto-enable Pages) on this repository, then save your settings again.`
+            `Use a fine-grained token limited to this repository with "Contents: Read and write" ` +
+            `(and "Pages: Read and write" to auto-enable Pages), then save your settings again.`
         );
       }
 
@@ -503,100 +510,125 @@ export class SitePublisher {
         throw new Error(`Failed to resolve branch "${branch}" (HTTP ${refRes.status})${this.githubErrorDetail(refRes.body)}`);
       }
 
-      const baseCommitRes = await gh(`${repoPath}/git/commits/${baseCommitSha}`);
-      if (baseCommitRes.status !== 200) {
-        throw new Error(`Failed to read base commit (HTTP ${baseCommitRes.status})${this.githubErrorDetail(baseCommitRes.body)}`);
-      }
-      const baseTreeSha = (baseCommitRes.body as { tree: { sha: string } }).tree.sha;
-
-      // 2. Compare with what's on the branch: GitHub identifies files by their git blob hash, so
-      // unchanged files (most photos, most of the time) aren't uploaded again.
-      const remoteTreeRes = await gh(`${repoPath}/git/trees/${baseTreeSha}?recursive=1`);
-      const remoteTree = new Map<string, string>();
-      let remoteComplete = false;
-      if (remoteTreeRes.status === 200) {
-        const body = remoteTreeRes.body as { truncated?: boolean; tree: Array<{ path: string; type: string; sha: string }> };
-        for (const entry of body.tree) if (entry.type === 'blob') remoteTree.set(entry.path, entry.sha);
-        remoteComplete = !body.truncated;
-      }
       const destination = `github:${owner}/${repo}@${branch}`;
       const db = this.generator.database;
       const ledger = db.getPublishLedger(destination);
       const files = hashStagedFiles(stagingDir);
-      const toUpload = [...files.keys()].filter(
-        (relPath) => remoteTree.get(relPath) !== gitBlobSha(fs.readFileSync(path.join(stagingDir, relPath)))
-      );
-      // Only delete what Studio published here (or owns outright), and only if it's still there
-      const plan = planSync(files, ledger, remoteComplete ? [...remoteTree.keys()] : []);
-      const toRemove = plan.remove.filter((relPath) => remoteTree.has(relPath));
-      if (toUpload.length === 0 && toRemove.length === 0) {
-        for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
-        this.generator.recordPublished(genResult.bundle);
-        return {
-          success: true,
-          mode: 'github-pages',
-          destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
-          filesPublished: 0,
-          uploaded: 0,
-          unchanged: files.size,
-          removed: 0,
-          message: `${owner}/${repo}@${branch} is already up to date.${missingNote(genResult.missingMedia)}`,
-        };
-      }
+      // Blobs already uploaded (by local path), so a retry on a moved branch doesn't upload them again
+      const uploadedBlobs = new Map<string, string>();
+      let toUpload: string[] = [];
+      let toRemove: string[] = [];
+      let plan: { remove: string[] } = { remove: [] };
+      const delays = this.githubRetryDelaysMs;
+      let published = false;
 
-      // 3. Upload changed files as blobs. GitHub's abuse-detection rate limiter flags concurrent
-      // writes to this endpoint, so these go one at a time (retried internally with backoff by
-      // githubRequest on 403/429) rather than in parallel chunks.
-      const treeEntries: Array<{ path: string; mode: string; type: string; sha: string | null }> = [];
-      for (const relPath of toUpload) {
-        const content = fs.readFileSync(path.join(stagingDir, relPath)).toString('base64');
-        const blobRes = await gh(`${repoPath}/git/blobs`, 'POST', {
-          content,
-          encoding: 'base64',
-        });
-        if (blobRes.status !== 201) {
-          throw new Error(
-            `Failed to upload "${relPath}" (HTTP ${blobRes.status})${this.githubErrorDetail(blobRes.body)}`
-          );
+      for (let attempt = 0; attempt < delays.length + 1 && !published; attempt++) {
+        if (attempt > 0) {
+          // The branch moved under us (another publish or a manual commit): wait, then rebuild on its new head
+          await new Promise((resolve) => setTimeout(resolve, delays[attempt - 1]));
+          const headRes = await gh(`${repoPath}/git/ref/heads/${encodeURIComponent(branch)}`);
+          if (headRes.status !== 200) {
+            throw new Error(`Failed to re-read branch "${branch}" (HTTP ${headRes.status})${this.githubErrorDetail(headRes.body)}`);
+          }
+          baseCommitSha = (headRes.body as { object: { sha: string } }).object.sha;
         }
-        treeEntries.push({
-          path: relPath,
-          mode: '100644',
-          type: 'blob',
-          sha: (blobRes.body as { sha: string }).sha,
+
+        const baseCommitRes = await gh(`${repoPath}/git/commits/${baseCommitSha}`);
+        if (baseCommitRes.status !== 200) {
+          throw new Error(`Failed to read base commit (HTTP ${baseCommitRes.status})${this.githubErrorDetail(baseCommitRes.body)}`);
+        }
+        const baseTreeSha = (baseCommitRes.body as { tree: { sha: string } }).tree.sha;
+
+        // 2. Compare with what's on the branch: GitHub identifies files by their git blob hash, so
+        // unchanged files (most photos, most of the time) aren't uploaded again.
+        const remoteTreeRes = await gh(`${repoPath}/git/trees/${baseTreeSha}?recursive=1`);
+        const remoteTree = new Map<string, string>();
+        let remoteComplete = false;
+        if (remoteTreeRes.status === 200) {
+          const body = remoteTreeRes.body as { truncated?: boolean; tree: Array<{ path: string; type: string; sha: string }> };
+          for (const entry of body.tree) if (entry.type === 'blob') remoteTree.set(entry.path, entry.sha);
+          remoteComplete = !body.truncated;
+        }
+        toUpload = [...files.keys()].filter(
+          (relPath) => remoteTree.get(relPath) !== gitBlobSha(fs.readFileSync(path.join(stagingDir, relPath)))
+        );
+        // Only delete what Studio published here (or owns outright), and only if it's still there
+        plan = planSync(files, ledger, remoteComplete ? [...remoteTree.keys()] : []);
+        toRemove = plan.remove.filter((relPath) => remoteTree.has(relPath));
+        if (toUpload.length === 0 && toRemove.length === 0) {
+          for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
+          this.generator.recordPublished(genResult.bundle);
+          return {
+            success: true,
+            mode: 'github-pages',
+            destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
+            filesPublished: 0,
+            uploaded: 0,
+            unchanged: files.size,
+            removed: 0,
+            message: `${owner}/${repo}@${branch} is already up to date.${missingNote(genResult.missingMedia)}`,
+          };
+        }
+
+        // 3. Upload changed files as blobs. GitHub's abuse-detection rate limiter flags concurrent
+        // writes to this endpoint, so these go one at a time (retried internally with backoff by
+        // githubRequest on 403/429) rather than in parallel chunks.
+        const treeEntries: Array<{ path: string; mode: string; type: string; sha: string | null }> = [];
+        for (const relPath of toUpload) {
+          const content = fs.readFileSync(path.join(stagingDir, relPath));
+          const localSha = gitBlobSha(content);
+          let blobSha = uploadedBlobs.get(relPath) === localSha ? localSha : undefined;
+          if (!blobSha) {
+            const blobRes = await gh(`${repoPath}/git/blobs`, 'POST', {
+              content: content.toString('base64'),
+              encoding: 'base64',
+            });
+            if (blobRes.status !== 201) {
+              throw new Error(
+                `Failed to upload "${relPath}" (HTTP ${blobRes.status})${this.githubErrorDetail(blobRes.body)}`
+              );
+            }
+            blobSha = (blobRes.body as { sha: string }).sha;
+            uploadedBlobs.set(relPath, blobSha);
+          }
+          treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: blobSha });
+        }
+        for (const relPath of toRemove) {
+          treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: null });
+        }
+
+        // 4. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
+        const treeRes = await gh(`${repoPath}/git/trees`, 'POST', {
+          base_tree: baseTreeSha,
+          tree: treeEntries,
         });
-      }
-      for (const relPath of toRemove) {
-        treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: null });
-      }
+        if (treeRes.status !== 201) {
+          throw new Error(`Failed to create tree (HTTP ${treeRes.status})${this.githubErrorDetail(treeRes.body)}`);
+        }
+        const newTreeSha = (treeRes.body as { sha: string }).sha;
 
-      // 4. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
-      const treeRes = await gh(`${repoPath}/git/trees`, 'POST', {
-        base_tree: baseTreeSha,
-        tree: treeEntries,
-      });
-      if (treeRes.status !== 201) {
-        throw new Error(`Failed to create tree (HTTP ${treeRes.status})${this.githubErrorDetail(treeRes.body)}`);
-      }
-      const newTreeSha = (treeRes.body as { sha: string }).sha;
+        const commitRes = await gh(`${repoPath}/git/commits`, 'POST', {
+          message: `Publish site via Webring Studio (${toUpload.length} changed, ${toRemove.length} removed)`,
+          tree: newTreeSha,
+          parents: [baseCommitSha],
+        });
+        if (commitRes.status !== 201) {
+          throw new Error(`Failed to create commit (HTTP ${commitRes.status})${this.githubErrorDetail(commitRes.body)}`);
+        }
+        const newCommitSha = (commitRes.body as { sha: string }).sha;
 
-      const commitRes = await gh(`${repoPath}/git/commits`, 'POST', {
-        message: `Publish site via Webring Studio (${toUpload.length} changed, ${toRemove.length} removed)`,
-        tree: newTreeSha,
-        parents: [baseCommitSha],
-      });
-      if (commitRes.status !== 201) {
-        throw new Error(`Failed to create commit (HTTP ${commitRes.status})${this.githubErrorDetail(commitRes.body)}`);
+        // Never forced: a 422 means the branch moved since we read it, so rebuild on its new head
+        const updateRefRes = await gh(`${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
+          sha: newCommitSha,
+          force: false,
+        });
+        if (updateRefRes.status === 200) {
+          published = true;
+        } else if (updateRefRes.status !== 422) {
+          throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
+        }
       }
-      const newCommitSha = (commitRes.body as { sha: string }).sha;
-
-      const updateRefRes = await gh(`${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
-        sha: newCommitSha,
-        force: false,
-      });
-      if (updateRefRes.status !== 200) {
-        throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
-      }
+      if (!published) throw new Error(GITHUB_BRANCH_BUSY_MESSAGE);
 
       for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
       for (const relPath of plan.remove) db.setPublishLedgerEntry(destination, relPath, null);
