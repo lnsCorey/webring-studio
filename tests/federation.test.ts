@@ -6213,7 +6213,7 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
     });
     mcpServer.attachScheduler(scheduler);
     mcpServer.attachAppServices({
-      publishPaths: () => ({}),
+      publishPaths: () => ({ userDataDir: os.tmpdir(), tempDir: os.tmpdir() }),
       deviceLogin: { start: async () => ({}), poll: async () => ({ status: 'pending' }) } as never,
       onLocalChange: (personaId, reason, opts) => {
         autoPub.noteLocalChange(personaId, reason, opts);
@@ -6286,7 +6286,8 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
         publicKeyEncoding: { type: 'spki', format: 'pem' },
         privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
       });
-      friendDb.db
+      // Reaches into the friend's database directly, as a hijacker of their site would
+      (friendDb as unknown as { db: DatabaseSync }).db
         .prepare('UPDATE profile SET public_key_pem = ?, private_key_pem = ?, display_name = ? WHERE id = 1')
         .run(newKeys.publicKey, newKeys.privateKey, 'Hijacked Name');
       new StaticSiteGenerator(friendDb).generateToDirectory(friendOut);
