@@ -14,6 +14,7 @@ import {
 } from '../services/scheduler';
 import { parseProxyUrl, redactProxyUrl } from '../security/proxyAgent';
 import { SecretStorageUnavailableError } from '../security/keyVault';
+import { isNetworkDisabled, runWithoutNetwork } from '../security/networkPolicy';
 import { GitHubDeviceLogin } from '../services/githubAuth';
 import { notifyWebringHubs, publishTo, PublishPaths } from '../services/jobs';
 import {
@@ -127,6 +128,7 @@ export const MCP_TOOL_TIERS: Record<string, McpToolTier> = {
   webring_get_endorsements: 'read',
   webring_list_rings: 'read',
   webring_list_friend_notices: 'read',
+  // 'list' only; add and remove are outward (getMcpToolTier)
   webring_hubs: 'read',
   webring_search_hub: 'read',
   webring_get_schedule: 'read',
@@ -135,9 +137,6 @@ export const MCP_TOOL_TIERS: Record<string, McpToolTier> = {
   webring_get_addons: 'read',
 
   // Local-write tools
-  webring_create_persona: 'local-write',
-  webring_switch_persona: 'local-write',
-  webring_update_profile: 'local-write',
   webring_create_post: 'local-write',
   webring_interact_with_url: 'local-write',
   webring_update_item: 'local-write',
@@ -156,12 +155,19 @@ export const MCP_TOOL_TIERS: Record<string, McpToolTier> = {
   webring_dismiss_friend_notice: 'local-write',
   webring_check_key_with_hubs: 'local-write',
   webring_start_preview_server: 'local-write',
-  webring_configure_analytics_addon: 'local-write',
-  webring_configure_ads_addon: 'local-write',
-  webring_github_login_start: 'local-write',
-  webring_github_login_poll: 'local-write',
 
   // Outward, destructive, or sensitive-path tools (require human confirmation)
+  // Personas stay out of an agent's reach without a human: switching or creating one is outward
+  webring_create_persona: 'outward',
+  webring_switch_persona: 'outward',
+  // Can change the site address (and so the DID), comments, analytics and ad ids
+  webring_update_profile: 'outward',
+  // Add third-party scripts to the published site
+  webring_configure_analytics_addon: 'outward',
+  webring_configure_ads_addon: 'outward',
+  // Connects a GitHub account that can publish
+  webring_github_login_start: 'outward',
+  webring_github_login_poll: 'outward',
   webring_publish: 'outward',
   webring_export_static_site: 'outward',
   webring_run_scheduled_job: 'outward',
@@ -172,7 +178,7 @@ export const MCP_TOOL_TIERS: Record<string, McpToolTier> = {
   webring_trust_friend_key: 'outward',
   webring_rotate_keys: 'outward',
   webring_set_proxy: 'outward',
-  webring_set_schedule: 'outward',
+  webring_set_schedule: 'local-write', // outward when it would publish (getMcpToolTier)
   webring_add_photo: 'outward',
   webring_set_profile_image: 'local-write',
   webring_join_ring: 'outward',
@@ -190,7 +196,10 @@ export function getMcpToolTier(name: string, args?: Record<string, unknown>): Mc
     return 'outward';
   }
   if (name === 'webring_set_schedule') {
+    // Anything that makes Studio publish on its own is outward
     if (
+      args?.publishEnabled !== undefined ||
+      args?.publishPreset !== undefined ||
       args?.autoPublishEnabled !== undefined ||
       args?.autoPublishDelaySeconds !== undefined ||
       args?.publishDestination !== undefined
@@ -198,6 +207,10 @@ export function getMcpToolTier(name: string, args?: Record<string, unknown>): Mc
       return 'outward';
     }
     return 'local-write';
+  }
+  if (name === 'webring_hubs') {
+    const action = String(args?.action || 'list');
+    return action === 'list' ? 'read' : 'outward';
   }
   return MCP_TOOL_TIERS[name] ?? 'outward';
 }
@@ -1909,12 +1922,9 @@ export class WebringMcpServer {
         case 'webring_crawl_friend': {
           const ctx = this.resolveContext(args);
           const siteUrl = String(args.siteUrl || '');
-          const localDirOverride = args.localDirOverride
-            ? String(args.localDirOverride)
-            : undefined;
-          const res = await this.withPersonaLock(ctx.persona.id, () =>
-            ctx.ringCrawler.crawlFriendSite(siteUrl, localDirOverride)
-          );
+          // Reading a local folder as a friend's site is for tests and offline folders, not agents
+          if (args.localDirOverride !== undefined) throw new Error('localDirOverride is not available to agents');
+          const res = await this.withPersonaLock(ctx.persona.id, () => ctx.ringCrawler.crawlFriendSite(siteUrl));
           resultData = res;
           summary = `Crawled ${siteUrl} (verified=${res.verifiedSignature}, items=${res.itemsIndexed})`;
           break;
@@ -2127,7 +2137,10 @@ export class WebringMcpServer {
             resultData = { webringHubs: ctx.webringHubService.remove(url) };
             summary = `Removed Webring Hub ${url}`;
           } else if (action === 'list') {
-            resultData = { webringHubs: await ctx.webringHubService.refreshStaleInfo() };
+            // Read-only agents get the stored list; refreshing it would contact each hub
+            resultData = {
+              webringHubs: isNetworkDisabled() ? ctx.webringHubService.list() : await ctx.webringHubService.refreshStaleInfo(),
+            };
             summary = 'Listed Webring Hubs';
           } else {
             throw new Error('action must be list, add or remove');
@@ -2137,6 +2150,11 @@ export class WebringMcpServer {
 
         case 'webring_search_hub': {
           const ctx = this.resolveContext(args);
+          if (isNetworkDisabled()) {
+            throw new Error(
+              "Searching a Webring Hub contacts it, which read-only mode doesn't allow. Allow writes in Webring Studio's MCP tab to search."
+            );
+          }
           const res = await ctx.webringHubService.search(String(args.url || ''), String(args.query || ''), {
             limit: Number(args.limit) || undefined,
             offset: Number(args.offset) || undefined,
@@ -2325,7 +2343,8 @@ export class WebringMcpServer {
 
         case 'webring_get_setup_status': {
           const ctx = this.resolveContext(args);
-          resultData = await getSetupStatus(ctx, { checkGitHub: args.checkGitHub !== false });
+          // Read-only agents get what's stored; asking GitHub is a network call
+          resultData = await getSetupStatus(ctx, { checkGitHub: args.checkGitHub !== false && !isNetworkDisabled() });
           const status = resultData as Awaited<ReturnType<typeof getSetupStatus>>;
           summary = status.complete ? 'Setup complete' : `Setup: next step "${status.nextStep}"`;
           break;
@@ -2396,6 +2415,11 @@ export class WebringMcpServer {
 
         case 'webring_check_live_site': {
           const ctx = this.resolveContext(args);
+          if (isNetworkDisabled()) {
+            throw new Error(
+              "Checking the live site contacts your host, which read-only mode doesn't allow. Allow writes in Webring Studio's MCP tab to check it."
+            );
+          }
           const res = await checkLiveSite(ctx);
           resultData = res;
           summary = `Live site: ${res.state}`;
@@ -2640,7 +2664,10 @@ export class WebringMcpServer {
 
       // The target persona is fixed now. The active persona's context stays open for this call even
       // if the user switches persona meanwhile; another persona gets its own context for the call.
-      const runIn = (ctx: ActivePersonaContext) => callContext.run({ ctx, personaId: targetPersonaId }, runTool);
+      // A read-only agent call can't reach the network, whatever the tool does
+      const noNetwork = enforcePolicy && this.readOnlyMode;
+      const runIn = (ctx: ActivePersonaContext) =>
+        callContext.run({ ctx, personaId: targetPersonaId }, () => (noNetwork ? runWithoutNetwork(runTool) : runTool()));
       const { resultData, summary } =
         targetPersonaId === activeId
           ? await this.personaManager.withActiveContext(runIn)

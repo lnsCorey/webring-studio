@@ -910,11 +910,17 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       const peerOutDir = path.join(peerDataDir, 'public_html');
       new StaticSiteGenerator(peerDb).generateToDirectory(peerOutDir);
 
-      const crawlRes = await mcpServer.executeToolCall('webring_crawl_friend', {
+      // Agents can't read a local folder as a friend's site (phase 7); the app syncs it here
+      const refused = await mcpServer.executeToolCall('webring_crawl_friend', {
         siteUrl: 'https://friend-peer.ring.test',
         localDirOverride: peerOutDir,
       });
-      expect((crawlRes.data as { verifiedSignature: boolean }).verifiedSignature).toBe(true);
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0].text).toMatch(/localDirOverride is not available to agents/);
+      const crawlRes = await manager
+        .getActiveContext()
+        .ringCrawler.crawlFriendSite('https://friend-peer.ring.test', peerOutDir);
+      expect(crawlRes.verifiedSignature).toBe(true);
 
       // Agent reads Neighborhood Feed via MCP and replies to Peer Friend's post
       const feedRes = await mcpServer.executeToolCall('webring_get_neighborhood_feed', {
