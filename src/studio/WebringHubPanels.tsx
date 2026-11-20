@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { BookOpen, Globe, Loader2, Plus, Search, ShieldCheck, Trash2, UserPlus, X } from 'lucide-react';
+import { BookOpen, CircleDot, Globe, Loader2, Plus, Search, ShieldCheck, Trash2, UserPlus, X } from 'lucide-react';
+import { normalizeSiteUrl } from '../shared/schema';
 
 /**
  * Optional Webring Hubs (electron/services/webringHubService.ts,
@@ -66,7 +67,7 @@ export interface WebringHubSearchResultView {
 export interface WebringHubApi {
   listWebringHubs: () => Promise<WebringHubView[]>;
   addWebringHub: (url: string) => Promise<WebringHubView>;
-  removeWebringHub: (url: string) => Promise<WebringHubView[]>;
+  removeWebringHub: (url: string, options?: { force?: boolean }) => Promise<WebringHubView[]>;
   searchWebringHub: (
     url: string,
     query: string,
@@ -75,6 +76,60 @@ export interface WebringHubApi {
   setWebringHubListed: (url: string, listed: boolean) => Promise<WebringHubView>;
   checkKeyWithWebringHubs?: (siteUrl: string) => Promise<WebringHubKeyCheckView>;
 }
+
+/** A ring this persona is in, with the member sites Studio knows, for tagging hub search results. */
+export interface HubSearchRing {
+  id: string;
+  name: string;
+  memberUrls: Set<string>;
+}
+
+/**
+ * The rings this persona is in, from Studio's own ring data (never from the hub, which doesn't
+ * know about rings): every member of an active ring it hosts, and for a joined ring the members
+ * in rotation at the last sync. Members a joined ring has taken out of rotation aren't known.
+ */
+export function ringsForHubSearch(
+  joined: Array<{
+    id: string;
+    name: string;
+    status: string;
+    prevSiteUrl?: string;
+    nextSiteUrl?: string;
+    rotationUrls?: string[];
+  }>,
+  hosted: Array<{
+    id: string;
+    name: string;
+    status: string;
+    maintainerIsMember: boolean;
+    members: Array<{ siteUrl: string }>;
+  }>,
+  ownSiteUrl: string
+): HubSearchRing[] {
+  const urls = (list: Array<string | undefined>) =>
+    new Set(list.filter((u): u is string => !!u && !!u.trim()).map((u) => normalizeSiteUrl(u)));
+  const rings: HubSearchRing[] = [];
+  for (const ring of hosted) {
+    if (ring.status !== 'active') continue;
+    const members = ring.members.map((m) => m.siteUrl);
+    if (ring.maintainerIsMember) members.push(ownSiteUrl);
+    rings.push({ id: ring.id, name: ring.name, memberUrls: urls(members) });
+  }
+  for (const ring of joined) {
+    if (ring.status !== 'member' || rings.some((r) => r.id === ring.id)) continue;
+    rings.push({
+      id: ring.id,
+      name: ring.name,
+      memberUrls: urls([...(ring.rotationUrls || []), ring.prevSiteUrl, ring.nextSiteUrl, ownSiteUrl]),
+    });
+  }
+  return rings.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** With a ring filter on, how many hub results are checked (the hub can't filter by ring). */
+const RING_FILTER_SCAN_LIMIT = 200;
+const RING_FILTER_PAGE_SIZE = 50;
 
 const errorText = (err: unknown) =>
   (err instanceof Error ? err.message : String(err)).replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
@@ -253,9 +308,31 @@ export function WebringHubListingsPanel(props: {
                     {busy === d.url && <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" />}
                     <button
                       type="button"
-                      disabled={busy !== null || d.listMe}
-                      title={d.listMe ? 'Unlist your site first' : 'Remove this Webring Hub'}
-                      onClick={() => void run(`remove:${d.url}`, async () => void (await api.removeWebringHub(d.url)))}
+                      disabled={busy !== null}
+                      title={
+                        d.listMe
+                          ? 'Unlist your site first. If this hub can no longer be reached, you can forget it anyway.'
+                          : 'Remove this Webring Hub'
+                      }
+                      onClick={() => {
+                        // A listed hub that can't be reached can never be unlisted, so offer to forget it
+                        // after a warning instead of leaving it stuck in the list.
+                        if (
+                          d.listMe &&
+                          !window.confirm(
+                            `Your site is still listed in ${d.title}.\n\n` +
+                              `If the hub still works, cancel and untick "List my site" first so your listing is removed.\n\n` +
+                              `Only continue if the hub can't be reached any more. Studio will forget it, and any listing ` +
+                              `on that server stays there until its operator removes it.`
+                          )
+                        ) {
+                          return;
+                        }
+                        void run(`remove:${d.url}`, async () => {
+                          await api.removeWebringHub(d.url, { force: d.listMe });
+                          if (d.listMe) notify(`Forgot ${d.title}. Your listing there wasn't removed.`);
+                        });
+                      }}
                       className="p-1.5 rounded-lg hover:bg-slate-800 disabled:opacity-40 text-slate-400"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -291,14 +368,19 @@ export function WebringHubListingsPanel(props: {
 export function WebringHubSearchPanel(props: {
   api: WebringHubApi | undefined;
   webringHubs: WebringHubView[];
+  /** Rings this persona is in (see ringsForHubSearch), for the filter and the result tags. */
+  webrings?: HubSearchRing[];
   onUse: (result: WebringHubSearchResultView) => void;
   onManage: () => void;
 }) {
   const { api, webringHubs, onUse, onManage } = props;
+  const webrings = props.webrings || [];
   const [webringHubUrl, setWebringHubUrl] = useState('');
   const [query, setQuery] = useState('');
+  const [ringFilter, setRingFilter] = useState('');
   const [results, setResults] = useState<WebringHubSearchResultView[] | null>(null);
   const [total, setTotal] = useState(0);
+  const [scanned, setScanned] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -309,7 +391,19 @@ export function WebringHubSearchPanel(props: {
     }
   }, [webringHubs, webringHubUrl]);
 
+  // A ring that's gone (left, closed) can't stay selected
+  useEffect(() => {
+    if (ringFilter && !webrings.some((r) => r.id === ringFilter)) {
+      setRingFilter('');
+      setResults(null);
+    }
+  }, [webrings, ringFilter]);
+
   if (!api) return null;
+
+  const ringsOf = (siteUrl: string) => webrings.filter((r) => r.memberUrls.has(siteUrl));
+  const selectedRing = webrings.find((r) => r.id === ringFilter);
+  const shown = results && selectedRing ? results.filter((r) => selectedRing.memberUrls.has(r.siteUrl)) : results;
 
   const search = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -317,9 +411,27 @@ export function WebringHubSearchPanel(props: {
     setBusy(true);
     setError('');
     try {
-      const res = await api.searchWebringHub(webringHubUrl, query);
-      setResults(res.results);
-      setTotal(res.total);
+      if (!ringFilter) {
+        const res = await api.searchWebringHub(webringHubUrl, query);
+        setResults(res.results);
+        setTotal(res.total);
+        setScanned(res.results.length);
+        return;
+      }
+      // The hub doesn't know about rings, so read several pages and filter them here
+      const seen = new Map<string, WebringHubSearchResultView>();
+      let offset = 0;
+      let hubTotal = 0;
+      while (offset < RING_FILTER_SCAN_LIMIT) {
+        const res = await api.searchWebringHub(webringHubUrl, query, { limit: RING_FILTER_PAGE_SIZE, offset });
+        hubTotal = res.total;
+        for (const r of res.results) seen.set(r.siteUrl, r);
+        offset += RING_FILTER_PAGE_SIZE;
+        if (res.results.length === 0 || offset >= hubTotal) break;
+      }
+      setResults([...seen.values()]);
+      setTotal(hubTotal);
+      setScanned(Math.min(offset, hubTotal));
     } catch (err) {
       setError(errorText(err));
       setResults(null);
@@ -374,6 +486,24 @@ export function WebringHubSearchPanel(props: {
             placeholder="Interests, names, places…"
             className="flex-1 min-w-[12rem] px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs"
           />
+          {webrings.length > 0 && (
+            <select
+              value={ringFilter}
+              onChange={(e) => {
+                setRingFilter(e.target.value);
+                setResults(null);
+              }}
+              title="Show only members of a webring you're in. Membership comes from your own ring lists, not from the hub."
+              className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs"
+            >
+              <option value="">All webrings</option>
+              {webrings.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.name}
+                </option>
+              ))}
+            </select>
+          )}
           <button
             type="submit"
             disabled={busy || !webringHubUrl}
@@ -387,13 +517,19 @@ export function WebringHubSearchPanel(props: {
 
       {error && <p className="text-xs text-rose-300">{error}</p>}
 
-      {results && (
+      {results && shown && (
         <div className="space-y-2">
           <p className="text-[11px] text-slate-500">
-            {results.length === 0 ? 'No matches.' : `Showing ${results.length} of ${total}.`}
+            {selectedRing
+              ? `${shown.length === 0 ? 'No' : shown.length} member${shown.length === 1 ? '' : 's'} of ${selectedRing.name} ` +
+                `among ${scanned === total ? `all ${total}` : `the first ${scanned} of ${total}`} matching profiles.` +
+                (scanned < total ? ' Narrow the search to check the rest.' : '')
+              : results.length === 0
+                ? 'No matches.'
+                : `Showing ${results.length} of ${total}.`}
           </p>
           <ul className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {results.map((r) => (
+            {shown.map((r) => (
               <li key={r.siteUrl} className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex gap-3">
                 {r.avatarUrl ? (
                   <img src={r.avatarUrl} alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" />
@@ -407,6 +543,19 @@ export function WebringHubSearchPanel(props: {
                   <div className="text-[11px] text-slate-500 font-mono truncate flex items-center gap-1">
                     <Globe className="w-3 h-3 flex-shrink-0" /> {r.siteUrl}
                   </div>
+                  {ringsOf(r.siteUrl).length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {ringsOf(r.siteUrl).map((ring) => (
+                        <span
+                          key={ring.id}
+                          title={`A member of ${ring.name}, a webring you're in`}
+                          className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 flex items-center gap-1"
+                        >
+                          <CircleDot className="w-2.5 h-2.5" /> {ring.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   {r.tagline && <p className="text-xs text-slate-400 line-clamp-2">{r.tagline}</p>}
                   {r.interests.length > 0 && (
                     <div className="flex flex-wrap gap-1">

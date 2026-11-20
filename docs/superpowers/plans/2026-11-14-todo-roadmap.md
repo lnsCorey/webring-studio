@@ -75,7 +75,7 @@ The work was committed, reviewed in webring PR #33 and webring-directory-php PR 
    - `/api/ext/key-witness/v1/keys/<a listed did>` returns a `first-seen` record
 6. Confirm the refresh cron job still runs `scripts/refresh.php`.
 
-**Done when:** the live hub at `directory.lines2code.com` passes step 5, and Studio shows the **Key witness** badge for it.
+**Done when:** the live hub at `techhub.lines2code.com` passes step 5, and Studio shows the **Key witness** badge for it.
 
 ## 3. Check the hub features in the running Studio
 
