@@ -110,6 +110,17 @@ export interface McpPendingApproval {
 interface McpCallScope {
   ctx: ActivePersonaContext;
   personaId: string;
+  /** An agent's call (policy enforced): private data is hidden unless the user allowed it. */
+  agent: boolean;
+}
+
+/** Shown in a result that left private data out. */
+const PRIVATE_DATA_HIDDEN = "private data hidden — enable 'Allow agents to read private data' in Studio";
+
+/** The MCP settings the user chose in the app (app-wide, in userData/mcp-settings.json). */
+interface McpSettingsFile {
+  readOnly?: boolean;
+  allowPrivateData?: boolean;
 }
 const callContext = new AsyncLocalStorage<McpCallScope>();
 
@@ -278,11 +289,39 @@ export class WebringMcpServer {
     private onActivity?: (entry: McpActivityLogEntry) => void
   ) {
     this.previewServer = previewServer || new LocalPreviewServer();
+    this.loadSettings();
+  }
+
+  private get settingsPath(): string {
+    return path.join(this.userDataDir, 'mcp-settings.json');
+  }
+
+  /** Read-only (default on) and private data (default off) survive restarts; the CLI shares them. */
+  private loadSettings(): void {
+    let saved: McpSettingsFile = {};
+    try {
+      saved = JSON.parse(fs.readFileSync(this.settingsPath, 'utf8')) as McpSettingsFile;
+    } catch {
+      // No file yet (or unreadable): the safe defaults
+    }
+    this.readOnlyMode = saved.readOnly !== false;
+    this.allowPrivateData = saved.allowPrivateData === true;
+  }
+
+  private saveSettings(): void {
+    try {
+      fs.mkdirSync(this.userDataDir, { recursive: true });
+      const settings: McpSettingsFile = { readOnly: this.readOnlyMode, allowPrivateData: this.allowPrivateData };
+      fs.writeFileSync(this.settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+    } catch (err) {
+      console.error('[mcp] Could not save MCP settings:', err);
+    }
   }
 
   private attachedScheduler: Scheduler | null = null;
   private appServices: McpAppServices | null = null;
   private readOnlyMode = true;
+  private allowPrivateData = false;
   private requireConfirmation = true;
   private pendingApprovals: McpPendingApproval[] = [];
 
@@ -290,8 +329,25 @@ export class WebringMcpServer {
     return this.readOnlyMode;
   }
 
+  /** Only the app's MCP tab changes this; no tool can. */
   public setReadOnlyMode(enabled: boolean): void {
     this.readOnlyMode = enabled;
+    this.saveSettings();
+  }
+
+  public isPrivateDataAllowed(): boolean {
+    return this.allowPrivateData;
+  }
+
+  /** "Allow agents to read private data". Only the app's MCP tab changes this; no tool can. */
+  public setAllowPrivateData(enabled: boolean): void {
+    this.allowPrivateData = enabled;
+    this.saveSettings();
+  }
+
+  /** True when this call (an agent's) must not see private data. */
+  private hidePrivateData(): boolean {
+    return !this.allowPrivateData && callContext.getStore()?.agent === true;
   }
 
   public setRequireConfirmation(enabled: boolean): void {
@@ -1611,7 +1667,15 @@ export class WebringMcpServer {
 
         case 'webring_get_profile': {
           const ctx = this.resolveContext(args);
-          resultData = ctx.db.getProfile();
+          const profile = ctx.db.getProfile();
+          if (this.hidePrivateData()) {
+            // Publishing settings (hosts, user names, local paths) and add-on ids stay private
+            const { publishSettings: _p, analyticsAddon, adsAddon, ...publicProfile } = profile;
+            const hidden = 1 + (analyticsAddon ? 1 : 0) + (adsAddon ? 1 : 0);
+            resultData = { ...publicProfile, redacted: { reason: PRIVATE_DATA_HIDDEN, count: hidden } };
+          } else {
+            resultData = profile;
+          }
           summary = `Read profile for ${ctx.persona.displayName}`;
           break;
         }
@@ -1844,8 +1908,14 @@ export class WebringMcpServer {
 
         case 'webring_list_friends': {
           const ctx = this.resolveContext(args);
-          const friends = ctx.db.getFriends();
-          resultData = { count: friends.length, friends };
+          const all = ctx.db.getFriends();
+          const friends = this.hidePrivateData() ? all.filter((f) => f.visibility === 'public') : all;
+          const hidden = all.length - friends.length;
+          resultData = {
+            count: friends.length,
+            friends,
+            ...(this.hidePrivateData() ? { redacted: { reason: PRIVATE_DATA_HIDDEN, count: hidden } } : {}),
+          };
           summary = `Listed ${friends.length} friend(s) in local ring`;
           break;
         }
@@ -1960,8 +2030,14 @@ export class WebringMcpServer {
 
         case 'webring_list_saved': {
           const ctx = this.resolveContext(args);
-          resultData = ctx.db.getSavedPosts();
-          summary = `${(resultData as unknown[]).length} saved post(s)`;
+          const saved = ctx.db.getSavedPosts();
+          if (this.hidePrivateData()) {
+            resultData = { savedPosts: [], redacted: { reason: PRIVATE_DATA_HIDDEN, count: saved.length } };
+            summary = 'Saved posts hidden (private data)';
+          } else {
+            resultData = saved;
+            summary = `${saved.length} saved post(s)`;
+          }
           break;
         }
 
@@ -2667,7 +2743,9 @@ export class WebringMcpServer {
       // A read-only agent call can't reach the network, whatever the tool does
       const noNetwork = enforcePolicy && this.readOnlyMode;
       const runIn = (ctx: ActivePersonaContext) =>
-        callContext.run({ ctx, personaId: targetPersonaId }, () => (noNetwork ? runWithoutNetwork(runTool) : runTool()));
+        callContext.run({ ctx, personaId: targetPersonaId, agent: enforcePolicy }, () =>
+          noNetwork ? runWithoutNetwork(runTool) : runTool()
+        );
       const { resultData, summary } =
         targetPersonaId === activeId
           ? await this.personaManager.withActiveContext(runIn)
@@ -2718,7 +2796,10 @@ export class WebringMcpServer {
         payload = this.personaManager.listPersonas();
         break;
       case 'webring://active/bundle':
-        payload = ctx.db.buildSignedSiteBundle();
+        // Without the opt-in, agents see what the published site shows (no private friends)
+        payload = this.allowPrivateData
+          ? ctx.db.buildSignedSiteBundle()
+          : { ...ctx.db.buildSignedSiteBundle({ publish: true }), redacted: { reason: PRIVATE_DATA_HIDDEN, count: 1 } };
         break;
       case 'webring://active/feed': {
         const curated = ctx.db.getCuratedNetworkFeed();
@@ -2742,12 +2823,20 @@ export class WebringMcpServer {
       }
       case 'webring://active/addons': {
         const p = ctx.db.getProfile();
-        payload = {
-          personaId: ctx.persona.id,
-          analyticsAddon: p.analyticsAddon || null,
-          adsAddon: p.adsAddon || null,
-          commentConfig: p.commentConfig || null,
-        };
+        payload = this.allowPrivateData
+          ? {
+              personaId: ctx.persona.id,
+              analyticsAddon: p.analyticsAddon || null,
+              adsAddon: p.adsAddon || null,
+              commentConfig: p.commentConfig || null,
+            }
+          : {
+              personaId: ctx.persona.id,
+              analyticsAddon: p.analyticsAddon ? { enabled: Boolean(p.analyticsAddon.enabled) } : null,
+              adsAddon: p.adsAddon ? { enabled: Boolean(p.adsAddon.enabled) } : null,
+              commentConfig: p.commentConfig || null,
+              redacted: { reason: PRIVATE_DATA_HIDDEN, count: (p.analyticsAddon ? 1 : 0) + (p.adsAddon ? 1 : 0) },
+            };
         break;
       }
       default:

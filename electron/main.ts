@@ -1322,6 +1322,7 @@ function registerIpcHandlers() {
       prompts: webringMcpServer.getPrompts(),
       activityLog: webringMcpServer.getActivityLog(),
       readOnlyMode: webringMcpServer.isReadOnlyMode(),
+      allowPrivateData: webringMcpServer.isPrivateDataAllowed(),
       pendingApprovals: webringMcpServer.listPendingApprovals(),
     };
   });
@@ -1329,6 +1330,12 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:set-mcp-read-only', (_e, enabled: boolean) => {
     webringMcpServer.setReadOnlyMode(Boolean(enabled));
     return { readOnlyMode: webringMcpServer.isReadOnlyMode() };
+  });
+
+  // "Allow agents to read private data": only this IPC (the MCP tab) changes it, never a tool
+  ipcMain.handle('studio:set-mcp-private-data', (_e, enabled: boolean) => {
+    webringMcpServer.setAllowPrivateData(enabled === true);
+    return { allowPrivateData: webringMcpServer.isPrivateDataAllowed() };
   });
 
   ipcMain.handle('studio:resolve-mcp-approval', async (_e, id: string, approved: boolean) => {

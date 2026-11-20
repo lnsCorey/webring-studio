@@ -125,6 +125,7 @@ contextBridge.exposeInMainWorld('studioApi', {
   openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
   getMcpInfo: () => ipcRenderer.invoke('studio:get-mcp-info'),
   setMcpReadOnly: (enabled: boolean) => ipcRenderer.invoke('studio:set-mcp-read-only', enabled),
+  setMcpPrivateData: (enabled: boolean) => ipcRenderer.invoke('studio:set-mcp-private-data', enabled),
   resolveMcpApproval: (id: string, approved: boolean) =>
     ipcRenderer.invoke('studio:resolve-mcp-approval', id, approved),
   callMcpTool: (toolName: string, args?: Record<string, unknown>) =>

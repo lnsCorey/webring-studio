@@ -180,3 +180,95 @@ describe('Security Phase 7: tool tiers and read-only mode', () => {
     expect(mcp.listPendingApprovals().map((a) => a.toolName)).toEqual(['webring_set_schedule']);
   });
 });
+
+describe('Security Phase 7: private data stays hidden from agents unless allowed', () => {
+  let dir: string;
+  let manager: PersonaManager;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p7-private-'));
+    manager = new PersonaManager(dir);
+    const db = manager.getActiveContext().db;
+    db.updateProfile({ siteUrl: 'https://me.p7.test', displayName: 'Me' });
+    db.updateProfile({ publishSettings: { ...db.getProfile().publishSettings, host: 'sftp.private.example', exportPath: 'C:\\Users\\me\\site' } });
+    db.addOrUpdateFriend({ siteUrl: 'https://public.p7.test', displayName: 'Public Pal', visibility: 'public' });
+    db.addOrUpdateFriend({ siteUrl: 'https://secret.p7.test', displayName: 'Secret Pal', visibility: 'private' });
+    db.addOrUpdateFriend({ siteUrl: 'https://quiet.p7.test', displayName: 'Quiet Pal' });
+    db.upsertNetworkFeedEntry({
+      friendSiteUrl: 'https://public.p7.test',
+      friendName: 'Public Pal',
+      friendAvatarUrl: '',
+      friendDid: '',
+      entryType: 'post',
+      title: 'Saved one',
+      canonicalUrl: 'https://public.p7.test/posts/1',
+      targetUrl: '',
+      commentary: 'hello',
+      mediaUrl: '',
+      tags: [],
+      createdAt: new Date().toISOString(),
+      verifiedSignature: true,
+    });
+    db.saveFeedEntry('https://public.p7.test/posts/1', 'my private note');
+  });
+
+  afterEach(() => {
+    manager.closeAll();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows may still hold a database file
+    }
+  });
+
+  const agent = (mcp: WebringMcpServer, name: string) => mcp.executeToolCall(name, {}, { enforcePolicy: true });
+
+  it('hides private friends, saved posts and private profile fields, and says how many', async () => {
+    const mcp = new WebringMcpServer(manager, dir);
+    expect(mcp.isPrivateDataAllowed()).toBe(false);
+
+    const friends = (await agent(mcp, 'webring_list_friends')).data as {
+      friends: Array<{ displayName: string }>;
+      redacted: { reason: string; count: number };
+    };
+    expect(friends.friends.map((f) => f.displayName)).toEqual(['Public Pal']);
+    expect(friends.redacted).toEqual({ reason: expect.stringContaining("Allow agents to read private data"), count: 2 });
+
+    const saved = (await agent(mcp, 'webring_list_saved')).data as { savedPosts: unknown[]; redacted: { count: number } };
+    expect(saved.savedPosts).toEqual([]);
+    expect(saved.redacted.count).toBe(1);
+
+    const profile = await agent(mcp, 'webring_get_profile');
+    expect(profile.content[0].text).not.toContain('sftp.private.example');
+    expect(profile.content[0].text).not.toContain('C:\\\\Users');
+    expect((profile.data as { publishSettings?: unknown }).publishSettings).toBeUndefined();
+    expect((profile.data as { redacted: { count: number } }).redacted.count).toBe(1);
+
+    const bundle = JSON.parse(mcp.readResource('webring://active/bundle').contents[0].text);
+    expect(JSON.stringify(bundle)).not.toContain('Secret Pal');
+
+    // The app's own (non-agent) calls still see everything
+    const own = (await mcp.executeToolCall('webring_list_friends', {})).data as { friends: unknown[] };
+    expect(own.friends).toHaveLength(3);
+  });
+
+  it('includes them once the user allows it, and both settings survive a restart', async () => {
+    const mcp = new WebringMcpServer(manager, dir);
+    expect(mcp.isReadOnlyMode()).toBe(true); // no settings file yet: read-only by default
+    mcp.setAllowPrivateData(true);
+    mcp.setReadOnlyMode(false);
+
+    const friends = (await agent(mcp, 'webring_list_friends')).data as { friends: unknown[]; redacted?: unknown };
+    expect(friends.friends).toHaveLength(3);
+    expect(friends.redacted).toBeUndefined();
+    expect(((await agent(mcp, 'webring_list_saved')).data as unknown[]).length).toBe(1);
+
+    const restarted = new WebringMcpServer(manager, dir);
+    expect(restarted.isPrivateDataAllowed()).toBe(true);
+    expect(restarted.isReadOnlyMode()).toBe(false);
+
+    // No tool can change either setting
+    const names = restarted.getTools().map((t) => t.name).join(' ');
+    expect(names).not.toMatch(/read_only|readonly|private_data|mcp_settings/i);
+  });
+});

@@ -30,7 +30,7 @@ import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
 import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
 import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
-import { PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
+import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -334,6 +334,10 @@ function imageErrorText(err: unknown): string {
   const text = (err instanceof Error ? err.message : String(err)).replace(/^Error invoking remote method '[^']+': (\w*Error: )?/, '');
   return text || "This image is too large or couldn't be processed.";
 }
+
+/** Shown with the "Allow agents to read private data" toggle and its confirmation. */
+const PRIVATE_DATA_EXPLANATION =
+  'Includes private friends, saved posts and private profile fields. Content from friends’ posts can contain instructions aimed at your agent; only enable this for agents you trust.';
 
 /** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
 function mediaSrc(url: string): string {
@@ -674,6 +678,7 @@ declare global {
           success: boolean;
         }>;
         readOnlyMode?: boolean;
+        allowPrivateData?: boolean;
         pendingApprovals?: Array<{
           id: string;
           toolName: string;
@@ -684,6 +689,7 @@ declare global {
         }>;
       }>;
       setMcpReadOnly?: (enabled: boolean) => Promise<{ readOnlyMode: boolean }>;
+      setMcpPrivateData?: (enabled: boolean) => Promise<{ allowPrivateData: boolean }>;
       resolveMcpApproval?: (
         id: string,
         approved: boolean
@@ -958,6 +964,7 @@ export const App: React.FC = () => {
       success: boolean;
     }>;
     readOnlyMode?: boolean;
+    allowPrivateData?: boolean;
     pendingApprovals?: Array<{
       id: string;
       toolName: string;
@@ -1013,6 +1020,21 @@ export const App: React.FC = () => {
   const [consentRequest, setConsentRequest] = useState<{ label: string; resolve: (allow: boolean) => void } | null>(null);
   const askConsent = (label: string) =>
     new Promise<boolean>((resolve) => setConsentRequest({ label, resolve }));
+
+  // Yes/no questions for safeguards (ConfirmDialog)
+  const [confirmRequest, setConfirmRequest] = useState<{
+    title: string;
+    message: React.ReactNode;
+    confirmLabel: string;
+    tone?: 'warning' | 'danger';
+    resolve: (confirmed: boolean) => void;
+  } | null>(null);
+  const askConfirm = (request: {
+    title: string;
+    message: React.ReactNode;
+    confirmLabel: string;
+    tone?: 'warning' | 'danger';
+  }) => new Promise<boolean>((resolve) => setConfirmRequest({ ...request, resolve }));
 
   /**
    * Saves profile changes. A newly typed password or token needs the user's consent when the
@@ -7054,6 +7076,13 @@ export const App: React.FC = () => {
                       >
                         {mcpInfo?.readOnlyMode !== false ? 'Read-Only' : 'Writes Allowed'}
                       </span>
+                      <span
+                        className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${
+                          mcpInfo?.allowPrivateData ? 'bg-amber-500/20 text-amber-300' : 'bg-slate-700/60 text-slate-300'
+                        }`}
+                      >
+                        {mcpInfo?.allowPrivateData ? 'Private data: visible to agents' : 'Private data: hidden'}
+                      </span>
                     </h3>
                     <p className="text-xs text-slate-400 mt-1">
                       Read-Only mode blocks external MCP writes by default. When writes are allowed,
@@ -7078,6 +7107,38 @@ export const App: React.FC = () => {
                   >
                     {mcpInfo?.readOnlyMode !== false ? 'Allow Local Writes' : 'Switch Back to Read-Only'}
                   </button>
+                </div>
+
+                <div className="border-t border-slate-800 pt-3">
+                  <label className="flex items-start gap-2 text-xs text-slate-200 max-w-2xl">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(mcpInfo?.allowPrivateData)}
+                      onChange={async (e) => {
+                        const next = e.target.checked;
+                        // Turning it on is a decision; turning it off needs no confirmation
+                        if (
+                          next &&
+                          !(await askConfirm({
+                            title: 'Allow agents to read private data?',
+                            message: PRIVATE_DATA_EXPLANATION,
+                            confirmLabel: 'Allow',
+                          }))
+                        ) {
+                          return;
+                        }
+                        await window.studioApi?.setMcpPrivateData?.(next);
+                        const info = await window.studioApi?.getMcpInfo?.();
+                        if (info) setMcpInfo(info);
+                        notify(next ? 'Agents can now read private data.' : 'Private data is hidden from agents again.');
+                      }}
+                      className="accent-amber-500 mt-0.5"
+                    />
+                    <span>
+                      <span className="font-semibold">Allow agents to read private data</span>
+                      <span className="block text-slate-400 mt-0.5">{PRIVATE_DATA_EXPLANATION}</span>
+                    </span>
+                  </label>
                 </div>
 
                 {(mcpInfo?.pendingApprovals?.length || 0) > 0 && (
@@ -9351,6 +9412,19 @@ git push -u origin main --force`}
       </main>
 
       {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {confirmRequest && (
+        <ConfirmDialog
+          title={confirmRequest.title}
+          message={confirmRequest.message}
+          confirmLabel={confirmRequest.confirmLabel}
+          tone={confirmRequest.tone}
+          onAnswer={(confirmed) => {
+            confirmRequest.resolve(confirmed);
+            setConfirmRequest(null);
+          }}
+        />
+      )}
+
       {consentRequest && (
         <PlaintextConsentDialog
           secretLabel={consentRequest.label}
