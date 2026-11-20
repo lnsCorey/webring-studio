@@ -108,6 +108,21 @@ import {
 import type { PagesBuildStatus } from '../electron/services/publisher';
 import { McpHttpServer } from '../electron/mcp/mcpHttpServer';
 
+/**
+ * Deletes a test's temp folder. Windows can't delete a file another handle still has open (a
+ * test's SQLite database, until it's garbage-collected), so there a leftover folder in the OS
+ * temp directory is accepted instead of failing the test.
+ */
+function removeTempDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EBUSY')) return;
+    throw err;
+  }
+}
+
 describe('Webring Schema, DID Identity & Ed25519 Signatures', () => {
   it('converts website URLs into standard W3C / ATProto did:web identifiers', () => {
     expect(siteUrlToDidWeb('https://alice.indiering.social')).toBe(
@@ -184,7 +199,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
 
   afterEach(() => {
     if (fs.existsSync(tempRoot)) {
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      removeTempDir(tempRoot);
     }
   });
 
@@ -421,7 +436,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     aliceDb.close();
     bobDb.close();
     if (fs.existsSync(carolDir)) {
-      fs.rmSync(carolDir, { recursive: true, force: true });
+      removeTempDir(carolDir);
     }
   });
 
@@ -751,13 +766,16 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       // Overall crawl signature verification must fail because items.json was tampered with
       expect(tamperedCrawl.verifiedSignature).toBe(false);
 
-      // Photos from untampered albums.json remain verified, while tampered items/endorsements are marked unverified!
+      // Photos from untampered albums.json remain verified. The tampered items.json is unverified, so it
+      // can't overwrite the verified copies already stored: the original post and endorsement stay.
       const feedAfterTamper = aliceDb.getNetworkFeed();
       const photoEntry = aliceDb.getFeedAlbumPhotos(bobAlbum.canonicalUrl)[0];
       const itemEntry = feedAfterTamper.find((e) => e.entryType === 'like');
       expect(photoEntry?.verifiedSignature).toBe(true);
-      expect(itemEntry?.verifiedSignature).toBe(false);
-      expect(aliceDb.getEndorsements()[0]?.verifiedSignature).toBe(false);
+      expect(itemEntry?.verifiedSignature).toBe(true);
+      expect(itemEntry?.commentary).not.toContain('TAMPERED');
+      expect(JSON.stringify(aliceDb.getNetworkFeed())).not.toContain('TAMPERED');
+      expect(aliceDb.getEndorsements()[0]?.verifiedSignature).toBe(true);
 
       // 4. FIX-04: Simulate domain hijack / key swap on Bob's site with a rogue Ed25519 keypair
       const rogueDir = path.join(tempRoot, 'bob-rogue');
@@ -1113,7 +1131,7 @@ describe('Feed Integrity, Moderation & Publish Snapshot', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const makeSite = (name: string) => {
@@ -1310,7 +1328,7 @@ describe('Private Key Encryption at Rest', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   // Stand-in for Electron safeStorage: reversible, and obviously not plaintext
@@ -1438,10 +1456,13 @@ describe('Loopback MCP HTTP Settings', () => {
 
       expect(secondStatus.port).toBe(firstStatus.port);
       expect(secondStatus.authorizedSseUrl).toBe(firstStatus.authorizedSseUrl);
-      expect((fs.statSync(settingsPath).mode & 0o777).toString(8)).toBe('600');
+      // Windows has no POSIX permission bits (Node reports 666 for any writable file)
+      if (process.platform !== 'win32') {
+        expect((fs.statSync(settingsPath).mode & 0o777).toString(8)).toBe('600');
+      }
     } finally {
       manager.closeAll();
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      removeTempDir(tempRoot);
     }
   });
 });
@@ -1487,13 +1508,18 @@ describe('SSRF Guard for Peer Crawling', () => {
   });
 
   it('refuses to fetch loopback addresses by IP or hostname', async () => {
+    // Plain http:// is refused first, outside dev mode
     await expect(defaultJsonFetcher(`http://127.0.0.1:${port}/api/manifest.json`)).rejects.toThrow(
+      /Refusing insecure http:\/\//
+    );
+    // https:// reaches the private-address guard, which refuses before connecting
+    await expect(defaultJsonFetcher(`https://127.0.0.1:${port}/api/manifest.json`)).rejects.toThrow(
       /private or local network address/
     );
-    await expect(defaultJsonFetcher(`http://localhost:${port}/api/manifest.json`)).rejects.toThrow(
+    await expect(defaultJsonFetcher(`https://localhost:${port}/api/manifest.json`)).rejects.toThrow(
       /private or local network address/
     );
-    await expect(defaultJsonFetcher(`http://[::1]:${port}/x`)).rejects.toThrow(
+    await expect(defaultJsonFetcher(`https://[::1]:${port}/x`)).rejects.toThrow(
       /private or local network address/
     );
   });
@@ -1502,7 +1528,7 @@ describe('SSRF Guard for Peer Crawling', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-ssrf-'));
     const db = new StudioDatabase(dir, 'ssrf.sqlite');
     try {
-      const res = await new RingCrawler(db).crawlFriendSite(`http://127.0.0.1:${port}`);
+      const res = await new RingCrawler(db).crawlFriendSite(`https://127.0.0.1:${port}`);
       expect(res.success).toBe(false);
       expect(res.error).toMatch(/private or local network address/);
 
@@ -1512,7 +1538,7 @@ describe('SSRF Guard for Peer Crawling', () => {
       });
     } finally {
       db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
+      removeTempDir(dir);
     }
   });
 });
@@ -1556,7 +1582,7 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
 
   afterEach(() => {
     for (const { db } of sites.values()) db.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('joins a ring end to end: signed request, approval, membership on both sides', async () => {
@@ -1959,7 +1985,7 @@ describe('Scheduled Sync & Publish', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const local = (y: number, mo: number, d: number, h: number, mi: number) => new Date(y, mo - 1, d, h, mi, 0, 0);
@@ -2195,7 +2221,7 @@ describe('Auto-publish after changes', () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const ok = (message: string): JobResult => ({ at: new Date().toISOString(), status: 'ok', message });
@@ -2429,7 +2455,7 @@ describe('Release defaults (no sample content)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('starts new installs empty, with a placeholder profile', () => {
@@ -2543,7 +2569,7 @@ describe('Media Library', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   /** A JPEG with an EXIF block (orientation + a fake GPS marker) like a phone photo. */
@@ -2688,6 +2714,7 @@ describe('Media Library', () => {
     fs.mkdirSync(path.join(out, 'media/albums/old'), { recursive: true });
     fs.writeFileSync(path.join(out, 'README.md'), 'mine'); // not Studio's: must survive
     fs.writeFileSync(path.join(out, 'media/albums/old/stale.jpg'), 'old'); // Studio's old photo area
+    fs.writeFileSync(path.join(out, '.webring-studio'), 'webring-studio\n'); // a folder Studio published before
     expect(site.publisher.publishToLocalDirectory(out).success).toBe(true);
 
     const manifestPath = path.join(out, `media/albums/${album.id}/manifest.json`);
@@ -2928,7 +2955,7 @@ describe('History window: published archives, feed window, conditional sync, sav
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const DAY = 86400000;
@@ -3221,7 +3248,7 @@ describe('Media Library references', () => {
       expect(fs.existsSync(path.join(out, 'media/albums/wall-posts/post.jpg'))).toBe(true);
       db.close();
     } finally {
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      removeTempDir(tempRoot);
     }
   });
 });
@@ -3278,7 +3305,7 @@ describe('Site Design (look & feel, page layout)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const blockOrder = (html: string) => [...html.matchAll(/data-block="([a-z]+)"/g)].map((m) => m[1]);
@@ -3706,7 +3733,7 @@ describe('Letting people know you added them (friend notices, mutual, "Added you
   afterEach(() => {
     vi.useRealTimers();
     for (const { db } of sites.values()) db.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('sends a signed "I added you" link that the recipient verifies, keeps and can add back', async () => {
@@ -3888,7 +3915,7 @@ describe('Sync at scale', () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const makePersona = (name: string) => {
@@ -4018,7 +4045,7 @@ describe('One request per unchanged friend (manifest fingerprints)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const DOCS = ['.well-known/did.json', 'api/manifest.json', 'api/profile.json', 'api/albums.json', 'api/items.json', 'api/connections.json'];
@@ -4223,7 +4250,7 @@ describe('Album cards', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   it('stores album settings and a stable, unique slug', () => {
@@ -4482,7 +4509,7 @@ describe('Album feed cards (syncing friends)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const DAY = 86400000;
@@ -4793,7 +4820,7 @@ describe('Published page freshness and the Studio preview', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   const makeSite = () => {
@@ -4893,7 +4920,7 @@ describe('Editing friend details', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   it('updates a friend in place, allows clearing optional fields, and cleans up old feed data when siteUrl changes', async () => {
@@ -4981,7 +5008,7 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   it('verifies planned Ed25519 key rotations (single-hop and multi-hop) while rejecting forged certificates, and supports emergency re-pinning', async () => {
@@ -5308,7 +5335,7 @@ describe('Guided setup: GitHub sign-in, site creation, publish and live check', 
     vi.unstubAllGlobals();
     for (const manager of managers) manager.getActiveContext().db.close();
     managers = [];
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   /** A scripted GitHub device-flow endpoint: each poll returns the next answer. */
@@ -5624,7 +5651,8 @@ describe('Webring Hubs (optional third-party index)', () => {
         const row = listed.get(did);
         if (!row) return { status: 404, json: { error: 'not_found', message: 'No such entry.' } };
         const body = init.body as { siteUrl: string; nonce: string; createdAt: string; signature: string };
-        const payload = { action: 'remove', siteUrl: row.siteUrl, did, nonce: body.nonce, createdAt: body.createdAt };
+        // The real hub binds the signature to its own address, so a removal can't be replayed elsewhere
+        const payload = { action: 'remove', siteUrl: row.siteUrl, did, hubUrl: HUB, nonce: body.nonce, createdAt: body.createdAt };
         const ok = crypto.verify(
           null,
           Buffer.from(canonicalizeJson(payload), 'utf8'),
@@ -5660,7 +5688,7 @@ describe('Webring Hubs (optional third-party index)', () => {
 
   afterEach(() => {
     db.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('adds a hub only after it answers /api/info, unlisted by default, https only', async () => {
@@ -5920,7 +5948,7 @@ describe('Webring Hubs (optional third-party index)', () => {
 
   it('sends hub API calls through the private-network guard', async () => {
     await expect(
-      requestPublicJson('http://127.0.0.1:9/api/entries', { method: 'POST', body: { siteUrl: SITE } })
+      requestPublicJson('https://127.0.0.1:9/api/entries', { method: 'POST', body: { siteUrl: SITE } })
     ).rejects.toThrow(/private or local network address/);
   });
 
@@ -6091,7 +6119,7 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('requires the access token on every MCP HTTP route even without an Origin header', async () => {
@@ -6264,7 +6292,7 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('pins SFTP host key fingerprints on first use and fails closed on change', async () => {
@@ -6404,7 +6432,7 @@ describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', ()
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('blocks IPv6 transition and documentation ranges in networkGuard', () => {
