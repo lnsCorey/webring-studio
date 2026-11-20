@@ -49,6 +49,8 @@ export function summarizeSync(result: SyncAllResult): JobResult {
   const leavers = result.rings.hosted.reduce((acc, r) => acc + r.autoRemoved.length, 0);
   if (leavers) parts.push(`${leavers} member(s) left your rings`);
   if (friendsWithProblems) parts.push(`${friendsWithProblems} with sync problems`);
+  const rollbacks = result.friends.reduce((acc, r) => acc + (r.rollbacksBlocked || 0), 0);
+  if (rollbacks) parts.push(`${rollbacks} rollback(s) blocked`);
   if (failedFriends) parts.push(`${failedFriends} friend site(s) unreachable`);
   if (deferredFriends) parts.push(`${deferredFriends} unreachable lately (skipped for now)`);
   if (ringErrors) parts.push(`${ringErrors} ring(s) couldn't be checked`);

@@ -80,6 +80,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   reviewFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-review', link),
   acceptFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-accept', link),
   dismissFriendNotice: (siteUrl: string) => ipcRenderer.invoke('studio:friend-notice-dismiss', siteUrl),
+  dismissFriendSyncNotice: (siteUrl: string, doc: string) =>
+    ipcRenderer.invoke('studio:friend-sync-notice-dismiss', siteUrl, doc),
   createHostedRing: (input: { name: string; description?: string }) =>
     ipcRenderer.invoke('studio:hosted-ring-create', input),
   updateHostedRing: (ringId: string, updates: unknown) =>

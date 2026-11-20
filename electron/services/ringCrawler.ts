@@ -57,6 +57,8 @@ export interface CrawlSiteResult {
    * 404). The crawl itself still succeeded. Missing or unchanged documents aren't listed.
    */
   documentErrors?: Array<{ doc: string; message: string }>;
+  /** Documents refused because they were older than the newest copy already verified. */
+  rollbacksBlocked?: number;
 }
 
 /** A document that's absent (404, or no such file in a local folder) is normal, not a sync problem. */
@@ -602,12 +604,28 @@ export class RingCrawler {
             )
           : false;
 
+      // The newest verified date of each document, read before this crawl records any newer one
+      const lastVerified = (url: string) => this.db.getDocumentFreshnessMark(url) || '';
+      const manifestMark = lastVerified(manifestFetch.url);
+      const profileMark = lastVerified(profileFetch.url);
       const isManifestFresh = isManifestVerified
         ? this.db.checkDocumentFreshness(manifestFetch.url, manifest.updatedAt, true)
         : false;
       const isProfileFresh = isProfileVerified
         ? this.db.checkDocumentFreshness(profileFetch.url, profile.updatedAt, true)
         : false;
+      // Rollback protection: nothing is deleted unless the manifest itself is verified and current
+      const manifestCurrent = Boolean(isManifestVerified) && isManifestFresh;
+      let rollbacksBlocked = 0;
+      // A validly signed copy older than one already verified is a replay: refused, and the user told
+      const blockRollback = (doc: string, servedUpdatedAt: string | undefined, mark: string) => {
+        rollbacksBlocked++;
+        this.db.addFriendSyncNotice(normalizedFriendUrl, 'rollback_blocked', {
+          doc,
+          servedUpdatedAt: servedUpdatedAt || '',
+          lastVerifiedUpdatedAt: mark,
+        });
+      };
 
       // Update friend profile metadata only when both manifest and profile verify and are not rolled back.
       // On key change, rollback, or unverified fetch, update only keyStatus and lastCrawledAt.
@@ -640,8 +658,12 @@ export class RingCrawler {
         });
       }
 
-      // Save copies only of documents that verified; otherwise forget them so they're downloaded next time
-      const keepCopies = isManifestVerified && isProfileVerified;
+      if (isManifestVerified && !isManifestFresh) blockRollback('manifest.json', manifest.updatedAt, manifestMark);
+      if (isProfileVerified && !isProfileFresh) blockRollback('profile.json', profile.updatedAt, profileMark);
+
+      // Save copies only of documents that verified and are current; otherwise forget them so
+      // they're downloaded next time
+      const keepCopies = manifestCurrent && Boolean(isProfileVerified) && isProfileFresh;
       for (const doc of [manifestFetch, profileFetch, ...(didFetch && fetchedPublicKeyPem ? [didFetch] : [])]) {
         if (!doc.remote) continue;
         if (keepCopies) {
@@ -700,6 +722,34 @@ export class RingCrawler {
           documentFingerprint(doc.json as Record<string, unknown>)
         );
       };
+      /**
+       * Whether a fetched document may be used at all. Refused when the verified manifest lists a
+       * different fingerprint for it (reported as a sync problem), or when it's older than the
+       * newest copy already verified (a rollback; if validly signed, the user gets a notice).
+       */
+      const admitDocument = (
+        doc: string,
+        key: ManifestDocumentKey,
+        url: string,
+        raw: unknown,
+        updatedAt: string | undefined,
+        signatureValid: boolean
+      ): boolean => {
+        const listed = isManifestVerified ? listedFingerprint(key) : undefined;
+        if (listed && documentFingerprint(raw as Record<string, unknown>) !== listed) {
+          noteDocumentError(doc, new Error("doesn't match the fingerprint in their signed manifest, so it wasn't used"));
+          return false;
+        }
+        if (!this.db.checkDocumentFreshness(url, updatedAt, false)) {
+          if (signatureValid) blockRollback(doc, updatedAt, lastVerified(url));
+          return false;
+        }
+        return true;
+      };
+      // After a verified, current document has been applied, later copies must be at least this new
+      const recordVerifiedDate = (url: string, updatedAt: string) => {
+        this.db.checkDocumentFreshness(url, updatedAt, true);
+      };
 
       // Crawl albums.json and independently verify its Ed25519 signature
       try {
@@ -715,7 +765,12 @@ export class RingCrawler {
               )
             : false;
 
-        const photoVerified = isManifestVerified && isProfileVerified && isAlbumsVerified;
+        if (!admitDocument('albums.json', 'albums', albumsFetch.url, rawAlbums, albumsDoc.updatedAt, Boolean(isAlbumsVerified))) {
+          isAlbumsVerified = false;
+          throw new UnchangedDocument();
+        }
+
+        const photoVerified = Boolean(isManifestVerified && isProfileVerified && isAlbumsVerified);
         const seenPhotoUrls: string[] = [];
 
         const absoluteUrl = (url: string) =>
@@ -801,10 +856,12 @@ export class RingCrawler {
           }
         });
 
-        // Only a verified document may delete rows, so a hijacked or tampered site can't wipe the feed
-        if (photoVerified) {
+        // Only a verified, current document under a verified, current manifest may delete rows, so a
+        // hijacked or tampered site (or an old copy replayed) can't wipe the feed
+        if (photoVerified && manifestCurrent) {
           entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'photos', seenPhotoUrls);
           rememberValidators(albumsFetch);
+          recordVerifiedDate(albumsFetch.url, albumsDoc.updatedAt);
         }
       } catch (err) {
         // Missing or unchanged is normal; anything else is reported, and the rest of the crawl goes on
@@ -825,7 +882,12 @@ export class RingCrawler {
               )
             : false;
 
-        const itemVerified = isManifestVerified && isProfileVerified && isItemsVerified;
+        if (!admitDocument('items.json', 'items', itemsFetch.url, rawItems, itemsDoc.updatedAt, Boolean(isItemsVerified))) {
+          isItemsVerified = false;
+          throw new UnchangedDocument();
+        }
+
+        const itemVerified = Boolean(isManifestVerified && isProfileVerified && isItemsVerified);
         const seenItemUrls: string[] = [];
 
         this.db.transaction(() => {
@@ -870,12 +932,13 @@ export class RingCrawler {
           }
         });
 
-        if (itemVerified) {
+        if (itemVerified && manifestCurrent) {
           // A friend who publishes only recent items has archived the older ones, not deleted them
           const since = itemsDoc.archive?.since;
           entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'items', seenItemUrls, since);
           entriesPruned += this.db.pruneEndorsementsFrom(normalizedFriendUrl, seenItemUrls, since);
           rememberValidators(itemsFetch);
+          recordVerifiedDate(itemsFetch.url, itemsDoc.updatedAt);
         }
       } catch (err) {
         noteDocumentError('items.json', err);
@@ -898,12 +961,18 @@ export class RingCrawler {
           ) &&
           normalizeSiteUrl(connections.siteUrl) === normalizedFriendUrl &&
           connections.did === manifest.did;
-        if (connectionsVerified) {
+        if (
+          !admitDocument('connections.json', 'connections', connectionsFetch.url, rawConnections, connections.updatedAt, connectionsVerified)
+        ) {
+          throw new UnchangedDocument();
+        }
+        if (connectionsVerified && manifestCurrent) {
           this.db.setFriendListsMe(
             normalizedFriendUrl,
             connections.friends.some((f) => normalizeSiteUrl(f.siteUrl) === mySiteUrl)
           );
           rememberValidators(connectionsFetch);
+          recordVerifiedDate(connectionsFetch.url, connections.updatedAt);
         }
       } catch (err) {
         // Optional: missing, unchanged or unverifiable leaves "Mutual" as it was
@@ -939,6 +1008,7 @@ export class RingCrawler {
         keyChangedWarning,
         ...(unchanged.length ? { unchanged } : {}),
         ...(documentErrors.length ? { documentErrors } : {}),
+        ...(rollbacksBlocked ? { rollbacksBlocked } : {}),
       };
     } catch (err: unknown) {
       return {

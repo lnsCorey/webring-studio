@@ -635,6 +635,7 @@ function registerIpcHandlers() {
       savedPosts: ctx.db.getSavedPosts(),
       feedRetentionDays: ctx.db.getFeedRetentionDays(),
       friendNotices: ctx.db.getFriendNotices(),
+      friendSyncNotices: ctx.db.getFriendSyncNotices(),
       mutualFriendUrls: ctx.db.getMutualFriendUrls(),
       proxySettings: ctx.db.getProxySettings(),
       keyRotations: ctx.db.getKeyRotations(),
@@ -1003,6 +1004,11 @@ function registerIpcHandlers() {
   });
   ipcMain.handle('studio:friend-notice-dismiss', (_e, siteUrl: string) => {
     personaManager.getActiveContext().db.dismissFriendNotice(String(siteUrl));
+    return { ok: true };
+  });
+  // Rollback notices: a friend served an older copy of a document than one already verified
+  ipcMain.handle('studio:friend-sync-notice-dismiss', (_e, siteUrl: string, doc: string) => {
+    personaManager.getActiveContext().db.dismissFriendSyncNotice(String(siteUrl), 'rollback_blocked', String(doc));
     return { ok: true };
   });
 

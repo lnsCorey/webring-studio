@@ -123,6 +123,28 @@ function removeTempDir(dir: string): void {
   }
 }
 
+/**
+ * Rewrites one of a site's published documents as its owner would: signed with the site key, with
+ * the manifest's digest of it updated and the manifest signed again. (A document changed without
+ * its manifest no longer matches the manifest's digest, and friends refuse it.)
+ */
+function republishDocument(
+  outDir: string,
+  relPath: string,
+  key: 'albums' | 'items' | 'connections' | 'profile',
+  doc: Record<string, unknown>,
+  siteUrl: string,
+  privateKeyPem: string
+): void {
+  const did = siteUrlToDidWeb(siteUrl);
+  const signed = signDocument(doc, did, privateKeyPem);
+  fs.writeFileSync(path.join(outDir, relPath), JSON.stringify(signed));
+  const manifestPath = path.join(outDir, 'api/manifest.json');
+  const { proof: _proof, ...manifest } = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.documents = { ...(manifest.documents || {}), [key]: { sha256: documentFingerprint(signed) } };
+  fs.writeFileSync(manifestPath, JSON.stringify(signDocument(manifest, did, privateKeyPem)));
+}
+
 describe('Webring Schema, DID Identity & Ed25519 Signatures', () => {
   it('converts website URLs into standard W3C / ATProto did:web identifiers', () => {
     expect(siteUrlToDidWeb('https://alice.indiering.social')).toBe(
@@ -1159,12 +1181,7 @@ describe('Feed Integrity, Moderation & Publish Snapshot', () => {
       const itemsPath = path.join(mallory.outDir, 'api/items.json');
       const { proof: _proof, ...itemsDoc } = JSON.parse(fs.readFileSync(itemsPath, 'utf8'));
       itemsDoc.items[0].canonicalUrl = carolPost.canonicalUrl;
-      const resigned = signDocument(
-        itemsDoc,
-        siteUrlToDidWeb(mallory.siteUrl),
-        mallory.db.getKeys().privateKeyPem
-      );
-      fs.writeFileSync(itemsPath, JSON.stringify(resigned));
+      republishDocument(mallory.outDir, 'api/items.json', 'items', itemsDoc, mallory.siteUrl, mallory.db.getKeys().privateKeyPem);
 
       const res = await new RingCrawler(alice.db).crawlFriendSite(mallory.siteUrl, mallory.outDir);
       expect(res.success).toBe(true);
@@ -4667,7 +4684,7 @@ describe('Album feed cards (syncing friends)', () => {
         delete a.slug;
         delete a.pageUrl;
       }
-      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+      republishDocument(carol.outDir, 'api/albums.json', 'albums', doc, carol.siteUrl, carol.db.getKeys().privateKeyPem);
 
       const res = await crawl(alice, carol);
       expect(res.verifiedSignature).toBe(true);
@@ -4734,7 +4751,7 @@ describe('Album feed cards (syncing friends)', () => {
       const albumsPath = path.join(mallory.outDir, 'api/albums.json');
       const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
       doc.albums[0].canonicalUrl = album.canonicalUrl;
-      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(mallory.siteUrl), mallory.db.getKeys().privateKeyPem)));
+      republishDocument(mallory.outDir, 'api/albums.json', 'albums', doc, mallory.siteUrl, mallory.db.getKeys().privateKeyPem);
 
       const res = await crawl(alice, mallory);
       expect(res.verifiedSignature).toBe(true);
@@ -4763,7 +4780,7 @@ describe('Album feed cards (syncing friends)', () => {
       const albumsPath = path.join(carol.outDir, 'api/albums.json');
       const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
       doc.albums[0].pageUrl = 'https://evil.example/phish/';
-      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+      republishDocument(carol.outDir, 'api/albums.json', 'albums', doc, carol.siteUrl, carol.db.getKeys().privateKeyPem);
 
       const res = await crawl(alice, carol);
       expect(res.verifiedSignature).toBe(true);
@@ -6722,6 +6739,127 @@ describe('Security Phase 6: upgrade migrations', () => {
     } finally {
       bobDb.close();
       aliceDb.close();
+    }
+  });
+});
+
+describe('Security Phase 6: rollback protection for every document', () => {
+  let tempRoot: string;
+  const ALICE = 'https://alice.rb.test';
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-rollback-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  const tick = () => new Promise((r) => setTimeout(r, 15));
+
+  /** Alice's site, published into one folder; `snapshot` copies the current state aside. */
+  const makeAlice = () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'alice'), 'alice.sqlite');
+    db.updateProfile({ siteUrl: ALICE, displayName: 'Alice' });
+    const out = path.join(tempRoot, 'alice-out');
+    const publish = () => new StaticSiteGenerator(db).generateToDirectory(out);
+    const snapshot = (name: string) => {
+      const copy = path.join(tempRoot, name);
+      fs.cpSync(out, copy, { recursive: true });
+      return copy;
+    };
+    const serve = (copy: string) => {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.cpSync(copy, out, { recursive: true });
+    };
+    return { db, out, publish, snapshot, serve };
+  };
+
+  const makeBob = () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    db.updateProfile({ siteUrl: 'https://bob.rb.test', displayName: 'Bob' });
+    return db;
+  };
+
+  it('refuses an older signed copy: nothing pruned, the newer copy kept, and a notice recorded', async () => {
+    const alice = makeAlice();
+    const bob = makeBob();
+    try {
+      alice.db.createItem({ type: 'post', title: 'First', commentary: 'one' });
+      alice.publish();
+      const v1 = alice.snapshot('v1');
+      await tick();
+      const second = alice.db.createItem({ type: 'post', title: 'Second', commentary: 'two' });
+      alice.publish();
+
+      const synced = await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(synced.rollbacksBlocked).toBeUndefined();
+      expect(bob.getNetworkFeed().map((e) => e.title).sort()).toEqual(['First', 'Second']);
+      const itemsPath = path.join(alice.out, 'api/items.json');
+      const v2ItemsDate = JSON.parse(fs.readFileSync(itemsPath, 'utf8')).updatedAt;
+
+      // The host serves the old, validly signed copy of everything
+      alice.serve(v1);
+      const replayed = await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(replayed.success).toBe(true);
+      expect(replayed.entriesPruned).toBe(0);
+      expect(replayed.rollbacksBlocked).toBeGreaterThan(0);
+      expect(bob.getNetworkFeed().map((e) => e.canonicalUrl)).toContain(second.canonicalUrl);
+      // The newest verified date is still v2's
+      expect(bob.getDocumentFreshnessMark(itemsPath)).toBe(v2ItemsDate);
+
+      const notices = bob.getFriendSyncNotices();
+      expect(notices.map((n) => n.doc)).toEqual(expect.arrayContaining(['manifest.json', 'items.json']));
+      const itemsNotice = notices.find((n) => n.doc === 'items.json')!;
+      expect(itemsNotice).toMatchObject({ siteUrl: ALICE, friendName: 'Alice', kind: 'rollback_blocked', lastVerifiedUpdatedAt: v2ItemsDate });
+      expect(itemsNotice.servedUpdatedAt < v2ItemsDate).toBe(true);
+
+      bob.dismissFriendSyncNotice(ALICE, 'rollback_blocked', 'items.json');
+      expect(bob.getFriendSyncNotices().some((n) => n.doc === 'items.json')).toBe(false);
+    } finally {
+      bob.close();
+      alice.db.close();
+    }
+  });
+
+  it('treats a document with no date, or an unreadable one, as stale', () => {
+    const db = makeBob();
+    try {
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', undefined)).toBe(false);
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', '')).toBe(false);
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', 'not a date')).toBe(false);
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', '2026-11-20T00:00:00.000Z')).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses a document that doesn't match its digest in the signed manifest: no upsert, no prune", async () => {
+    const alice = makeAlice();
+    const bob = makeBob();
+    try {
+      const first = alice.db.createItem({ type: 'post', title: 'First', commentary: 'one' });
+      alice.publish();
+      await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(bob.getNetworkFeed().map((e) => e.title)).toEqual(['First']);
+
+      // A newer, validly signed items.json (First removed, Third added) without the manifest that lists it
+      const manifestV2 = fs.readFileSync(path.join(alice.out, 'api/manifest.json'), 'utf8');
+      await tick();
+      alice.db.deleteItem(first.id);
+      alice.db.createItem({ type: 'post', title: 'Third', commentary: 'three' });
+      alice.publish();
+      fs.writeFileSync(path.join(alice.out, 'api/manifest.json'), manifestV2);
+
+      const res = await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(res.success).toBe(true);
+      expect(res.entriesPruned).toBe(0);
+      expect(res.documentErrors?.map((e) => e.doc)).toContain('items.json');
+      expect(bob.getNetworkFeed().map((e) => e.title)).toEqual(['First']);
+      expect(bob.getFriendBySiteUrl(ALICE)?.lastSyncError).toMatch(/items\.json: .*fingerprint/);
+    } finally {
+      bob.close();
+      alice.db.close();
     }
   });
 });

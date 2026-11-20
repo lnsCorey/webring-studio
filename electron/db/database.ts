@@ -391,6 +391,22 @@ export interface NetworkFeedEntry {
 /** A friend's post or photo the user saved: a private copy kept outside the feed window. */
 export type FriendNoticeSource = 'link' | 'ring';
 
+export type FriendSyncNoticeKind = 'rollback_blocked';
+
+/**
+ * Something a friend's sync refused that the user should know about (friend_sync_notices).
+ * 'rollback_blocked': the friend served an older copy of a document than one already verified.
+ */
+export interface FriendSyncNotice {
+  siteUrl: string;
+  friendName: string;
+  kind: FriendSyncNoticeKind;
+  doc: string;
+  servedUpdatedAt: string;
+  lastVerifiedUpdatedAt: string;
+  createdAt: string;
+}
+
 /** Someone who added this persona as a friend (database.ts friend_notices). Never exported. */
 export interface FriendNotice {
   siteUrl: string;
@@ -987,6 +1003,19 @@ export class StudioDatabase {
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         dismissed_at TEXT
+      );
+
+      -- Things a friend's sync did that the user should know about, e.g. an older copy of a
+      -- document refused (rollback_blocked). Local only, never exported.
+      CREATE TABLE IF NOT EXISTS friend_sync_notices (
+        site_url TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        doc TEXT NOT NULL,
+        served_updated_at TEXT NOT NULL DEFAULT '',
+        last_verified_updated_at TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        dismissed_at TEXT,
+        PRIMARY KEY (site_url, kind, doc)
       );
     `);
 
@@ -2576,6 +2605,7 @@ export class StudioDatabase {
         this.db.prepare('DELETE FROM network_feed WHERE friend_site_url = ?').run(row.site_url);
         this.db.prepare('DELETE FROM endorsements WHERE author_site_url = ?').run(row.site_url);
         this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(row.site_url);
+        this.db.prepare('DELETE FROM friend_sync_notices WHERE site_url = ?').run(row.site_url);
       }
       this.db.prepare('DELETE FROM friends WHERE id = ?').run(friendId);
     });
@@ -3334,7 +3364,8 @@ export class StudioDatabase {
    * If `record` is true and the check passes, saves the new timestamp.
    */
   public checkDocumentFreshness(docUrl: string, updatedAt?: string, record = false): boolean {
-    if (!updatedAt) return true;
+    // A document with no date can't be shown to be newer than the last verified copy
+    if (!updatedAt) return false;
     const nextTs = Date.parse(updatedAt);
     if (!Number.isFinite(nextTs)) return false;
     const key = `doc_updated_at:${docUrl}`;
@@ -3355,6 +3386,70 @@ export class StudioDatabase {
         .run(key, updatedAt);
     }
     return true;
+  }
+
+  /** The `updatedAt` of the newest verified copy of a document, as recorded by checkDocumentFreshness. */
+  public getDocumentFreshnessMark(docUrl: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM local_settings WHERE key = ?').get(`doc_updated_at:${docUrl}`) as
+      | { value: string }
+      | undefined;
+    return row?.value || undefined;
+  }
+
+  /**
+   * Records that a friend served an older copy of a document than one already verified, so Studio
+   * kept the newer one. One notice per friend and document; a new rollback brings a dismissed one back.
+   */
+  public addFriendSyncNotice(
+    siteUrl: string,
+    kind: FriendSyncNoticeKind,
+    details: { doc: string; servedUpdatedAt: string; lastVerifiedUpdatedAt: string }
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO friend_sync_notices (site_url, kind, doc, served_updated_at, last_verified_updated_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(site_url, kind, doc) DO UPDATE SET
+           served_updated_at = excluded.served_updated_at,
+           last_verified_updated_at = excluded.last_verified_updated_at,
+           created_at = excluded.created_at,
+           dismissed_at = NULL`
+      )
+      .run(
+        normalizeSiteUrl(siteUrl),
+        kind,
+        details.doc,
+        details.servedUpdatedAt.slice(0, 40),
+        details.lastVerifiedUpdatedAt.slice(0, 40),
+        new Date().toISOString()
+      );
+  }
+
+  /** Undismissed sync notices, newest first, with the friend's current name. */
+  public getFriendSyncNotices(): FriendSyncNotice[] {
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, f.display_name AS friend_name FROM friend_sync_notices n
+         JOIN friends f ON f.site_url = n.site_url
+         WHERE n.dismissed_at IS NULL
+         ORDER BY n.created_at DESC`
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      siteUrl: String(r.site_url),
+      friendName: String(r.friend_name || r.site_url),
+      kind: 'rollback_blocked',
+      doc: String(r.doc),
+      servedUpdatedAt: String(r.served_updated_at || ''),
+      lastVerifiedUpdatedAt: String(r.last_verified_updated_at || ''),
+      createdAt: String(r.created_at),
+    }));
+  }
+
+  public dismissFriendSyncNotice(siteUrl: string, kind: FriendSyncNoticeKind, doc: string): void {
+    this.db
+      .prepare('UPDATE friend_sync_notices SET dismissed_at = ? WHERE site_url = ? AND kind = ? AND doc = ?')
+      .run(new Date().toISOString(), normalizeSiteUrl(siteUrl), kind, doc);
   }
 
   public getSftpHostKeyFingerprint(host: string, port: number): string | null {

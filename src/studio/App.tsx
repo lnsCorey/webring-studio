@@ -28,6 +28,7 @@ import { FriendEdit, FriendEditor } from './FriendEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
+import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
@@ -317,6 +318,8 @@ interface CrawlSiteResult {
   error?: string;
   /** Documents the sync couldn't use; the friend shows a "Sync problem" badge. */
   documentErrors?: Array<{ doc: string; message: string }>;
+  /** Older copies of documents refused (rollback protection). */
+  rollbacksBlocked?: number;
 }
 
 /** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
@@ -435,6 +438,7 @@ declare global {
         savedPosts?: SavedPostView[];
         feedRetentionDays?: number;
         friendNotices?: FriendNoticeView[];
+        friendSyncNotices?: FriendSyncNoticeView[];
         mutualFriendUrls?: string[];
         proxySettings?: { enabled: boolean; proxyUrl: string };
         keyRotations?: KeyRotationCertificate[];
@@ -555,6 +559,7 @@ declare global {
       reviewFriendNotice?: (link: string) => Promise<FriendNoticeReviewView>;
       acceptFriendNotice?: (link: string) => Promise<unknown>;
       dismissFriendNotice?: (siteUrl: string) => Promise<unknown>;
+      dismissFriendSyncNotice?: (siteUrl: string, doc: string) => Promise<unknown>;
       onFriendNoticeLink?: (cb: (link: string) => void) => () => void;
       getSchedule: () => Promise<ScheduleOverview>;
       setSchedule: (
@@ -709,6 +714,7 @@ export const App: React.FC = () => {
   const [savedPosts, setSavedPosts] = useState<SavedPostView[]>([]);
   const [feedRetentionDays, setFeedRetentionDays] = useState(90);
   const [friendNotices, setFriendNotices] = useState<FriendNoticeView[]>([]);
+  const [friendSyncNotices, setFriendSyncNotices] = useState<FriendSyncNoticeView[]>([]);
   const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
   const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
@@ -1029,6 +1035,7 @@ export const App: React.FC = () => {
     setSavedPosts(data.savedPosts || []);
     if (typeof data.feedRetentionDays === 'number') setFeedRetentionDays(data.feedRetentionDays);
     setFriendNotices(data.friendNotices || []);
+    setFriendSyncNotices(data.friendSyncNotices || []);
     setMutualFriendUrls(data.mutualFriendUrls || []);
     setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
     setModeration(data.moderation || []);
@@ -1816,6 +1823,8 @@ export const App: React.FC = () => {
       if (blocked) parts.push(`${blocked} blocked (skipped)`);
       if (deferred) parts.push(`${deferred} unreachable lately (skipped for now)`);
       if (keyChanged) parts.push(`${keyChanged} key changed`);
+      const rollbacks = results.reduce((acc, r) => acc + (r.rollbacksBlocked || 0), 0);
+      if (rollbacks) parts.push(`${rollbacks} rollback(s) blocked`);
       if (rejected) parts.push(`${rejected} spoofed entries rejected`);
       const newMember = rings.joined.filter((r) => r.outcome === 'member').length;
       const removedFrom = rings.joined.filter((r) => r.outcome === 'removed' || r.outcome === 'closed');
@@ -3746,6 +3755,26 @@ export const App: React.FC = () => {
                   await refreshStudioData();
                 }}
                 onBlock={(target) => handleSetModeration(target.siteUrl, target.displayName || target.siteUrl, 'block')}
+              />
+
+              <FriendSyncNoticesPanel
+                notices={friendSyncNotices}
+                errorMessage={errorMessage}
+                onDismiss={async (n) => {
+                  await window.studioApi?.dismissFriendSyncNotice?.(n.siteUrl, n.doc);
+                  await refreshStudioData();
+                }}
+                onRecheck={async (n) => {
+                  const res = await window.studioApi?.crawlFriend(n.siteUrl);
+                  await refreshStudioData();
+                  notify(
+                    res?.success
+                      ? res.rollbacksBlocked
+                        ? `${n.friendName} is still serving an older copy. Studio kept the newer one.`
+                        : `Re-checked ${n.friendName}: their site is current again.`
+                      : `Couldn't reach ${n.siteUrl}: ${res?.error || 'site unreachable'}`
+                  );
+                }}
               />
 
               {/* Social Graph Privacy & Anti-Scraping Shield Panel */}
