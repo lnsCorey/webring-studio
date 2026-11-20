@@ -444,3 +444,28 @@ describe('Security Phase 8: the preview server runs only while needed', () => {
     expect(app).toContain('Preview stopped — click to restart');
   });
 });
+
+describe('Security Phase 8: every safeguard is explained', () => {
+  it('Help and the README cover the phase 6–8 controls', () => {
+    const help = read('src/studio/SafetyControlsHelp.tsx');
+    for (const topic of [
+      'Security banners',
+      'Review New Key',
+      'Sync problem',
+      'Allow agents to read private data',
+      'Approval requests',
+      'Held agent changes',
+      'Export folder rules',
+      'SFTP sign-in and the pinned server key',
+      'Unencrypted FTP',
+      'GitHub fine-grained token',
+    ]) {
+      expect(help).toContain(topic);
+    }
+    expect(read('src/studio/App.tsx')).toContain("helpSection === 'safety-controls' && <SafetyControlsHelp />");
+    const readme = read('README.md');
+    for (const topic of ['#### Publishing safely', 'Forget pinned key', 'Allow unencrypted FTP', 'Create token on GitHub', 'Requires Node 24 (see .nvmrc)']) {
+      expect(readme).toContain(topic);
+    }
+  });
+});

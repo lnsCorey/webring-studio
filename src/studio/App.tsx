@@ -33,6 +33,7 @@ import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
 import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
 import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
 import { HeldAgentChangeView, HeldChangesPanel } from './HeldChangesPanel';
+import { SafetyControlsHelp } from './SafetyControlsHelp';
 import { authMethodOf, HostKeyMismatchDialog, SftpHostKeyApi, SftpSecurityControls } from './SftpSecurityControls';
 
 /** Where GitHub creates a fine-grained token (the user picks the one repository there). */
@@ -781,6 +782,7 @@ export const App: React.FC = () => {
     | 'webrings'
     | 'hubs'
     | 'security-storage'
+    | 'safety-controls'
   >('quickstart');
   const [bundle, setBundle] = useState<CompleteSiteBundle | null>(null);
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
@@ -7858,6 +7860,7 @@ export const App: React.FC = () => {
                       { id: 'webrings', label: '7. Webrings Guide' },
                       { id: 'hubs', label: '8. Webring Hubs' },
                       { id: 'security-storage', label: '9. Secure Storage & Proxy' },
+                      { id: 'safety-controls', label: '10. Safety Notices & Controls' },
                     ] as const
                   ).map((sec) => (
                     <button
@@ -9252,6 +9255,8 @@ git push -u origin main --force`}
               )}
 
               {/* SECTION 9: SECURE STORAGE & PROXY */}
+              {helpSection === 'safety-controls' && <SafetyControlsHelp />}
+
               {helpSection === 'security-storage' && (
                 <div className="space-y-6">
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
