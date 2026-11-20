@@ -56,12 +56,14 @@ import {
 } from '../../src/shared/schema';
 import { markdownToPlainText } from '../../src/shared/markdown';
 import {
+  isAvailable as isKeyCipherAvailable,
   isEncryptedKey,
   KeyCipher,
   openPrivateKey,
   openSecret,
   sealPrivateKey,
   sealSecret,
+  SecretStorageUnavailableError,
 } from '../security/keyVault';
 import {
   DEMO_PEER_SITE_URL,
@@ -82,6 +84,46 @@ type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
  * the Publish form) keeps the stored value; '' clears it; anything else replaces it.
  */
 export const STORED_SECRET_PLACEHOLDER = '••••••••';
+
+/**
+ * A public key's fingerprint: SHA-256 of its SPKI DER bytes, in lowercase hex. The same key in
+ * any PEM wrapping has the same fingerprint. An unreadable key falls back to its trimmed text.
+ */
+export function spkiFingerprint(publicKeyPem: string): string {
+  try {
+    const der = crypto.createPublicKey(publicKeyPem).export({ type: 'spki', format: 'der' });
+    return crypto.createHash('sha256').update(der).digest('hex');
+  } catch {
+    return publicKeyPem.trim();
+  }
+}
+
+/** A fingerprint as typed or shown (any case, spaces or colons) in the stored form. */
+function normalizeFingerprint(value: string): string {
+  return value.replace(/[\s:]/g, '').toLowerCase();
+}
+
+/** local_settings key: how many friend profiles migration 2 reset, for a one-time notice. */
+const PROFILES_RESET_NOTICE_KEY = 'notice:friend_profiles_reset';
+
+const sha256Hex = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
+
+/** A friend's feed row: one per (friend, canonical URL), so two friends never share a row. */
+export const feedRowId = (friendUrl: string, url: string) => `feed-${sha256Hex(`${friendUrl}\0${url}`)}`;
+
+/** An endorsement row: one per (author, source item URL). */
+export const endorsementRowId = (authorUrl: string, url: string) => `end-${sha256Hex(`${authorUrl}\0${url}`)}`;
+
+/**
+ * A versioned schema change, run once in order of `version` and recorded in `PRAGMA user_version`.
+ * The column probes in initializeSchema are the version 0 baseline.
+ */
+interface SchemaMigration {
+  version: number;
+  name: string;
+  /** Runs inside a transaction; throwing rolls it back. */
+  up: () => void;
+}
 
 /** The published files behind a Media Library photo (see electron/services/mediaLibrary.ts). */
 export interface LocalPhotoMedia {
@@ -372,6 +414,22 @@ export interface NetworkFeedEntry {
 /** A friend's post or photo the user saved: a private copy kept outside the feed window. */
 export type FriendNoticeSource = 'link' | 'ring';
 
+export type FriendSyncNoticeKind = 'rollback_blocked';
+
+/**
+ * Something a friend's sync refused that the user should know about (friend_sync_notices).
+ * 'rollback_blocked': the friend served an older copy of a document than one already verified.
+ */
+export interface FriendSyncNotice {
+  siteUrl: string;
+  friendName: string;
+  kind: FriendSyncNoticeKind;
+  doc: string;
+  servedUpdatedAt: string;
+  lastVerifiedUpdatedAt: string;
+  createdAt: string;
+}
+
 /** Someone who added this persona as a friend (database.ts friend_notices). Never exported. */
 export interface FriendNotice {
   siteUrl: string;
@@ -557,6 +615,7 @@ export class StudioDatabase {
     this.ensureDefaultProfile(options);
     this.sealPrivateKeyAtRest();
     this.sealPublishSecretsAtRest();
+    this.sealProxyAtRest();
     this.migrateLegacyHub();
     this.removeLegacyDemoContent();
   }
@@ -681,6 +740,43 @@ export class StudioDatabase {
       | { publish_settings_json: string }
       | undefined;
     return JSON.parse(String(row?.publish_settings_json || '{}'));
+  }
+
+  /** True when the OS keychain can seal secrets for this persona now. */
+  public isKeyVaultAvailable(): boolean {
+    return isKeyCipherAvailable(this.keyCipher);
+  }
+
+  /**
+   * Refuses to store a new secret unencrypted unless the user agreed to (`allowPlaintext`): with no
+   * keychain, sealSecret would keep it as plain text in the database file.
+   */
+  private assertSecretCanBeStored(value: string | undefined, options: { allowPlaintext?: boolean }): void {
+    if (!value || isEncryptedKey(value) || options.allowPlaintext || this.isKeyVaultAvailable()) return;
+    throw new SecretStorageUnavailableError();
+  }
+
+  /**
+   * Seals a proxy URL stored as plain text (by an older build, or saved while the keychain was
+   * unavailable) once the keychain is available. Runs at every start; migration 4 runs it once too.
+   */
+  private sealProxyAtRest(): void {
+    if (!this.isKeyVaultAvailable()) return;
+    const row = this.db.prepare("SELECT value FROM local_settings WHERE key = 'proxySettingsJson'").get() as
+      | { value: string }
+      | undefined;
+    if (!row?.value) return;
+    let parsed: { enabled?: unknown; proxyUrl?: unknown };
+    try {
+      parsed = JSON.parse(row.value);
+    } catch {
+      return;
+    }
+    const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
+    if (!raw || isEncryptedKey(raw)) return;
+    this.db
+      .prepare("UPDATE local_settings SET value = ? WHERE key = 'proxySettingsJson'")
+      .run(JSON.stringify({ ...parsed, proxyUrl: sealSecret(raw, this.keyCipher) }));
   }
 
   /** Encrypts plaintext publishing credentials (from older builds or the MCP CLI) once a cipher is available. */
@@ -969,6 +1065,19 @@ export class StudioDatabase {
         last_seen_at TEXT NOT NULL,
         dismissed_at TEXT
       );
+
+      -- Things a friend's sync did that the user should know about, e.g. an older copy of a
+      -- document refused (rollback_blocked). Local only, never exported.
+      CREATE TABLE IF NOT EXISTS friend_sync_notices (
+        site_url TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        doc TEXT NOT NULL,
+        served_updated_at TEXT NOT NULL DEFAULT '',
+        last_verified_updated_at TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        dismissed_at TEXT,
+        PRIMARY KEY (site_url, kind, doc)
+      );
     `);
 
     // Safe migration for existing databases lacking friends.visibility or TOFU key pinning columns
@@ -1123,6 +1232,315 @@ export class StudioDatabase {
     `);
 
     this.migrateLegacyAbsoluteCustomLinks();
+
+    // Everything above is the version 0 baseline; versioned changes follow
+    this.runMigrations();
+  }
+
+  /** The schema version this database is at (`PRAGMA user_version`). */
+  public getSchemaVersion(): number {
+    const row = this.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
+    return Number(row?.user_version || 0);
+  }
+
+  /**
+   * Runs each migration above the stored `user_version`, in order, each in its own transaction
+   * with the version bump. A failure rolls that migration back and is thrown, naming it, so a
+   * half-upgraded database is never used silently.
+   */
+  private runMigrations(): void {
+    const current = this.getSchemaVersion();
+    for (const migration of this.schemaMigrations()) {
+      if (migration.version <= current) continue;
+      this.db.exec('BEGIN');
+      try {
+        migration.up();
+        this.db.exec(`PRAGMA user_version = ${Math.floor(migration.version)}`);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Database upgrade ${migration.version} (${migration.name}) failed: ${message}`);
+      }
+      console.info(`[webring-studio] Database upgraded to version ${migration.version} (${migration.name}).`);
+    }
+  }
+
+  private schemaMigrations(): SchemaMigration[] {
+    return [
+      {
+        version: 1,
+        name: 'feed_endorsement_scoped_unique',
+        up: () => this.migrateFeedAndEndorsementKeys(),
+      },
+      {
+        version: 2,
+        name: 'reset_unverified_friend_profiles',
+        up: () => this.resetUnverifiedFriendProfiles(),
+      },
+      {
+        version: 3,
+        name: 'friend_candidate_keys',
+        up: () => this.moveCandidateKeysToFriends(),
+      },
+      {
+        // A plaintext proxy is sealed when the keychain is available; otherwise it stays as it is
+        // and the security banner says so (sealProxyAtRest also runs at every start)
+        version: 4,
+        name: 'reseal_proxy',
+        up: () => this.sealProxyAtRest(),
+      },
+    ];
+  }
+
+  /**
+   * Migration 3. A changed key seen while syncing (the "candidate") moves from local_settings into
+   * the friend's row, with its fingerprint and when it was first seen, so the one the user reviews
+   * is the one that gets trusted.
+   */
+  private moveCandidateKeysToFriends(): void {
+    const existing = this.db.prepare('PRAGMA table_info(friends)').all() as Array<{ name: string }>;
+    for (const [name, ddl] of [
+      ['candidate_key_pem', "TEXT NOT NULL DEFAULT ''"],
+      ['candidate_fingerprint', "TEXT NOT NULL DEFAULT ''"],
+      ['candidate_first_seen_at', "TEXT NOT NULL DEFAULT ''"],
+      ['candidate_conflict', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) {
+      if (!existing.some((c) => c.name === name)) this.db.exec(`ALTER TABLE friends ADD COLUMN ${name} ${ddl}`);
+    }
+    const rows = this.db.prepare("SELECT key, value FROM local_settings WHERE key LIKE 'candidate_key:%'").all() as Array<{
+      key: string;
+      value: string;
+    }>;
+    const now = new Date().toISOString();
+    const update = this.db.prepare(
+      `UPDATE friends SET candidate_key_pem = ?, candidate_fingerprint = ?, candidate_first_seen_at = ?, candidate_conflict = 0
+       WHERE site_url = ?`
+    );
+    for (const row of rows) {
+      const pem = row.value.trim();
+      if (pem) update.run(pem, spkiFingerprint(pem), now, normalizeSiteUrl(row.key.slice('candidate_key:'.length)));
+    }
+    this.db.exec("DELETE FROM local_settings WHERE key LIKE 'candidate_key:%'");
+  }
+
+  /**
+   * Migration 2. Builds before the fixes stored friends' names, bios and avatars from documents
+   * that never verified. A friend with no saved verified profile copy, or whose key isn't pinned,
+   * goes back to what its address alone proves (hostname and did:web) and is re-crawled first on
+   * the next sync. The count is kept for a one-time notice.
+   */
+  private resetUnverifiedFriendProfiles(): void {
+    const friendColumns = this.db.prepare('PRAGMA table_info(friends)').all() as Array<{ name: string }>;
+    if (!friendColumns.some((c) => c.name === 'needs_recrawl')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN needs_recrawl INTEGER NOT NULL DEFAULT 0');
+    }
+    const friends = this.db.prepare('SELECT id, site_url, key_status FROM friends').all() as Array<{
+      id: string;
+      site_url: string;
+      key_status: string;
+    }>;
+    const hasVerifiedProfileCopy = (siteUrl: string) =>
+      (
+        this.db.prepare("SELECT body FROM fetch_cache WHERE site_url = ? AND body != ''").all(siteUrl) as Array<{
+          body: string;
+        }>
+      ).some((row) => {
+        try {
+          const doc = JSON.parse(row.body) as { displayName?: unknown; siteUrl?: unknown };
+          return typeof doc.displayName === 'string' && normalizeSiteUrl(String(doc.siteUrl || '')) === siteUrl;
+        } catch {
+          return false;
+        }
+      });
+    const reset = this.db.prepare(
+      `UPDATE friends SET display_name = ?, bio = '', avatar_url = '', handle = '', did = ?, needs_recrawl = 1
+       WHERE id = ?`
+    );
+    let count = 0;
+    for (const friend of friends) {
+      if (friend.key_status === 'pinned' && hasVerifiedProfileCopy(friend.site_url)) continue;
+      let hostname = friend.site_url;
+      try {
+        hostname = new URL(friend.site_url).hostname;
+      } catch {
+        // keep the stored address as the name
+      }
+      reset.run(hostname, siteUrlToDidWeb(friend.site_url), friend.id);
+      count++;
+    }
+    if (count > 0) {
+      this.db
+        .prepare(
+          'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        )
+        .run(PROFILES_RESET_NOTICE_KEY, String(count));
+    }
+  }
+
+  /**
+   * The one-time notices left by upgrades, removed as they're read so each is shown once.
+   */
+  public takeUpgradeNotices(): string[] {
+    const row = this.db.prepare('SELECT value FROM local_settings WHERE key = ?').get(PROFILES_RESET_NOTICE_KEY) as
+      | { value: string }
+      | undefined;
+    if (!row) return [];
+    this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(PROFILES_RESET_NOTICE_KEY);
+    const n = Number(row.value) || 0;
+    return n > 0
+      ? [
+          `Studio reset ${n} friend profile${n === 1 ? '' : 's'} it couldn't verify. ` +
+            `${n === 1 ? 'It refreshes' : 'They refresh'} from ${n === 1 ? 'their' : 'their own'} verified site on the next sync.`,
+        ]
+      : [];
+  }
+
+  /** Clears the "re-crawl first" flag once a sync has verified a friend's profile again. */
+  public clearNeedsRecrawl(siteUrl: string): void {
+    this.db.prepare('UPDATE friends SET needs_recrawl = 0 WHERE site_url = ?').run(normalizeSiteUrl(siteUrl));
+  }
+
+  /** Friends flagged by an upgrade to be re-crawled before the others. */
+  public getNeedsRecrawlUrls(): Set<string> {
+    const rows = this.db.prepare('SELECT site_url FROM friends WHERE needs_recrawl = 1').all() as Array<{ site_url: string }>;
+    return new Set(rows.map((r) => r.site_url));
+  }
+
+  /**
+   * Migration 1. Feed and endorsement rows were unique per URL across all friends, and rows saved
+   * before phase 3 used a shorter id, so every later upsert of them hit the URL constraint and the
+   * friend's feed silently stopped updating. Rows are now unique per (friend, URL) and their ids
+   * are recomputed. When two old rows map to the same new key, the verified one is kept (the
+   * newest if both are verified).
+   */
+  private migrateFeedAndEndorsementKeys(): void {
+    const keepBetter = <T extends { verified_signature: number; created_at: string }>(a: T, b: T): T => {
+      if (Boolean(a.verified_signature) !== Boolean(b.verified_signature)) return a.verified_signature ? a : b;
+      return b.created_at >= a.created_at ? b : a;
+    };
+
+    this.db.exec(`
+      CREATE TABLE network_feed_v1 (
+        id TEXT PRIMARY KEY,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL,
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        friend_did TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        canonical_url TEXT NOT NULL,
+        target_url TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0,
+        album_url TEXT NOT NULL DEFAULT '',
+        photo_count INTEGER NOT NULL DEFAULT 0,
+        new_count INTEGER NOT NULL DEFAULT 0,
+        peek_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (friend_site_url, canonical_url)
+      );
+      CREATE TABLE endorsements_v1 (
+        id TEXT PRIMARY KEY,
+        target_canonical_url TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        author_avatar_url TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        source_item_url TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (author_site_url, source_item_url)
+      );
+    `);
+
+    type FeedRow = Record<string, unknown> & { verified_signature: number; created_at: string };
+    const feed = new Map<string, FeedRow>();
+    for (const row of this.db.prepare('SELECT * FROM network_feed').all() as FeedRow[]) {
+      const id = feedRowId(String(row.friend_site_url), String(row.canonical_url));
+      const existing = feed.get(id);
+      feed.set(id, existing ? keepBetter(existing, row) : row);
+    }
+    const insertFeed = this.db.prepare(`
+      INSERT INTO network_feed_v1 (
+        id, friend_site_url, friend_name, friend_avatar_url, friend_did, entry_type, title,
+        canonical_url, target_url, commentary, media_url, tags_json, created_at, verified_signature,
+        album_url, photo_count, new_count, peek_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [id, r] of feed) {
+      insertFeed.run(
+        id,
+        String(r.friend_site_url),
+        String(r.friend_name ?? ''),
+        String(r.friend_avatar_url ?? ''),
+        String(r.friend_did ?? ''),
+        String(r.entry_type),
+        String(r.title ?? ''),
+        String(r.canonical_url),
+        String(r.target_url ?? ''),
+        String(r.commentary ?? ''),
+        String(r.media_url ?? ''),
+        String(r.tags_json ?? '[]'),
+        String(r.created_at),
+        r.verified_signature ? 1 : 0,
+        String(r.album_url ?? ''),
+        Number(r.photo_count ?? 0),
+        Number(r.new_count ?? 0),
+        String(r.peek_json ?? '[]')
+      );
+    }
+
+    type EndorsementRow = Record<string, unknown> & { verified_signature: number; created_at: string };
+    const endorsements = new Map<string, EndorsementRow>();
+    for (const row of this.db.prepare('SELECT * FROM endorsements').all() as EndorsementRow[]) {
+      const id = endorsementRowId(String(row.author_site_url), String(row.source_item_url));
+      const existing = endorsements.get(id);
+      endorsements.set(id, existing ? keepBetter(existing, row) : row);
+    }
+    const insertEndorsement = this.db.prepare(`
+      INSERT INTO endorsements_v1 (
+        id, target_canonical_url, author_site_url, author_name, author_avatar_url,
+        type, commentary, source_item_url, created_at, verified_signature
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [id, r] of endorsements) {
+      insertEndorsement.run(
+        id,
+        String(r.target_canonical_url),
+        String(r.author_site_url),
+        String(r.author_name ?? ''),
+        String(r.author_avatar_url ?? ''),
+        String(r.type),
+        String(r.commentary ?? ''),
+        String(r.source_item_url),
+        String(r.created_at),
+        r.verified_signature ? 1 : 0
+      );
+    }
+
+    this.db.exec(`
+      DROP TABLE network_feed;
+      ALTER TABLE network_feed_v1 RENAME TO network_feed;
+      DROP TABLE endorsements;
+      ALTER TABLE endorsements_v1 RENAME TO endorsements;
+      CREATE INDEX IF NOT EXISTS idx_network_feed_friend ON network_feed(friend_site_url);
+      CREATE INDEX IF NOT EXISTS idx_network_feed_created ON network_feed(created_at);
+      CREATE INDEX IF NOT EXISTS idx_network_feed_album ON network_feed(album_url);
+      CREATE INDEX IF NOT EXISTS idx_endorsements_author ON endorsements(author_site_url);
+    `);
+
+    // Why a friend's last sync couldn't use one of their documents (local only, never exported)
+    const friendColumns = this.db.prepare('PRAGMA table_info(friends)').all() as Array<{ name: string }>;
+    if (!friendColumns.some((c) => c.name === 'last_sync_error')) {
+      this.db.exec("ALTER TABLE friends ADD COLUMN last_sync_error TEXT NOT NULL DEFAULT ''");
+    }
+    if (!friendColumns.some((c) => c.name === 'last_sync_error_at')) {
+      this.db.exec("ALTER TABLE friends ADD COLUMN last_sync_error_at TEXT NOT NULL DEFAULT ''");
+    }
   }
 
   /**
@@ -1435,7 +1853,14 @@ export class StudioDatabase {
     };
   }
 
-  public updateProfile(updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> }): ProfileDocument {
+  public updateProfile(
+    updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> },
+    options: { allowPlaintext?: boolean } = {}
+  ): ProfileDocument {
+    for (const field of SECRET_PUBLISH_FIELDS) {
+      const incoming = updates.publishSettings?.[field];
+      if (incoming !== STORED_SECRET_PLACEHOLDER) this.assertSecretCanBeStored(incoming, options);
+    }
     const current = this.getProfile();
     const siteUrl = updates.siteUrl ? normalizeSiteUrl(updates.siteUrl) : current.siteUrl;
     const now = new Date().toISOString();
@@ -2101,6 +2526,18 @@ export class StudioDatabase {
         : 'unverified') as FriendKeyStatus,
       lastCrawledAt: r.last_crawled_at ? String(r.last_crawled_at) : undefined,
       addedAt: String(r.added_at),
+      ...(r.last_sync_error
+        ? { lastSyncError: String(r.last_sync_error), lastSyncErrorAt: String(r.last_sync_error_at || '') }
+        : {}),
+      // Local only, for reviewing a changed key; the export copies its own list of fields
+      ...(r.pinned_public_key_pem ? { pinnedFingerprint: spkiFingerprint(String(r.pinned_public_key_pem)) } : {}),
+      ...(r.candidate_fingerprint
+        ? {
+            candidateFingerprint: String(r.candidate_fingerprint),
+            candidateFirstSeenAt: String(r.candidate_first_seen_at || ''),
+            candidateConflict: Boolean(r.candidate_conflict),
+          }
+        : {}),
     };
   }
 
@@ -2376,6 +2813,7 @@ export class StudioDatabase {
         this.db.prepare('DELETE FROM network_feed WHERE friend_site_url = ?').run(row.site_url);
         this.db.prepare('DELETE FROM endorsements WHERE author_site_url = ?').run(row.site_url);
         this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(row.site_url);
+        this.db.prepare('DELETE FROM friend_sync_notices WHERE site_url = ?').run(row.site_url);
       }
       this.db.prepare('DELETE FROM friends WHERE id = ?').run(friendId);
     });
@@ -2655,6 +3093,17 @@ export class StudioDatabase {
       .run(normalizeSiteUrl(siteUrl));
   }
 
+  /**
+   * Records why the last sync couldn't use one of a friend's documents (or clears it with '').
+   * Local only: shown as "Sync problem" in the friends list, never exported.
+   */
+  public setFriendSyncError(siteUrl: string, message: string): void {
+    const clean = message.replace(/\s+/g, ' ').trim().slice(0, 500);
+    this.db
+      .prepare('UPDATE friends SET last_sync_error = ?, last_sync_error_at = ? WHERE site_url = ?')
+      .run(clean, clean ? new Date().toISOString() : '', normalizeSiteUrl(siteUrl));
+  }
+
   /** Forgets cached validators (all, or one site's), so the next sync downloads everything. */
   public clearFetchCache(siteUrl?: string): void {
     if (siteUrl) this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalizeSiteUrl(siteUrl));
@@ -2698,9 +3147,9 @@ export class StudioDatabase {
   }
 
   /**
-   * The rings published in connections.json: rings this persona is a confirmed member of
-   * (plus pre-redesign 'legacy' rows), and hosted rings the maintainer belongs to, built from
-   * local tables so the maintainer never has to fetch their own hub.
+   * The rings published in connections.json: only joined rings with status 'member' whose ring
+   * file verified (hubVerified), and hosted rings the maintainer belongs to, built from local
+   * tables so the maintainer never has to fetch their own hub.
    */
   public getWebrings(): WebringMembership[] {
     const joined: WebringMembership[] = this.getJoinedRings()
@@ -2911,16 +3360,7 @@ export class StudioDatabase {
       return 'pinned';
     }
 
-    const spkiFp = (pem: string): string => {
-      try {
-        const der = crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' });
-        return crypto.createHash('sha256').update(der).digest('hex');
-      } catch {
-        return pem.trim();
-      }
-    };
-
-    if (spkiFp(priorPinnedPem) === spkiFp(publicKeyPem)) {
+    if (spkiFingerprint(priorPinnedPem) === spkiFingerprint(publicKeyPem)) {
       if (!existing) {
         this.db
           .prepare(
@@ -2978,80 +3418,85 @@ export class StudioDatabase {
   }
 
   /**
-   * Manually resets or replaces a friend's pinned Ed25519 key (for emergency key recovery when
-   * the friend lost their previous private key and could not sign a KeyRotationCertificate).
-   * If `newPublicKeyPem` is omitted, clears the pinned key so the next sync pins their live key.
+   * Records the key a friend's site now presents when it doesn't match the pinned one and no
+   * signed rotation explains it (the "candidate"). The first candidate is kept: seeing it again
+   * changes nothing, and a different key sets `candidate_conflict` without replacing it, so the key
+   * the user reviews can't be swapped underneath them.
    */
-  public getCandidateSiteKey(siteUrl: string): string | null {
-    const normalized = normalizeSiteUrl(siteUrl);
-    const row = this.db
-      .prepare('SELECT value FROM local_settings WHERE key = ?')
-      .get(`candidate_key:${normalized}`) as { value: string } | undefined;
-    return row?.value || null;
+  public recordFriendCandidateKey(friendUrl: string, publicKeyPem: string): void {
+    const siteUrl = normalizeSiteUrl(friendUrl);
+    const pem = publicKeyPem.trim();
+    if (!pem) return;
+    const fingerprint = spkiFingerprint(pem);
+    const row = this.db.prepare('SELECT candidate_fingerprint FROM friends WHERE site_url = ?').get(siteUrl) as
+      | { candidate_fingerprint: string }
+      | undefined;
+    if (!row) return;
+    if (!row.candidate_fingerprint) {
+      this.db
+        .prepare(
+          `UPDATE friends SET candidate_key_pem = ?, candidate_fingerprint = ?, candidate_first_seen_at = ?, candidate_conflict = 0
+           WHERE site_url = ?`
+        )
+        .run(pem, fingerprint, new Date().toISOString(), siteUrl);
+    } else if (row.candidate_fingerprint !== fingerprint) {
+      this.db.prepare('UPDATE friends SET candidate_conflict = 1 WHERE site_url = ?').run(siteUrl);
+    }
   }
 
-  public setCandidateSiteKey(siteUrl: string, publicKeyPem: string): void {
-    const normalized = normalizeSiteUrl(siteUrl);
+  /** Forgets a recorded candidate key, once the friend's site presents its pinned key again. */
+  public clearFriendCandidateKey(friendUrl: string): void {
     this.db
       .prepare(
-        'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        `UPDATE friends SET candidate_key_pem = '', candidate_fingerprint = '', candidate_first_seen_at = '', candidate_conflict = 0
+         WHERE site_url = ? AND candidate_fingerprint != ''`
       )
-      .run(`candidate_key:${normalized}`, publicKeyPem.trim());
+      .run(normalizeSiteUrl(friendUrl));
   }
 
-  public clearCandidateSiteKey(siteUrl: string): void {
-    const normalized = normalizeSiteUrl(siteUrl);
-    this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(`candidate_key:${normalized}`);
-  }
-
-  public trustNewFriendKey(friendId: string, newPublicKeyPem?: string): FriendConnection {
+  /**
+   * Pins the candidate key a friend's site presented, after the user reviewed it. Emergency
+   * recovery for a friend who lost their key and couldn't sign a rotation certificate.
+   * `expectedFingerprint` is the fingerprint the user was shown: it must match the stored
+   * candidate, so a key that changed after the review is never trusted. With no candidate (for
+   * example a friend flagged before this upgrade), trust is refused until a sync records one.
+   */
+  public trustNewFriendKey(friendId: string, expectedFingerprint: string): FriendConnection {
     const current = this.getFriendById(friendId);
-    if (!current) {
-      throw new Error(`Friend "${friendId}" not found.`);
+    if (!current) throw new Error(`Friend "${friendId}" not found.`);
+    if (typeof expectedFingerprint !== 'string' || !expectedFingerprint.trim()) {
+      throw new Error('Trusting a new key needs the fingerprint you reviewed.');
     }
     const normalized = normalizeSiteUrl(current.siteUrl);
-    const storedCandidate = this.getCandidateSiteKey(normalized);
-    const cleanKey = (newPublicKeyPem?.trim() || storedCandidate || '').trim();
-    if (storedCandidate && newPublicKeyPem?.trim()) {
-      const fp = (pem: string) => {
-        try {
-          return crypto
-            .createHash('sha256')
-            .update(crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' }))
-            .digest('hex');
-        } catch {
-          return pem.trim();
-        }
-      };
-      if (fp(storedCandidate) !== fp(newPublicKeyPem)) {
-        throw new Error('The key being trusted does not match the candidate key detected for this friend.');
-      }
+    const row = this.db
+      .prepare('SELECT candidate_key_pem, candidate_fingerprint FROM friends WHERE id = ?')
+      .get(friendId) as { candidate_key_pem: string; candidate_fingerprint: string } | undefined;
+    if (!row?.candidate_key_pem || !row.candidate_fingerprint) {
+      throw new Error(
+        `Studio hasn't recorded a new key for ${current.displayName} yet. Re-check their site, then review the key it shows.`
+      );
     }
+    if (normalizeFingerprint(expectedFingerprint) !== row.candidate_fingerprint) {
+      throw new Error("That fingerprint doesn't match the candidate key detected for this friend, so it wasn't trusted.");
+    }
+    const pem = row.candidate_key_pem;
     this.transaction(() => {
-      this.clearCandidateSiteKey(normalized);
       this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalized);
-      if (cleanKey) {
-        const did = current.did || siteUrlToDidWeb(normalized);
-        this.db
-          .prepare(
-            `INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
-             VALUES (?, ?, ?, 'pinned', ?)
-             ON CONFLICT(site_url) DO UPDATE SET did = excluded.did, public_key_pem = excluded.public_key_pem, key_status = 'pinned'`
-          )
-          .run(normalized, did, cleanKey, new Date().toISOString());
-        this.db
-          .prepare(
-            "UPDATE friends SET pinned_public_key_pem = ?, key_status = 'pinned', sync_failures = 0, retry_after = NULL WHERE id = ?"
-          )
-          .run(cleanKey, friendId);
-      } else {
-        this.db.prepare('DELETE FROM site_keys WHERE site_url = ?').run(normalized);
-        this.db
-          .prepare(
-            "UPDATE friends SET pinned_public_key_pem = '', key_status = 'unverified', sync_failures = 0, retry_after = NULL WHERE id = ?"
-          )
-          .run(friendId);
-      }
+      const did = current.did || siteUrlToDidWeb(normalized);
+      this.db
+        .prepare(
+          `INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
+           VALUES (?, ?, ?, 'pinned', ?)
+           ON CONFLICT(site_url) DO UPDATE SET did = excluded.did, public_key_pem = excluded.public_key_pem, key_status = 'pinned'`
+        )
+        .run(normalized, did, pem, new Date().toISOString());
+      this.db
+        .prepare(
+          `UPDATE friends SET pinned_public_key_pem = ?, key_status = 'pinned', sync_failures = 0, retry_after = NULL,
+             candidate_key_pem = '', candidate_fingerprint = '', candidate_first_seen_at = '', candidate_conflict = 0
+           WHERE id = ?`
+        )
+        .run(pem, friendId);
     });
     return this.getFriendById(friendId)!;
   }
@@ -3059,29 +3504,47 @@ export class StudioDatabase {
   // ---------------------------------------------------------------------------
   // Per-persona outbound proxy settings (local only, never exported)
 
-  public getProxySettings(): { enabled: boolean; proxyUrl: string } {
+  /**
+   * The persona's outbound proxy. `unavailable` means a proxy is saved but can't be unlocked on this
+   * device (sealed with a keychain that isn't available): callers must not connect at all
+   * (proxyAgent.requireUsableProxy), rather than silently going direct.
+   */
+  public getProxySettings(): { enabled: boolean; proxyUrl: string; unavailable?: boolean } {
     const row = this.db
       .prepare("SELECT value FROM local_settings WHERE key = 'proxySettingsJson'")
       .get() as { value: string } | undefined;
     if (!row?.value) return { enabled: false, proxyUrl: '' };
+    let parsed: { enabled?: unknown; proxyUrl?: unknown };
     try {
-      const parsed = JSON.parse(row.value) as { enabled?: unknown; proxyUrl?: unknown };
-      const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
-      const unsealed = raw ? openSecret(raw, this.keyCipher).trim() : '';
-      return {
-        enabled: Boolean(parsed.enabled && unsealed),
-        proxyUrl: unsealed,
-      };
+      parsed = JSON.parse(row.value);
     } catch {
       return { enabled: false, proxyUrl: '' };
     }
+    const raw = typeof parsed.proxyUrl === 'string' ? parsed.proxyUrl.trim() : '';
+    if (!raw) return { enabled: false, proxyUrl: '' };
+    let unsealed: string;
+    try {
+      unsealed = openSecret(raw, this.keyCipher).trim();
+    } catch {
+      return { enabled: true, proxyUrl: '', unavailable: true };
+    }
+    return {
+      enabled: Boolean(parsed.enabled && unsealed),
+      proxyUrl: unsealed,
+    };
   }
 
-  public setProxySettings(input: { enabled?: boolean; proxyUrl?: string }): {
+  public setProxySettings(
+    input: { enabled?: boolean; proxyUrl?: string },
+    options: { allowPlaintext?: boolean } = {}
+  ): {
     enabled: boolean;
     proxyUrl: string;
   } {
     const current = this.getProxySettings();
+    if (current.unavailable && input.proxyUrl === undefined) {
+      throw new Error("The saved proxy can't be unlocked on this device. Re-enter it to continue.");
+    }
     const nextUrl = input.proxyUrl !== undefined ? input.proxyUrl.trim() : current.proxyUrl;
     if (nextUrl) {
       let parsed: URL;
@@ -3103,6 +3566,15 @@ export class StudioDatabase {
         throw new Error('Proxy URL must include a valid hostname and port (e.g. socks5h://127.0.0.1:9050).');
       }
     }
+    // A proxy login is a secret: without the keychain it's stored only with the user's consent
+    let hasCredentials = false;
+    try {
+      const parsedUrl = nextUrl ? new URL(nextUrl) : null;
+      hasCredentials = Boolean(parsedUrl && (parsedUrl.username || parsedUrl.password));
+    } catch {
+      hasCredentials = false;
+    }
+    if (hasCredentials) this.assertSecretCanBeStored(nextUrl, options);
     const nextEnabled =
       input.enabled !== undefined ? Boolean(input.enabled && nextUrl) : Boolean(current.enabled && nextUrl);
     const storedUrl = nextUrl ? sealSecret(nextUrl, this.keyCipher) : '';
@@ -3123,7 +3595,8 @@ export class StudioDatabase {
    * If `record` is true and the check passes, saves the new timestamp.
    */
   public checkDocumentFreshness(docUrl: string, updatedAt?: string, record = false): boolean {
-    if (!updatedAt) return true;
+    // A document with no date can't be shown to be newer than the last verified copy
+    if (!updatedAt) return false;
     const nextTs = Date.parse(updatedAt);
     if (!Number.isFinite(nextTs)) return false;
     const key = `doc_updated_at:${docUrl}`;
@@ -3144,6 +3617,70 @@ export class StudioDatabase {
         .run(key, updatedAt);
     }
     return true;
+  }
+
+  /** The `updatedAt` of the newest verified copy of a document, as recorded by checkDocumentFreshness. */
+  public getDocumentFreshnessMark(docUrl: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM local_settings WHERE key = ?').get(`doc_updated_at:${docUrl}`) as
+      | { value: string }
+      | undefined;
+    return row?.value || undefined;
+  }
+
+  /**
+   * Records that a friend served an older copy of a document than one already verified, so Studio
+   * kept the newer one. One notice per friend and document; a new rollback brings a dismissed one back.
+   */
+  public addFriendSyncNotice(
+    siteUrl: string,
+    kind: FriendSyncNoticeKind,
+    details: { doc: string; servedUpdatedAt: string; lastVerifiedUpdatedAt: string }
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO friend_sync_notices (site_url, kind, doc, served_updated_at, last_verified_updated_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(site_url, kind, doc) DO UPDATE SET
+           served_updated_at = excluded.served_updated_at,
+           last_verified_updated_at = excluded.last_verified_updated_at,
+           created_at = excluded.created_at,
+           dismissed_at = NULL`
+      )
+      .run(
+        normalizeSiteUrl(siteUrl),
+        kind,
+        details.doc,
+        details.servedUpdatedAt.slice(0, 40),
+        details.lastVerifiedUpdatedAt.slice(0, 40),
+        new Date().toISOString()
+      );
+  }
+
+  /** Undismissed sync notices, newest first, with the friend's current name. */
+  public getFriendSyncNotices(): FriendSyncNotice[] {
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, f.display_name AS friend_name FROM friend_sync_notices n
+         JOIN friends f ON f.site_url = n.site_url
+         WHERE n.dismissed_at IS NULL
+         ORDER BY n.created_at DESC`
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      siteUrl: String(r.site_url),
+      friendName: String(r.friend_name || r.site_url),
+      kind: 'rollback_blocked',
+      doc: String(r.doc),
+      servedUpdatedAt: String(r.served_updated_at || ''),
+      lastVerifiedUpdatedAt: String(r.last_verified_updated_at || ''),
+      createdAt: String(r.created_at),
+    }));
+  }
+
+  public dismissFriendSyncNotice(siteUrl: string, kind: FriendSyncNoticeKind, doc: string): void {
+    this.db
+      .prepare('UPDATE friend_sync_notices SET dismissed_at = ? WHERE site_url = ? AND kind = ? AND doc = ?')
+      .run(new Date().toISOString(), normalizeSiteUrl(siteUrl), kind, doc);
   }
 
   public getSftpHostKeyFingerprint(host: string, port: number): string | null {
@@ -3676,34 +4213,26 @@ export class StudioDatabase {
   }
 
   public upsertEndorsement(input: Omit<EndorsementItem, 'id'>): void {
-    const id = `end-${crypto
-      .createHash('sha256')
-      .update(`${input.authorSiteUrl}\0${input.sourceItemUrl}`)
-      .digest('hex')}`;
-    const existing = this.db
-      .prepare('SELECT author_site_url, verified_signature FROM endorsements WHERE id = ? OR source_item_url = ?')
-      .get(id, input.sourceItemUrl) as { author_site_url: string; verified_signature: number } | undefined;
-    if (existing) {
-      if (existing.author_site_url !== input.authorSiteUrl) return;
-      if (existing.verified_signature && !input.verifiedSignature) return;
-    }
+    // Rows are scoped per author, so another site can't take over this one. An unverified copy
+    // never replaces a verified row.
     this.db
       .prepare(
         `INSERT INTO endorsements (
           id, target_canonical_url, author_site_url, author_name, author_avatar_url,
           type, commentary, source_item_url, created_at, verified_signature
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        ON CONFLICT(author_site_url, source_item_url) DO UPDATE SET
           target_canonical_url = excluded.target_canonical_url,
           author_name = excluded.author_name,
           author_avatar_url = excluded.author_avatar_url,
           type = excluded.type,
           commentary = excluded.commentary,
           created_at = excluded.created_at,
-          verified_signature = excluded.verified_signature`
+          verified_signature = excluded.verified_signature
+        WHERE excluded.verified_signature = 1 OR endorsements.verified_signature = 0`
       )
       .run(
-        id,
+        endorsementRowId(input.authorSiteUrl, input.sourceItemUrl),
         input.targetCanonicalUrl,
         input.authorSiteUrl,
         input.authorName,
@@ -3944,17 +4473,9 @@ export class StudioDatabase {
   }
 
   public upsertNetworkFeedEntry(entry: Omit<NetworkFeedEntry, 'id'>): void {
-    const id = `feed-${crypto
-      .createHash('sha256')
-      .update(`${entry.friendSiteUrl}\0${entry.canonicalUrl}`)
-      .digest('hex')}`;
-    const existing = this.db
-      .prepare('SELECT friend_site_url, verified_signature FROM network_feed WHERE id = ? OR canonical_url = ?')
-      .get(id, entry.canonicalUrl) as { friend_site_url: string; verified_signature: number } | undefined;
-    if (existing) {
-      if (existing.friend_site_url !== entry.friendSiteUrl) return;
-      if (existing.verified_signature && !entry.verifiedSignature) return;
-    }
+    // Rows are scoped per friend: two friends publishing the same URL get a row each. An
+    // unverified copy never replaces a verified row.
+    const id = feedRowId(entry.friendSiteUrl, entry.canonicalUrl);
     this.db
       .prepare(
         `INSERT INTO network_feed (
@@ -3963,7 +4484,7 @@ export class StudioDatabase {
           media_url, tags_json, created_at, verified_signature,
           album_url, photo_count, new_count, peek_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        ON CONFLICT(friend_site_url, canonical_url) DO UPDATE SET
           friend_name = excluded.friend_name,
           friend_avatar_url = excluded.friend_avatar_url,
           friend_did = excluded.friend_did,
@@ -3978,7 +4499,8 @@ export class StudioDatabase {
           album_url = excluded.album_url,
           photo_count = excluded.photo_count,
           new_count = excluded.new_count,
-          peek_json = excluded.peek_json`
+          peek_json = excluded.peek_json
+        WHERE excluded.verified_signature = 1 OR network_feed.verified_signature = 0`
       )
       .run(
         id,

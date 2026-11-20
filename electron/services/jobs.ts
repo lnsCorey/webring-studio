@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { requireUsableProxy } from '../security/proxyAgent';
 import * as path from 'path';
 import { ActivePersonaContext } from './personaManager';
 import { PublishResult } from './publisher';
@@ -20,6 +21,9 @@ export interface SyncAllResult {
 }
 
 export async function runSyncAll(ctx: ActivePersonaContext): Promise<SyncAllResult> {
+  // A proxy that can't be unlocked stops the whole run with one ProxyUnavailableError, before
+  // any friend, ring or hub is contacted
+  requireUsableProxy(ctx.db.getProxySettings());
   const friends = await ctx.ringCrawler.crawlAllFriends();
   const joined = await ctx.ringService.syncJoinedRings();
   const hosted = await ctx.ringService.syncHostedRings();
@@ -42,11 +46,15 @@ export async function notifyWebringHubs(ctx: ActivePersonaContext): Promise<Webr
 export function summarizeSync(result: SyncAllResult): JobResult {
   const failedFriends = result.friends.filter((r) => !r.success && !r.blocked && !r.deferred).length;
   const deferredFriends = result.friends.filter((r) => r.deferred).length;
+  const friendsWithProblems = result.friends.filter((r) => r.success && r.documentErrors?.length).length;
   const ringErrors = result.rings.joined.filter((r) => r.outcome === 'error').length;
   const parts = [`${result.friends.filter((r) => r.success).length}/${result.friends.length} friends synced`];
   if (result.rings.joined.length) parts.push(`${result.rings.joined.length} joined ring(s) checked`);
   const leavers = result.rings.hosted.reduce((acc, r) => acc + r.autoRemoved.length, 0);
   if (leavers) parts.push(`${leavers} member(s) left your rings`);
+  if (friendsWithProblems) parts.push(`${friendsWithProblems} with sync problems`);
+  const rollbacks = result.friends.reduce((acc, r) => acc + (r.rollbacksBlocked || 0), 0);
+  if (rollbacks) parts.push(`${rollbacks} rollback(s) blocked`);
   if (failedFriends) parts.push(`${failedFriends} friend site(s) unreachable`);
   if (deferredFriends) parts.push(`${deferredFriends} unreachable lately (skipped for now)`);
   if (ringErrors) parts.push(`${ringErrors} ring(s) couldn't be checked`);

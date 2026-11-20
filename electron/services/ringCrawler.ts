@@ -28,7 +28,7 @@ import {
   PrivateNetworkAddressError,
   privatePeersAllowed,
 } from '../security/networkGuard';
-import { createProxyAgent } from '../security/proxyAgent';
+import { createProxyAgent, requireUsableProxy } from '../security/proxyAgent';
 
 export interface CrawlSiteResult {
   siteUrl: string;
@@ -52,6 +52,20 @@ export interface CrawlSiteResult {
   /** After a failed sync: when Sync All will try this friend again. */
   retryAfter?: string;
   error?: string;
+  /**
+   * Documents the crawl couldn't use (a parse error, a rejected write, an HTTP error other than
+   * 404). The crawl itself still succeeded. Missing or unchanged documents aren't listed.
+   */
+  documentErrors?: Array<{ doc: string; message: string }>;
+  /** Documents refused because they were older than the newest copy already verified. */
+  rollbacksBlocked?: number;
+}
+
+/** A document that's absent (404, or no such file in a local folder) is normal, not a sync problem. */
+function isMissingDocument(err: unknown): boolean {
+  if (err instanceof UnchangedDocument) return true;
+  if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return true;
+  return err instanceof Error && /^HTTP 404 /.test(err.message);
 }
 
 export type JsonFetcher = (url: string) => Promise<unknown>;
@@ -158,7 +172,11 @@ export async function defaultJsonFetcher(urlOrPath: string, proxyUrl?: string): 
     const raw = fs.readFileSync(filePath, 'utf8');
     return JSON.parse(raw);
   }
-  if (!/^https?:\/\//i.test(urlOrPath) && fs.existsSync(urlOrPath)) {
+  if (!/^https?:\/\//i.test(urlOrPath)) {
+    // A local folder (offline ring folders, tests): a missing file is "not found", like a 404
+    if (!fs.existsSync(urlOrPath)) {
+      throw Object.assign(new Error(`No such file: ${urlOrPath}`), { code: 'ENOENT' });
+    }
     const stat = fs.statSync(urlOrPath);
     if (stat.size > MAX_JSON_BYTES) {
       throw new Error(`File exceeds 5MB limit: ${urlOrPath}`);
@@ -399,10 +417,7 @@ export class RingCrawler {
       conditionalFetcher ||
       (customFetcher
         ? async (url: string) => ({ json: await customFetcher(url) })
-        : createConditionalJsonFetcher(() => {
-            const proxy = this.db.getProxySettings();
-            return proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined;
-          }));
+        : createConditionalJsonFetcher(() => requireUsableProxy(this.db.getProxySettings())));
   }
 
   /**
@@ -411,7 +426,28 @@ export class RingCrawler {
    * on EVERY document, enforces TOFU public key pinning, populates the local `network_feed`,
    * and discovers any likes/shares/comments of OUR items (`endorsements`).
    */
+  /** Throws ProxyUnavailableError when the saved proxy can't be unlocked, so nothing may connect. */
+  public assertCanSync(): void {
+    requireUsableProxy(this.db.getProxySettings());
+  }
+
   public async crawlFriendSite(friendSiteUrl: string, localDirOverride?: string): Promise<CrawlSiteResult> {
+    // A proxy that can't be unlocked stops the crawl before anything connects
+    try {
+      requireUsableProxy(this.db.getProxySettings());
+    } catch (err) {
+      return {
+        siteUrl: normalizeSiteUrl(friendSiteUrl),
+        success: false,
+        itemsIndexed: 0,
+        photosIndexed: 0,
+        endorsementsFound: 0,
+        entriesRejected: 0,
+        entriesPruned: 0,
+        verifiedSignature: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
     return this.crawlAndTrack(friendSiteUrl, localDirOverride, true);
   }
 
@@ -476,6 +512,12 @@ export class RingCrawler {
     };
 
     const unchanged: string[] = [];
+    const documentErrors: Array<{ doc: string; message: string }> = [];
+    const noteDocumentError = (doc: string, err: unknown) => {
+      if (isMissingDocument(err)) return;
+      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim().slice(0, 300);
+      documentErrors.push({ doc, message });
+    };
     // The manifest, did.json and profile are small and needed in full every time, so when the
     // manifest lists the same fingerprint as the copy saved when they last verified (no request),
     // or the host answers 304, that copy is used and checked again as if just downloaded.
@@ -545,7 +587,7 @@ export class RingCrawler {
       if (fetchedPublicKeyPem) {
         if (pinStatus === 'changed') {
           // Domain key changed unexpectedly without a valid KeyRotationCertificate!
-          this.db.setCandidateSiteKey(normalizedFriendUrl, fetchedPublicKeyPem);
+          this.db.recordFriendCandidateKey(normalizedFriendUrl, fetchedPublicKeyPem);
           keyChangedWarning = true;
           keyStatus = 'changed';
           pinnedKeyToSave = existingPinnedKey;
@@ -554,6 +596,8 @@ export class RingCrawler {
           keyStatus = 'pinned';
           pinnedKeyToSave = fetchedPublicKeyPem;
           effectiveVerifyKeyPem = fetchedPublicKeyPem;
+          // Back on its pinned key (or a signed rotation): any candidate seen before is moot
+          this.db.clearFriendCandidateKey(normalizedFriendUrl);
         }
       }
 
@@ -580,12 +624,28 @@ export class RingCrawler {
             )
           : false;
 
+      // The newest verified date of each document, read before this crawl records any newer one
+      const lastVerified = (url: string) => this.db.getDocumentFreshnessMark(url) || '';
+      const manifestMark = lastVerified(manifestFetch.url);
+      const profileMark = lastVerified(profileFetch.url);
       const isManifestFresh = isManifestVerified
         ? this.db.checkDocumentFreshness(manifestFetch.url, manifest.updatedAt, true)
         : false;
       const isProfileFresh = isProfileVerified
         ? this.db.checkDocumentFreshness(profileFetch.url, profile.updatedAt, true)
         : false;
+      // Rollback protection: nothing is deleted unless the manifest itself is verified and current
+      const manifestCurrent = Boolean(isManifestVerified) && isManifestFresh;
+      let rollbacksBlocked = 0;
+      // A validly signed copy older than one already verified is a replay: refused, and the user told
+      const blockRollback = (doc: string, servedUpdatedAt: string | undefined, mark: string) => {
+        rollbacksBlocked++;
+        this.db.addFriendSyncNotice(normalizedFriendUrl, 'rollback_blocked', {
+          doc,
+          servedUpdatedAt: servedUpdatedAt || '',
+          lastVerifiedUpdatedAt: mark,
+        });
+      };
 
       // Update friend profile metadata only when both manifest and profile verify and are not rolled back.
       // On key change, rollback, or unverified fetch, update only keyStatus and lastCrawledAt.
@@ -602,6 +662,7 @@ export class RingCrawler {
           keyStatus,
           lastCrawledAt: crawledAt,
         });
+        this.db.clearNeedsRecrawl(normalizedFriendUrl);
       } else if (existingFriend) {
         this.db.updateFriendVerificationState(normalizedFriendUrl, {
           keyStatus,
@@ -618,8 +679,12 @@ export class RingCrawler {
         });
       }
 
-      // Save copies only of documents that verified; otherwise forget them so they're downloaded next time
-      const keepCopies = isManifestVerified && isProfileVerified;
+      if (isManifestVerified && !isManifestFresh) blockRollback('manifest.json', manifest.updatedAt, manifestMark);
+      if (isProfileVerified && !isProfileFresh) blockRollback('profile.json', profile.updatedAt, profileMark);
+
+      // Save copies only of documents that verified and are current; otherwise forget them so
+      // they're downloaded next time
+      const keepCopies = manifestCurrent && Boolean(isProfileVerified) && isProfileFresh;
       for (const doc of [manifestFetch, profileFetch, ...(didFetch && fetchedPublicKeyPem ? [didFetch] : [])]) {
         if (!doc.remote) continue;
         if (keepCopies) {
@@ -678,6 +743,34 @@ export class RingCrawler {
           documentFingerprint(doc.json as Record<string, unknown>)
         );
       };
+      /**
+       * Whether a fetched document may be used at all. Refused when the verified manifest lists a
+       * different fingerprint for it (reported as a sync problem), or when it's older than the
+       * newest copy already verified (a rollback; if validly signed, the user gets a notice).
+       */
+      const admitDocument = (
+        doc: string,
+        key: ManifestDocumentKey,
+        url: string,
+        raw: unknown,
+        updatedAt: string | undefined,
+        signatureValid: boolean
+      ): boolean => {
+        const listed = isManifestVerified ? listedFingerprint(key) : undefined;
+        if (listed && documentFingerprint(raw as Record<string, unknown>) !== listed) {
+          noteDocumentError(doc, new Error("doesn't match the fingerprint in their signed manifest, so it wasn't used"));
+          return false;
+        }
+        if (!this.db.checkDocumentFreshness(url, updatedAt, false)) {
+          if (signatureValid) blockRollback(doc, updatedAt, lastVerified(url));
+          return false;
+        }
+        return true;
+      };
+      // After a verified, current document has been applied, later copies must be at least this new
+      const recordVerifiedDate = (url: string, updatedAt: string) => {
+        this.db.checkDocumentFreshness(url, updatedAt, true);
+      };
 
       // Crawl albums.json and independently verify its Ed25519 signature
       try {
@@ -693,7 +786,12 @@ export class RingCrawler {
               )
             : false;
 
-        const photoVerified = isManifestVerified && isProfileVerified && isAlbumsVerified;
+        if (!admitDocument('albums.json', 'albums', albumsFetch.url, rawAlbums, albumsDoc.updatedAt, Boolean(isAlbumsVerified))) {
+          isAlbumsVerified = false;
+          throw new UnchangedDocument();
+        }
+
+        const photoVerified = Boolean(isManifestVerified && isProfileVerified && isAlbumsVerified);
         const seenPhotoUrls: string[] = [];
 
         const absoluteUrl = (url: string) =>
@@ -779,13 +877,16 @@ export class RingCrawler {
           }
         });
 
-        // Only a verified document may delete rows, so a hijacked or tampered site can't wipe the feed
-        if (photoVerified) {
+        // Only a verified, current document under a verified, current manifest may delete rows, so a
+        // hijacked or tampered site (or an old copy replayed) can't wipe the feed
+        if (photoVerified && manifestCurrent) {
           entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'photos', seenPhotoUrls);
           rememberValidators(albumsFetch);
+          recordVerifiedDate(albumsFetch.url, albumsDoc.updatedAt);
         }
-      } catch {
-        // Continue if albums.json is missing or unchanged
+      } catch (err) {
+        // Missing or unchanged is normal; anything else is reported, and the rest of the crawl goes on
+        noteDocumentError('albums.json', err);
       }
 
       // Crawl items.json (posts, shares, likes, recommendations, comments) and independently verify its Ed25519 signature
@@ -802,7 +903,12 @@ export class RingCrawler {
               )
             : false;
 
-        const itemVerified = isManifestVerified && isProfileVerified && isItemsVerified;
+        if (!admitDocument('items.json', 'items', itemsFetch.url, rawItems, itemsDoc.updatedAt, Boolean(isItemsVerified))) {
+          isItemsVerified = false;
+          throw new UnchangedDocument();
+        }
+
+        const itemVerified = Boolean(isManifestVerified && isProfileVerified && isItemsVerified);
         const seenItemUrls: string[] = [];
 
         this.db.transaction(() => {
@@ -830,7 +936,8 @@ export class RingCrawler {
             itemsIndexed++;
 
             // Check if this friend liked/shared/recommended/commented on an item or photo belonging to OUR site!
-            if (item.targetUrl.startsWith(mySiteUrl)) {
+            // Same origin and under our site's path: a prefix match would also take https://me.com.evil.net
+            if (isUrlWithinSite(item.targetUrl, mySiteUrl)) {
               this.db.upsertEndorsement({
                 targetCanonicalUrl: item.targetUrl,
                 authorSiteUrl: normalizedFriendUrl,
@@ -847,15 +954,16 @@ export class RingCrawler {
           }
         });
 
-        if (itemVerified) {
+        if (itemVerified && manifestCurrent) {
           // A friend who publishes only recent items has archived the older ones, not deleted them
           const since = itemsDoc.archive?.since;
           entriesPruned += this.db.pruneFriendFeed(normalizedFriendUrl, 'items', seenItemUrls, since);
           entriesPruned += this.db.pruneEndorsementsFrom(normalizedFriendUrl, seenItemUrls, since);
           rememberValidators(itemsFetch);
+          recordVerifiedDate(itemsFetch.url, itemsDoc.updatedAt);
         }
-      } catch {
-        // Continue if items.json is missing or unchanged
+      } catch (err) {
+        noteDocumentError('items.json', err);
       }
 
       // connections.json: does this friend list us back ("Mutual")? Only a verified copy that
@@ -875,16 +983,29 @@ export class RingCrawler {
           ) &&
           normalizeSiteUrl(connections.siteUrl) === normalizedFriendUrl &&
           connections.did === manifest.did;
-        if (connectionsVerified) {
+        if (
+          !admitDocument('connections.json', 'connections', connectionsFetch.url, rawConnections, connections.updatedAt, connectionsVerified)
+        ) {
+          throw new UnchangedDocument();
+        }
+        if (connectionsVerified && manifestCurrent) {
           this.db.setFriendListsMe(
             normalizedFriendUrl,
             connections.friends.some((f) => normalizeSiteUrl(f.siteUrl) === mySiteUrl)
           );
           rememberValidators(connectionsFetch);
+          recordVerifiedDate(connectionsFetch.url, connections.updatedAt);
         }
-      } catch {
+      } catch (err) {
         // Optional: missing, unchanged or unverifiable leaves "Mutual" as it was
+        noteDocumentError('connections.json', err);
       }
+
+      // Shown as "Sync problem" in the friends list until a sync uses every document again
+      this.db.setFriendSyncError(
+        normalizedFriendUrl,
+        documentErrors.map((e) => `${e.doc}: ${e.message}`).join(' · ')
+      );
 
       // Sync All does this once at the end instead of once per friend
       if (applyFeedWindow) entriesPruned += this.db.pruneFeedOutsideWindow();
@@ -908,6 +1029,8 @@ export class RingCrawler {
         verifiedSignature: allVerified,
         keyChangedWarning,
         ...(unchanged.length ? { unchanged } : {}),
+        ...(documentErrors.length ? { documentErrors } : {}),
+        ...(rollbacksBlocked ? { rollbacksBlocked } : {}),
       };
     } catch (err: unknown) {
       return {
@@ -927,20 +1050,28 @@ export class RingCrawler {
   /**
    * Crawls all friends in the user's friend ring, `concurrency` sites at a time, so slow or
    * unreachable sites don't hold up the rest. Results are in the same order as the friends.
+   * Friends an upgrade flagged for a re-crawl (their unverified profile was reset) are crawled first.
    */
   public async crawlAllFriends(
     options: { concurrency?: number; onProgress?: (progress: SyncProgress) => void } = {}
   ): Promise<CrawlSiteResult[]> {
+    // A proxy that can't be unlocked stops the whole run once, before any friend is contacted
+    requireUsableProxy(this.db.getProxySettings());
     const concurrency = options.concurrency ?? SYNC_CONCURRENCY;
     const friends = this.db.getFriends();
+    const recrawlFirst = this.db.getNeedsRecrawlUrls();
+    // Indexes into `friends`, flagged ones first; results still go back in the friends' order
+    const order = friends
+      .map((_, index) => index)
+      .sort((a, b) => Number(recrawlFirst.has(friends[b].siteUrl)) - Number(recrawlFirst.has(friends[a].siteUrl)) || a - b);
     // Friends that recent syncs couldn't reach wait out their backoff (a single-friend sync still tries)
     const retryTimes = this.db.getSyncRetryTimes();
     const results: CrawlSiteResult[] = new Array(friends.length);
     let next = 0;
     let done = 0;
     const worker = async () => {
-      while (next < friends.length) {
-        const index = next++;
+      while (next < order.length) {
+        const index = order[next++];
         const siteUrl = normalizeSiteUrl(friends[index].siteUrl);
         const retryAfter = retryTimes.get(siteUrl);
         results[index] = retryAfter

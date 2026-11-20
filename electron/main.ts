@@ -24,6 +24,7 @@ import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
 import { DEMO_PEER_FOLDER_NAME } from './db/legacyDemoContent';
+import { spkiFingerprint } from './db/database';
 import { isRingMemberFlagged } from './services/ringService';
 import {
   describePreset,
@@ -37,7 +38,8 @@ import {
 } from './services/scheduler';
 import { notifyWebringHubs, publishTo, runScheduledPublish, runSyncAll, summarizeSync } from './services/jobs';
 import { AutoPublisher } from './services/autoPublisher';
-import { parseProxyUrl } from './security/proxyAgent';
+import { parseProxyUrl, ProxyUnavailableError } from './security/proxyAgent';
+import { onKeyVaultFallback } from './security/keyVault';
 import { GitHubDeviceLogin } from './services/githubAuth';
 import {
   checkLiveSite,
@@ -84,12 +86,47 @@ let isQuitting = false;
 let startupComplete = false;
 let windowProxyPlan: WindowProxyPlan | null = null;
 
+/** What the security banner shows for the active persona (studio:get-security-status). */
+interface SecurityStatus {
+  keyVaultAvailable: boolean;
+  proxyUnavailable: boolean;
+  /** Phase 7: agent changes held for review. */
+  agentChangesHeld: boolean;
+}
+
+function getSecurityStatus(): SecurityStatus {
+  const db = personaManager.getActiveContext().db;
+  return {
+    keyVaultAvailable: db.isKeyVaultAvailable(),
+    proxyUnavailable: Boolean(db.getProxySettings().unavailable),
+    agentChangesHeld: false,
+  };
+}
+
+let lastSecurityStatus = '';
+
+/** Tells the window when the security status changed (keychain, proxy, persona). */
+function pushSecurityStatus(force = false): void {
+  let status: SecurityStatus;
+  try {
+    status = getSecurityStatus();
+  } catch {
+    return;
+  }
+  const key = JSON.stringify(status);
+  if (!force && key === lastSecurityStatus) return;
+  lastSecurityStatus = key;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:security-status-changed', status);
+}
+
 /**
  * Points the Studio window's network session at the active persona's proxy, so friends' images and
  * ring hubs loaded in the window take the same route as syncs. Cheap to call after anything that
  * might change the active persona or its proxy setting: it only reconfigures on a change.
  */
 async function applyWindowProxy(): Promise<void> {
+  // Anything that changes the route (persona, proxy) can change the security status too
+  pushSecurityStatus();
   let plan: WindowProxyPlan;
   try {
     plan = planWindowProxy(personaManager.getActiveContext().db.getProxySettings());
@@ -319,6 +356,8 @@ async function initServices() {
       decrypt: (cipherText) => safeStorage.decryptString(cipherText),
     },
   });
+  // A secret saved without the keychain (with consent) shows the security banner at once
+  onKeyVaultFallback(() => pushSecurityStatus(true));
   localPreviewServer = new LocalPreviewServer();
   webringMcpServer = new WebringMcpServer(
     personaManager,
@@ -337,7 +376,15 @@ async function initServices() {
     listPersonaIds: () => personaManager.listPersonaRecords().map((p) => p.id),
     runner: {
       sync: (personaId) =>
-        personaManager.withPersonaContext(personaId, async (ctx) => summarizeSync(await runSyncAll(ctx))),
+        personaManager.withPersonaContext(personaId, async (ctx) => {
+          try {
+            return summarizeSync(await runSyncAll(ctx));
+          } catch (err) {
+            // Reported once by the scheduler; the banner explains it
+            if (err instanceof ProxyUnavailableError) pushSecurityStatus(true);
+            throw err;
+          }
+        }),
       publish: (personaId, destination, syncFirst) =>
         personaManager.withPersonaContext(personaId, (ctx) =>
           runScheduledPublish(ctx, destination, syncFirst, publishPaths())
@@ -635,6 +682,11 @@ function registerIpcHandlers() {
       savedPosts: ctx.db.getSavedPosts(),
       feedRetentionDays: ctx.db.getFeedRetentionDays(),
       friendNotices: ctx.db.getFriendNotices(),
+      friendSyncNotices: ctx.db.getFriendSyncNotices(),
+      // One-time messages left by database upgrades; reading them removes them
+      upgradeNotices: ctx.db.takeUpgradeNotices(),
+      // This persona's own key fingerprint, for friends to compare when their Studio says it changed
+      ownKeyFingerprint: spkiFingerprint(ctx.db.getKeys().publicKeyPem),
       mutualFriendUrls: ctx.db.getMutualFriendUrls(),
       proxySettings: ctx.db.getProxySettings(),
       keyRotations: ctx.db.getKeyRotations(),
@@ -694,9 +746,10 @@ function registerIpcHandlers() {
     return result;
   });
 
-  ipcMain.handle('studio:update-profile', (_e, updates) => {
+  // allowPlaintext: the user agreed to store a new password or token unencrypted (no keychain)
+  ipcMain.handle('studio:update-profile', (_e, updates, options?: { allowPlaintext?: boolean }) => {
     const ctx = personaManager.getActiveContext();
-    const profile = ctx.db.updateProfile(updates);
+    const profile = ctx.db.updateProfile(updates, { allowPlaintext: options?.allowPlaintext === true });
     // A replaced profile photo or banner that was uploaded to the library is deleted here
     if (updates && typeof updates === 'object' && ('avatarUrl' in updates || 'bannerUrl' in updates)) {
       cleanUpLibrary(ctx.db, ctx.mediaLibrary);
@@ -719,7 +772,7 @@ function registerIpcHandlers() {
       file = result.filePaths[0];
     }
     const ctx = personaManager.getActiveContext();
-    return { url: setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file) };
+    return { url: await setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file) };
   });
 
   ipcMain.handle('studio:create-album', (_e, input) => {
@@ -761,7 +814,7 @@ function registerIpcHandlers() {
       files = result.filePaths;
     }
     const ctx = personaManager.getActiveContext();
-    const imported = importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
+    const imported = await importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
     if (imported.added.length > 0) noteActiveChange('photos');
     return imported;
   });
@@ -775,7 +828,7 @@ function registerIpcHandlers() {
       filters: photoFilters,
     });
     if (result.canceled || result.filePaths.length === 0) return null;
-    const media = personaManager.getActiveContext().mediaLibrary.importPhoto(result.filePaths[0], 'wall-posts');
+    const media = await personaManager.getActiveContext().mediaLibrary.importPhoto(result.filePaths[0], 'wall-posts');
     return { url: media.url, fileName: path.basename(result.filePaths[0]) };
   });
 
@@ -788,7 +841,7 @@ function registerIpcHandlers() {
     });
     if (result.canceled || result.filePaths.length === 0) return { replaced: false };
     const ctx = personaManager.getActiveContext();
-    replacePhotoImage(ctx.db, ctx.mediaLibrary, photoId, result.filePaths[0]);
+    await replacePhotoImage(ctx.db, ctx.mediaLibrary, photoId, result.filePaths[0]);
     noteActiveChange('photo');
     return { replaced: true };
   });
@@ -869,22 +922,28 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.rotateSigningKeys();
   });
 
-  ipcMain.handle('studio:trust-friend-key', (_e, friendId: string, newPublicKeyPem?: string) => {
-    return personaManager.getActiveContext().db.trustNewFriendKey(String(friendId), newPublicKeyPem);
+  // Pins only the candidate key whose fingerprint the user reviewed in the key-change dialog
+  ipcMain.handle('studio:trust-friend-key', (_e, friendId: string, expectedFingerprint: string) => {
+    return personaManager.getActiveContext().db.trustNewFriendKey(String(friendId), String(expectedFingerprint || ''));
   });
 
-  ipcMain.handle('studio:set-proxy-settings', async (_e, input: { enabled?: boolean; proxyUrl?: string }) => {
+  ipcMain.handle(
+    'studio:set-proxy-settings',
+    async (_e, input: { enabled?: boolean; proxyUrl?: string }, options?: { allowPlaintext?: boolean }) => {
     const rawUrl = typeof input?.proxyUrl === 'string' ? input.proxyUrl.trim() : '';
     if (rawUrl) {
       parseProxyUrl(rawUrl);
     }
-    const updated = personaManager.getActiveContext().db.setProxySettings({
-      enabled: input?.enabled,
-      proxyUrl: rawUrl,
-    });
+    const updated = personaManager.getActiveContext().db.setProxySettings(
+      { enabled: input?.enabled, proxyUrl: rawUrl },
+      { allowPlaintext: options?.allowPlaintext === true }
+    );
     await applyWindowProxy();
     return updated;
-  });
+  }
+  );
+
+  ipcMain.handle('studio:get-security-status', () => getSecurityStatus());
 
   ipcMain.handle('studio:set-friend-visibility', (_e, friendId: string, visibility: 'private' | 'public') => {
     const friend = personaManager.getActiveContext().db.setFriendVisibility(friendId, visibility);
@@ -925,6 +984,13 @@ function registerIpcHandlers() {
 
   ipcMain.handle('studio:crawl-all-friends', async (event) => {
     return withActiveLock(async (_personaId, ctx) => {
+      // A proxy that can't be unlocked stops the run (ProxyUnavailableError) before anything connects
+      try {
+        ctx.ringCrawler.assertCanSync();
+      } catch (err) {
+        pushSecurityStatus(true);
+        throw err;
+      }
       const results = await ctx.ringCrawler.crawlAllFriends({
         // Progress for the Sync button: counts only, nothing about the sites
         onProgress: ({ done, total }) => {
@@ -1003,6 +1069,11 @@ function registerIpcHandlers() {
   });
   ipcMain.handle('studio:friend-notice-dismiss', (_e, siteUrl: string) => {
     personaManager.getActiveContext().db.dismissFriendNotice(String(siteUrl));
+    return { ok: true };
+  });
+  // Rollback notices: a friend served an older copy of a document than one already verified
+  ipcMain.handle('studio:friend-sync-notice-dismiss', (_e, siteUrl: string, doc: string) => {
+    personaManager.getActiveContext().db.dismissFriendSyncNotice(String(siteUrl), 'rollback_blocked', String(doc));
     return { ok: true };
   });
 
@@ -1182,15 +1253,19 @@ function registerIpcHandlers() {
     return { ...login, configured: true };
   });
   ipcMain.handle('studio:github-login-available', () => githubDeviceLogin.isConfigured());
-  ipcMain.handle('studio:github-login-poll', async (_e, loginId: string) => {
+  ipcMain.handle('studio:github-login-poll', async (_e, loginId: string, options?: { allowPlaintext?: boolean }) => {
     const result = await githubDeviceLogin.poll(String(loginId || ''));
     if (result.status !== 'approved') return result;
     // The token goes straight to the persona's sealed settings; the window never sees it
-    const user = await connectGitHub(personaManager.getActiveContext(), result.token);
+    const user = await connectGitHub(personaManager.getActiveContext(), result.token, {}, {
+      allowPlaintext: options?.allowPlaintext === true,
+    });
     return { status: 'approved', login: user.login };
   });
-  ipcMain.handle('studio:github-connect-token', async (_e, token: string) =>
-    connectGitHub(personaManager.getActiveContext(), String(token || ''))
+  ipcMain.handle('studio:github-connect-token', async (_e, token: string, options?: { allowPlaintext?: boolean }) =>
+    connectGitHub(personaManager.getActiveContext(), String(token || ''), {}, {
+      allowPlaintext: options?.allowPlaintext === true,
+    })
   );
   ipcMain.handle('studio:setup-configure-site', (_e, options?: { repoName?: string; allowAddressChange?: boolean }) =>
     configureGitHubSite(personaManager.getActiveContext(), {

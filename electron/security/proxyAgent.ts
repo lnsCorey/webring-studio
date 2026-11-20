@@ -11,6 +11,47 @@ import {
 
 export type SupportedProxyProtocol = 'socks5:' | 'socks5h:' | 'http:';
 
+/**
+ * Thrown before any connection when the persona has a proxy configured that can't be unlocked on
+ * this device (it was sealed with an OS keychain that isn't available). Studio never falls back to
+ * a direct connection, which would reveal the user's IP address.
+ */
+export class ProxyUnavailableError extends Error {
+  constructor() {
+    super(
+      "Your proxy is configured but can't be unlocked on this device, so Studio paused all network activity " +
+        'to avoid exposing your IP address. Re-enter the proxy in Publish & SFTP → Proxy to continue.'
+    );
+    this.name = 'ProxyUnavailableError';
+  }
+}
+
+/**
+ * The proxy URL to use for a request, or undefined for a direct connection when no proxy is set.
+ * Throws ProxyUnavailableError when a proxy is set but can't be unlocked: callers must not connect.
+ */
+export function requireUsableProxy(settings: { enabled: boolean; proxyUrl: string; unavailable?: boolean }): string | undefined {
+  if (settings.unavailable) throw new ProxyUnavailableError();
+  return settings.enabled && settings.proxyUrl ? settings.proxyUrl : undefined;
+}
+
+/** A proxy URL with any username and password replaced by ***, for messages and logs. */
+export function redactProxyUrl(raw: string): string {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(text);
+    if (parsed.username || parsed.password) {
+      parsed.username = parsed.username ? '***' : '';
+      parsed.password = parsed.password ? '***' : '';
+    }
+    return parsed.toString();
+  } catch {
+    // Not parseable, so where a login ends can't be known: hide it all if it might contain one
+    return text.includes('@') ? '(hidden: it may contain a password)' : text;
+  }
+}
+
 export interface ParsedProxyConfig {
   protocol: SupportedProxyProtocol;
   host: string;
@@ -27,19 +68,19 @@ export function parseProxyUrl(rawProxyUrl: string): ParsedProxyConfig {
   try {
     parsed = new URL(rawProxyUrl.trim());
   } catch {
-    throw new Error(`Invalid proxy URL: ${rawProxyUrl}`);
+    throw new Error(`Invalid proxy URL: ${redactProxyUrl(rawProxyUrl)}`);
   }
   if (parsed.protocol !== 'socks5:' && parsed.protocol !== 'socks5h:' && parsed.protocol !== 'http:') {
     throw new Error(`Unsupported proxy protocol "${parsed.protocol}". Use socks5://, socks5h://, or http://`);
   }
   const host = parsed.hostname.replace(/^\[|\]$/g, '');
   if (!host) {
-    throw new Error(`Proxy URL is missing a hostname: ${rawProxyUrl}`);
+    throw new Error(`Proxy URL is missing a hostname: ${redactProxyUrl(rawProxyUrl)}`);
   }
   const defaultPort = parsed.protocol === 'http:' ? 8080 : 1080;
   const port = parsed.port ? Number(parsed.port) : defaultPort;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`Invalid proxy port in ${rawProxyUrl}`);
+    throw new Error(`Invalid proxy port in ${redactProxyUrl(rawProxyUrl)}`);
   }
   return {
     protocol: parsed.protocol,

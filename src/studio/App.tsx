@@ -28,6 +28,11 @@ import { FriendEdit, FriendEditor } from './FriendEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
+import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
+import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
+import { PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
+import { formatFingerprint } from '../shared/fingerprint';
+import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
@@ -46,6 +51,7 @@ import type { SetupStatus } from '../shared/setup';
 import {
   BookOpen,
   Camera,
+  AlertTriangle,
   CheckCircle2,
   Code2,
   Compass,
@@ -314,6 +320,19 @@ interface CrawlSiteResult {
   deferred?: boolean;
   retryAfter?: string;
   error?: string;
+  /** Documents the sync couldn't use; the friend shows a "Sync problem" badge. */
+  documentErrors?: Array<{ doc: string; message: string }>;
+  /** Older copies of documents refused (rollback protection). */
+  rollbacksBlocked?: number;
+}
+
+/**
+ * Why an image couldn't be imported, in plain words. Images are processed in a worker thread
+ * that's stopped if it runs too long or out of memory; its messages say so already.
+ */
+function imageErrorText(err: unknown): string {
+  const text = (err instanceof Error ? err.message : String(err)).replace(/^Error invoking remote method '[^']+': (\w*Error: )?/, '');
+  return text || "This image is too large or couldn't be processed.";
 }
 
 /** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
@@ -432,6 +451,9 @@ declare global {
         savedPosts?: SavedPostView[];
         feedRetentionDays?: number;
         friendNotices?: FriendNoticeView[];
+        friendSyncNotices?: FriendSyncNoticeView[];
+        upgradeNotices?: string[];
+        ownKeyFingerprint?: string;
         mutualFriendUrls?: string[];
         proxySettings?: { enabled: boolean; proxyUrl: string };
         keyRotations?: KeyRotationCertificate[];
@@ -465,7 +487,9 @@ declare global {
         activePersonaId: string;
         personas: PersonaSummary[];
       }>;
-      updateProfile: (updates: unknown) => Promise<unknown>;
+      updateProfile: (updates: unknown, options?: { allowPlaintext?: boolean }) => Promise<unknown>;
+      getSecurityStatus?: () => Promise<SecurityStatusView>;
+      onSecurityStatusChanged?: (cb: (status: SecurityStatusView) => void) => () => void;
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
       addPhoto: (input: unknown) => Promise<unknown>;
@@ -503,17 +527,17 @@ declare global {
         rotationCertificate: KeyRotationCertificate;
         rotationCount: number;
       }>;
-      trustFriendKey?: (friendId: string, newPublicKeyPem?: string) => Promise<FriendConnection>;
+      trustFriendKey?: (friendId: string, expectedFingerprint: string) => Promise<FriendConnection>;
       listWebringHubs?: WebringHubApi['listWebringHubs'];
       addWebringHub?: WebringHubApi['addWebringHub'];
       removeWebringHub?: WebringHubApi['removeWebringHub'];
       searchWebringHub?: WebringHubApi['searchWebringHub'];
       setWebringHubListed?: WebringHubApi['setWebringHubListed'];
       checkKeyWithWebringHubs?: WebringHubApi['checkKeyWithWebringHubs'];
-      setProxySettings?: (input: {
-        enabled?: boolean;
-        proxyUrl?: string;
-      }) => Promise<{ enabled: boolean; proxyUrl: string }>;
+      setProxySettings?: (
+        input: { enabled?: boolean; proxyUrl?: string },
+        options?: { allowPlaintext?: boolean }
+      ) => Promise<{ enabled: boolean; proxyUrl: string }>;
       setFriendVisibility: (
         friendId: string,
         visibility: FriendVisibility
@@ -552,6 +576,7 @@ declare global {
       reviewFriendNotice?: (link: string) => Promise<FriendNoticeReviewView>;
       acceptFriendNotice?: (link: string) => Promise<unknown>;
       dismissFriendNotice?: (siteUrl: string) => Promise<unknown>;
+      dismissFriendSyncNotice?: (siteUrl: string, doc: string) => Promise<unknown>;
       onFriendNoticeLink?: (cb: (link: string) => void) => () => void;
       getSchedule: () => Promise<ScheduleOverview>;
       setSchedule: (
@@ -591,8 +616,11 @@ declare global {
       getSetupStatus?: SetupApi['getSetupStatus'];
       githubLoginAvailable?: SetupApi['githubLoginAvailable'];
       githubLoginStart?: SetupApi['githubLoginStart'];
-      githubLoginPoll?: SetupApi['githubLoginPoll'];
-      githubConnectToken?: SetupApi['githubConnectToken'];
+      githubLoginPoll?: (
+        loginId: string,
+        options?: { allowPlaintext?: boolean }
+      ) => ReturnType<SetupApi['githubLoginPoll']>;
+      githubConnectToken?: (token: string, options?: { allowPlaintext?: boolean }) => ReturnType<SetupApi['githubConnectToken']>;
       setupConfigureSite?: SetupApi['setupConfigureSite'];
       setupPublish?: SetupApi['setupPublish'];
       setupCheckLive?: SetupApi['setupCheckLive'];
@@ -697,6 +725,7 @@ export const App: React.FC = () => {
     | 'privacy-faq'
     | 'webrings'
     | 'hubs'
+    | 'security-storage'
   >('quickstart');
   const [bundle, setBundle] = useState<CompleteSiteBundle | null>(null);
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
@@ -706,6 +735,10 @@ export const App: React.FC = () => {
   const [savedPosts, setSavedPosts] = useState<SavedPostView[]>([]);
   const [feedRetentionDays, setFeedRetentionDays] = useState(90);
   const [friendNotices, setFriendNotices] = useState<FriendNoticeView[]>([]);
+  const [friendSyncNotices, setFriendSyncNotices] = useState<FriendSyncNoticeView[]>([]);
+  const [ownKeyFingerprint, setOwnKeyFingerprint] = useState('');
+  // The friend whose changed key is being reviewed in KeyChangeDialog
+  const [keyChangeFriendId, setKeyChangeFriendId] = useState<string | null>(null);
   const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
   const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
@@ -857,7 +890,7 @@ export const App: React.FC = () => {
   const [scheduleOverview, setScheduleOverview] = useState<ScheduleOverview | null>(null);
   const [runningJob, setRunningJob] = useState<'sync' | 'publish' | null>(null);
   const [publishedUpToDate, setPublishedUpToDate] = useState(false);
-  const [proxySettings, setProxySettings] = useState<{ enabled: boolean; proxyUrl: string }>({
+  const [proxySettings, setProxySettings] = useState<{ enabled: boolean; proxyUrl: string; unavailable?: boolean }>({
     enabled: false,
     proxyUrl: '',
   });
@@ -955,6 +988,54 @@ export const App: React.FC = () => {
       setStatusMessage((prev) => (prev === msg ? null : prev));
     }, 5000);
   };
+  // The Sync All message that mentions friends with sync problems; clicking it shows just those
+  const [syncProblemsMessage, setSyncProblemsMessage] = useState<string | null>(null);
+  const [friendsFilter, setFriendsFilter] = useState<'all' | 'sync-problems'>('all');
+  const [openSyncProblemId, setOpenSyncProblemId] = useState<string | null>(null);
+
+  // Keychain and proxy state for the security banners (studio:get-security-status)
+  const [securityStatus, setSecurityStatus] = useState<SecurityStatusView>({
+    keyVaultAvailable: true,
+    proxyUnavailable: false,
+    agentChangesHeld: false,
+  });
+  const [vaultBannerDismissed, setVaultBannerDismissed] = useState(false);
+  const refreshSecurityStatus = async () => {
+    const status = await window.studioApi?.getSecurityStatus?.().catch(() => undefined);
+    if (status) setSecurityStatus(status);
+  };
+  useEffect(() => {
+    void refreshSecurityStatus();
+    return window.studioApi?.onSecurityStatusChanged?.((status) => setSecurityStatus(status));
+  }, []);
+
+  // Asks before a new password or token is stored without encryption (no OS keychain)
+  const [consentRequest, setConsentRequest] = useState<{ label: string; resolve: (allow: boolean) => void } | null>(null);
+  const askConsent = (label: string) =>
+    new Promise<boolean>((resolve) => setConsentRequest({ label, resolve }));
+
+  /**
+   * Saves profile changes. A newly typed password or token needs the user's consent when the
+   * keychain is unavailable; saved ones come back masked and aren't new.
+   */
+  const saveProfile = async (updates: unknown) => {
+    if (!window.studioApi) throw new Error('Not available.');
+    const publish = (updates as { publishSettings?: Record<string, unknown> } | null)?.publishSettings;
+    const newSecret = publish
+      ? (['password', 'githubToken'] as const).find(
+          (field) => typeof publish[field] === 'string' && publish[field] && publish[field] !== '••••••••'
+        )
+      : undefined;
+    if (newSecret && !securityStatus.keyVaultAvailable) {
+      const allow = await askConsent(newSecret === 'githubToken' ? 'GitHub token' : 'password');
+      if (!allow) {
+        notify("Not saved: you chose not to store it without encryption.");
+        throw new Error('Not saved: storing it without encryption was declined.');
+      }
+      return window.studioApi.updateProfile(updates, { allowPlaintext: true });
+    }
+    return window.studioApi.updateProfile(updates);
+  };
 
   useEffect(() => {
     if (!bundle || !setupStatus || showSetupWizard) return;
@@ -964,6 +1045,7 @@ export const App: React.FC = () => {
     setShowSetupWizard(true);
   }, [bundle, setupStatus, activePersonaId]);
 
+  const setupTokenConsent = useRef(false);
   const setupApi: SetupApi | null =
     window.studioApi?.getSetupStatus &&
     window.studioApi.githubLoginAvailable &&
@@ -977,9 +1059,27 @@ export const App: React.FC = () => {
       ? {
           getSetupStatus: window.studioApi.getSetupStatus,
           githubLoginAvailable: window.studioApi.githubLoginAvailable,
-          githubLoginStart: window.studioApi.githubLoginStart,
-          githubLoginPoll: window.studioApi.githubLoginPoll,
-          githubConnectToken: window.studioApi.githubConnectToken,
+          // A GitHub token is a secret: without the keychain, ask before sign-in stores it unencrypted
+          githubLoginStart: async () => {
+            setupTokenConsent.current = false;
+            if (!securityStatus.keyVaultAvailable) {
+              if (!(await askConsent('GitHub token'))) {
+                throw new Error("Sign-in cancelled: Studio can't store the GitHub token securely on this device.");
+              }
+              setupTokenConsent.current = true;
+            }
+            return window.studioApi!.githubLoginStart!();
+          },
+          githubLoginPoll: (loginId: string) =>
+            window.studioApi!.githubLoginPoll!(loginId, setupTokenConsent.current ? { allowPlaintext: true } : undefined),
+          githubConnectToken: async (token: string) => {
+            let allowPlaintext = false;
+            if (!securityStatus.keyVaultAvailable) {
+              allowPlaintext = await askConsent('GitHub token');
+              if (!allowPlaintext) throw new Error("Not saved: Studio can't store the GitHub token securely on this device.");
+            }
+            return window.studioApi!.githubConnectToken!(token, allowPlaintext ? { allowPlaintext } : undefined);
+          },
           setupConfigureSite: window.studioApi.setupConfigureSite,
           setupPublish: window.studioApi.setupPublish,
           setupCheckLive: window.studioApi.setupCheckLive,
@@ -1022,6 +1122,9 @@ export const App: React.FC = () => {
     setSavedPosts(data.savedPosts || []);
     if (typeof data.feedRetentionDays === 'number') setFeedRetentionDays(data.feedRetentionDays);
     setFriendNotices(data.friendNotices || []);
+    setFriendSyncNotices(data.friendSyncNotices || []);
+    setOwnKeyFingerprint(data.ownKeyFingerprint || '');
+    for (const message of data.upgradeNotices || []) notify(message);
     setMutualFriendUrls(data.mutualFriendUrls || []);
     setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
     setModeration(data.moderation || []);
@@ -1279,7 +1382,7 @@ export const App: React.FC = () => {
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({
+    await saveProfile({
       siteUrl,
       handle,
       displayName,
@@ -1409,8 +1512,13 @@ export const App: React.FC = () => {
       notify('Set as album cover.');
     }
     if (action === 'replace') {
-      const res = await window.studioApi.replacePhoto(photo.id);
-      if (res.replaced) notify('Photo replaced. It goes live at your next publish.');
+      try {
+        const res = await window.studioApi.replacePhoto(photo.id);
+        if (res.replaced) notify('Photo replaced. It goes live at your next publish.');
+      } catch (err) {
+        notify(`Couldn't use that image: ${imageErrorText(err)}`);
+        return;
+      }
     }
     if (action === 'delete') {
       if (!window.confirm(`Delete this photo${photo.caption ? ` ("${photo.caption}")` : ''}? It's removed from your site at the next publish.`)) {
@@ -1469,7 +1577,13 @@ export const App: React.FC = () => {
 
   const handlePickLocalPostImage = async () => {
     if (!window.studioApi) return;
-    const imported = await window.studioApi.importImage();
+    let imported: { url: string; fileName: string } | null;
+    try {
+      imported = await window.studioApi.importImage();
+    } catch (err) {
+      notify(`Couldn't use that image: ${imageErrorText(err)}`);
+      return;
+    }
     if (imported) {
       setItemMediaUrl(imported.url);
       notify(`Attached ${imported.fileName} to your post (resized, location data removed).`);
@@ -1555,7 +1669,7 @@ export const App: React.FC = () => {
     if (friendVisibility === 'public' && !publishSettings.publishFriendsList) {
       const nextSettings = { ...publishSettings, publishFriendsList: true };
       setPublishSettings(nextSettings);
-      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+      await saveProfile({ publishSettings: nextSettings });
     }
     setFriendSiteUrl('');
     setFriendName('');
@@ -1580,7 +1694,7 @@ export const App: React.FC = () => {
     if (edit.visibility === 'public' && !publishSettings.publishFriendsList) {
       const nextSettings = { ...publishSettings, publishFriendsList: true };
       setPublishSettings(nextSettings);
-      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+      await saveProfile({ publishSettings: nextSettings });
     }
     setEditingFriendId(null);
     await refreshStudioData();
@@ -1591,7 +1705,7 @@ export const App: React.FC = () => {
     if (!window.studioApi) return;
     const nextSettings = { ...publishSettings, ...patch };
     setPublishSettings(nextSettings);
-    await window.studioApi.updateProfile({ publishSettings: nextSettings });
+    await saveProfile({ publishSettings: nextSettings });
     await refreshStudioData();
     notify('Updated social graph privacy policy and re-signed static JSON bundle!');
   };
@@ -1801,12 +1915,16 @@ export const App: React.FC = () => {
       const blocked = results.filter((r) => r.blocked).length;
       const deferred = results.filter((r) => r.deferred).length;
       const keyChanged = results.filter((r) => r.keyChangedWarning).length;
+      const withProblems = results.filter((r) => r.success && r.documentErrors?.length).length;
       const rejected = results.reduce((acc, r) => acc + (r.entriesRejected || 0), 0);
       const parts = [`${ok} synced`];
+      if (withProblems) parts.push(`${withProblems} with problems (click to see them)`);
       if (failed) parts.push(`${failed} failed`);
       if (blocked) parts.push(`${blocked} blocked (skipped)`);
       if (deferred) parts.push(`${deferred} unreachable lately (skipped for now)`);
       if (keyChanged) parts.push(`${keyChanged} key changed`);
+      const rollbacks = results.reduce((acc, r) => acc + (r.rollbacksBlocked || 0), 0);
+      if (rollbacks) parts.push(`${rollbacks} rollback(s) blocked`);
       if (rejected) parts.push(`${rejected} spoofed entries rejected`);
       const newMember = rings.joined.filter((r) => r.outcome === 'member').length;
       const removedFrom = rings.joined.filter((r) => r.outcome === 'removed' || r.outcome === 'closed');
@@ -1814,7 +1932,13 @@ export const App: React.FC = () => {
       if (newMember) parts.push(`${newMember} ring(s) current`);
       if (removedFrom.length) parts.push(`no longer in ${removedFrom.map((r) => `"${r.name}"`).join(', ')}`);
       if (leavers) parts.push(`${leavers} member(s) left your rings`);
-      notify(`Sync: ${parts.join(', ')}.`);
+      const message = `Sync: ${parts.join(', ')}.`;
+      setSyncProblemsMessage(withProblems ? message : null);
+      notify(message);
+    } catch (err) {
+      // e.g. the proxy can't be unlocked: nothing was contacted, and the banner explains it
+      notify(`Sync stopped: ${errorMessage(err)}`);
+      void refreshSecurityStatus();
     } finally {
       setIsSyncingFriends(false);
     }
@@ -1898,36 +2022,45 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleTrustFriendKey = async (friend: FriendConnection) => {
-    if (!window.studioApi?.trustFriendKey) return;
-    if (
-      !window.confirm(
-        `Trust ${friend.displayName}'s new public key without a rotation certificate? Only do this if you confirmed out-of-band with ${friend.displayName} that they lost their previous signing key.`
-      )
-    ) {
-      return;
-    }
-    try {
-      await window.studioApi.trustFriendKey(friend.id);
-      const crawlRes = await window.studioApi.crawlFriend(friend.siteUrl);
-      await refreshStudioData();
-      if (crawlRes?.success) {
-        notify(`Re-pinned ${friend.displayName}'s new Ed25519 key and verified their site!`);
-      } else {
-        notify(`Cleared old pin for ${friend.displayName}. Sync again when their site is reachable.`);
-      }
-    } catch (err) {
-      notify(`Couldn't re-pin key: ${errorMessage(err)}`);
-    }
+  // Trusting a changed key happens only from KeyChangeDialog, with the fingerprint the user reviewed
+  const handleTrustFriendKey = async (friend: KeyChangeFriend, expectedFingerprint: string) => {
+    if (!window.studioApi?.trustFriendKey) throw new Error('Not available in this version.');
+    await window.studioApi.trustFriendKey(friend.id, expectedFingerprint);
+    setKeyChangeFriendId(null);
+    const crawlRes = await window.studioApi.crawlFriend(friend.siteUrl);
+    await refreshStudioData();
+    notify(
+      crawlRes?.success
+        ? `Pinned ${friend.displayName}'s new key and verified their site.`
+        : `Pinned ${friend.displayName}'s new key. Sync again when their site is reachable.`
+    );
+  };
+
+  // Re-checking a friend from the dialog records the key their site presents now
+  const handleRecheckFriendKey = async (friend: KeyChangeFriend) => {
+    const res = await window.studioApi?.crawlFriend(friend.siteUrl);
+    await refreshStudioData();
+    if (!res?.success) throw new Error(`Couldn't reach ${friend.siteUrl}: ${res?.error || 'site unreachable'}`);
   };
 
   const handleSaveProxySettings = async (next: { enabled?: boolean; proxyUrl?: string }) => {
     if (!window.studioApi?.setProxySettings) return;
     try {
-      const updated = await window.studioApi.setProxySettings({
-        enabled: next.enabled ?? proxySettings.enabled,
-        proxyUrl: next.proxyUrl ?? proxySettings.proxyUrl,
-      });
+      const proxyUrl = next.proxyUrl ?? proxySettings.proxyUrl;
+      // A proxy login is a password: without the keychain, ask before storing it unencrypted
+      let allowPlaintext = false;
+      if (!securityStatus.keyVaultAvailable && /^[a-z0-9+.-]+:\/\/[^/@\s]+@/i.test(proxyUrl.trim())) {
+        allowPlaintext = await askConsent('proxy password');
+        if (!allowPlaintext) {
+          notify('Proxy not saved: you chose not to store its password without encryption.');
+          return;
+        }
+      }
+      const updated = await window.studioApi.setProxySettings(
+        { enabled: next.enabled ?? proxySettings.enabled, proxyUrl },
+        allowPlaintext ? { allowPlaintext } : undefined
+      );
+      void refreshSecurityStatus();
       setProxySettings(updated);
       notify(
         updated.enabled && updated.proxyUrl
@@ -2146,14 +2279,14 @@ export const App: React.FC = () => {
     if (chosen) {
       const nextSettings = { ...publishSettings, exportPath: chosen };
       setPublishSettings(nextSettings);
-      await window.studioApi.updateProfile({ publishSettings: nextSettings });
+      await saveProfile({ publishSettings: nextSettings });
       notify(`Saved local export folder: ${chosen}`);
     }
   };
 
   const handleSaveRemoteSettings = async () => {
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     await refreshStudioData();
     notify(
       `Saved ${publishSettings.protocol.toUpperCase()} connection settings for this persona in SQLite!`
@@ -2179,7 +2312,7 @@ export const App: React.FC = () => {
       remotePath: '/var/www/html',
     };
     setPublishSettings(clearedSettings);
-    await window.studioApi.updateProfile({ publishSettings: clearedSettings });
+    await saveProfile({ publishSettings: clearedSettings });
     await refreshStudioData();
     notify(`Deleted stored SFTP/FTP credentials from ${activeLabel}'s database.`);
   };
@@ -2187,7 +2320,7 @@ export const App: React.FC = () => {
   const handlePublishRemote = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     notify(`Saved settings & connecting to ${publishSettings.protocol.toUpperCase()} host ${publishSettings.host}...`);
     const res = await window.studioApi.publishRemote(publishSettings);
     await refreshStudioData();
@@ -2196,7 +2329,7 @@ export const App: React.FC = () => {
 
   const handleSaveGithubSettings = async () => {
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     await refreshStudioData();
     notify('Saved GitHub Pages connection settings for this persona in SQLite!');
   };
@@ -2220,7 +2353,7 @@ export const App: React.FC = () => {
     };
     setPublishSettings(clearedSettings);
     setGithubCheckResult(null);
-    await window.studioApi.updateProfile({ publishSettings: clearedSettings });
+    await saveProfile({ publishSettings: clearedSettings });
     await refreshStudioData();
     notify(`Deleted stored GitHub Pages credentials from ${activeLabel}'s database.`);
   };
@@ -2240,7 +2373,7 @@ export const App: React.FC = () => {
   const handlePublishGithub = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!window.studioApi) return;
-    await window.studioApi.updateProfile({ publishSettings });
+    await saveProfile({ publishSettings });
     notify(`Saved settings & deploying to github.com/${publishSettings.githubOwner}/${publishSettings.githubRepo}...`);
     setGithubDeploying(true);
     try {
@@ -2511,10 +2644,7 @@ export const App: React.FC = () => {
             >
               <img
                 src={
-                  bundle.profile.avatarUrl ||
-                  `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                    bundle.profile.displayName
-                  )}`
+                  bundle.profile.avatarUrl || localAvatarDataUri(bundle.profile.siteUrl || bundle.profile.displayName)
                 }
                 alt={bundle.profile.displayName}
                 className="w-8 h-8 rounded-lg object-cover border border-slate-700 shrink-0"
@@ -2636,11 +2766,26 @@ export const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-3">
-            {statusMessage && (
-              <div className="px-3 py-1 rounded-lg bg-indigo-500/20 border border-indigo-500/40 text-indigo-200 text-xs flex items-center gap-1.5">
-                <CheckCircle2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            {statusMessage && statusMessage === syncProblemsMessage ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setFriendsFilter('sync-problems');
+                  setActiveTab('friends');
+                }}
+                title="Show the friends whose last sync had a problem"
+                className="px-3 py-1 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-200 hover:bg-amber-500/25 text-xs flex items-center gap-1.5"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span className="truncate max-w-md">{statusMessage}</span>
-              </div>
+              </button>
+            ) : (
+              statusMessage && (
+                <div className="px-3 py-1 rounded-lg bg-indigo-500/20 border border-indigo-500/40 text-indigo-200 text-xs flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                  <span className="truncate max-w-md">{statusMessage}</span>
+                </div>
+              )
             )}
             <button
               onClick={handleSyncAllFriends}
@@ -2653,6 +2798,46 @@ export const App: React.FC = () => {
             </button>
           </div>
         </header>
+
+        {/* Safeguards that block or warn, with what to do (stacked) */}
+        {securityStatus.proxyUnavailable && (
+          <SecurityBanner
+            severity="error"
+            title="Network activity paused."
+            message="Your proxy is configured but can't be unlocked, so Studio has paused all network activity to avoid exposing your IP address."
+            actions={[
+              { label: 'Retry', onClick: () => void refreshSecurityStatus().then(() => refreshStudioData()) },
+              {
+                label: 'Open proxy settings',
+                onClick: () => {
+                  setActiveTab('publish');
+                  setTimeout(
+                    () => document.getElementById('proxy-settings')?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+                    100
+                  );
+                },
+              },
+            ]}
+          />
+        )}
+        {!securityStatus.keyVaultAvailable && !vaultBannerDismissed && (
+          <SecurityBanner
+            severity="warning"
+            title="Secure storage unavailable."
+            message="This device's secure storage isn't available. New passwords and tokens won't be saved unless you allow unencrypted storage."
+            actions={[
+              {
+                label: 'Learn more',
+                onClick: () => {
+                  setHelpSection('security-storage');
+                  setActiveTab('help');
+                },
+              },
+            ]}
+            dismissible
+            onDismiss={() => setVaultBannerDismissed(true)}
+          />
+        )}
 
         {/* Scrollable Workspace */}
         <div className="flex-1 overflow-y-auto p-6">
@@ -2888,6 +3073,20 @@ export const App: React.FC = () => {
                       >
                         {keyRotations.length} rotation cert{keyRotations.length === 1 ? '' : 's'}
                       </span>
+                    )}
+                    {ownKeyFingerprint && (
+                      <details className="w-full">
+                        <summary className="cursor-pointer text-slate-300 hover:text-slate-100">
+                          Your key fingerprint (for friends to compare)
+                        </summary>
+                        <pre className="mt-1.5 text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 text-slate-200 whitespace-pre">
+                          {formatFingerprint(ownKeyFingerprint)}
+                        </pre>
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          If a friend's Studio says your key changed, read them the first and last 8 characters so they
+                          can check it before trusting the new key.
+                        </p>
+                      </details>
                     )}
                     <button
                       type="button"
@@ -3629,8 +3828,13 @@ export const App: React.FC = () => {
                             item={item}
                             mediaSrc={mediaSrc}
                             onPickImage={async () => {
-                              const imported = await window.studioApi?.importImage();
-                              return imported ? imported.url : null;
+                              try {
+                                const imported = await window.studioApi?.importImage();
+                                return imported ? imported.url : null;
+                              } catch (err) {
+                                notify(`Couldn't use that image: ${imageErrorText(err)}`);
+                                return null;
+                              }
                             }}
                             onSave={(edit) => handleSaveItemEdit(item, edit)}
                             onCancel={() => setEditingItemId(null)}
@@ -3720,6 +3924,26 @@ export const App: React.FC = () => {
                   await refreshStudioData();
                 }}
                 onBlock={(target) => handleSetModeration(target.siteUrl, target.displayName || target.siteUrl, 'block')}
+              />
+
+              <FriendSyncNoticesPanel
+                notices={friendSyncNotices}
+                errorMessage={errorMessage}
+                onDismiss={async (n) => {
+                  await window.studioApi?.dismissFriendSyncNotice?.(n.siteUrl, n.doc);
+                  await refreshStudioData();
+                }}
+                onRecheck={async (n) => {
+                  const res = await window.studioApi?.crawlFriend(n.siteUrl);
+                  await refreshStudioData();
+                  notify(
+                    res?.success
+                      ? res.rollbacksBlocked
+                        ? `${n.friendName} is still serving an older copy. Studio kept the newer one.`
+                        : `Re-checked ${n.friendName}: their site is current again.`
+                      : `Couldn't reach ${n.siteUrl}: ${res?.error || 'site unreachable'}`
+                  );
+                }}
               />
 
               {/* Social Graph Privacy & Anti-Scraping Shield Panel */}
@@ -4487,9 +4711,44 @@ export const App: React.FC = () => {
                     Local Ring Friends ({allFriends.length} Total •{' '}
                     {bundle.connections.friends.length} Exported to Public JSON)
                   </h3>
+                  {(friendsFilter === 'sync-problems' || allFriends.some((f) => f.lastSyncError)) && (
+                    <div className="flex items-center gap-1.5 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setFriendsFilter('all')}
+                        className={`px-2.5 py-1 rounded-full border ${
+                          friendsFilter === 'all'
+                            ? 'bg-slate-700 border-slate-600 text-slate-100'
+                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFriendsFilter('sync-problems')}
+                        aria-pressed={friendsFilter === 'sync-problems'}
+                        className={`px-2.5 py-1 rounded-full border flex items-center gap-1 ${
+                          friendsFilter === 'sync-problems'
+                            ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-amber-200'
+                        }`}
+                      >
+                        <AlertTriangle className="w-3 h-3" /> Sync problems (
+                        {allFriends.filter((f) => f.lastSyncError).length})
+                      </button>
+                    </div>
+                  )}
                 </div>
+                {friendsFilter === 'sync-problems' && !allFriends.some((f) => f.lastSyncError) && (
+                  <p className="text-xs text-slate-500 mb-3">
+                    No friends have sync problems now. The last sync could use every document they publish.
+                  </p>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {allFriends.map((friend) => {
+                  {allFriends
+                    .filter((f) => friendsFilter === 'all' || f.lastSyncError)
+                    .map((friend) => {
                     const isPublic = friend.visibility === 'public';
                     const isActuallyExported =
                       isPublic && Boolean(publishSettings.publishFriendsList);
@@ -4510,12 +4769,8 @@ export const App: React.FC = () => {
                           <>
                         <div className="flex items-start gap-3 min-w-0">
                           <img
-                            src={
-                              friend.avatarUrl ||
-                              `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                                friend.displayName
-                              )}`
-                            }
+                            src={friendAvatarSrc(friend.avatarUrl, friend.siteUrl)}
+                            referrerPolicy="no-referrer"
                             alt={friend.displayName}
                             className="w-12 h-12 rounded-full object-cover bg-slate-800 shrink-0"
                           />
@@ -4563,14 +4818,48 @@ export const App: React.FC = () => {
                                 </span>
                               )}
                               {friend.keyStatus === 'changed' && (
-                                <span
-                                  className="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap bg-rose-500/20 text-rose-300 border border-rose-500/40"
-                                  title="WARNING: Friend domain's Ed25519 key in did.json changed unexpectedly! Signatures rejected."
+                                <button
+                                  type="button"
+                                  onClick={() => setKeyChangeFriendId(friend.id)}
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30"
+                                  title="Their signing key changed without a signed rotation. Click to review it."
                                 >
                                   🚨 Key Changed Warning!
-                                </span>
+                                </button>
+                              )}
+                              {friend.lastSyncError && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenSyncProblemId((open) => (open === friend.id ? null : friend.id))
+                                  }
+                                  aria-expanded={openSyncProblemId === friend.id}
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-medium whitespace-nowrap bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30"
+                                  title={`${friend.lastSyncError} — last attempt ${
+                                    friend.lastSyncErrorAt ? formatRelativeTime(friend.lastSyncErrorAt) : 'recently'
+                                  }`}
+                                >
+                                  ⚠ Sync problem
+                                </button>
                               )}
                             </div>
+                            {friend.lastSyncError && openSyncProblemId === friend.id && (
+                              <div className="mt-1.5 p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 space-y-1">
+                                <p className="break-words">
+                                  {friend.lastSyncError}
+                                  {friend.lastSyncErrorAt && (
+                                    <span className="text-amber-300/70">
+                                      {' '}
+                                      — last attempt {formatRelativeTime(friend.lastSyncErrorAt)}
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-amber-300/70">
+                                  Studio kept what it already had for these documents. It's usually a problem
+                                  on their site: let them know, then use Sync JSON to try again.
+                                </p>
+                              </div>
+                            )}
                             <p className="text-xs text-indigo-400 font-mono truncate mt-1.5" title={friend.siteUrl}>
                               {friend.siteUrl}
                             </p>
@@ -4620,7 +4909,7 @@ export const App: React.FC = () => {
                                   publishFriendsList: true,
                                 };
                                 setPublishSettings(nextSettings);
-                                await window.studioApi?.updateProfile({
+                                await saveProfile({
                                   publishSettings: nextSettings,
                                 });
                               }
@@ -4657,6 +4946,9 @@ export const App: React.FC = () => {
                                     (res.entriesRejected
                                       ? `, ${res.entriesRejected} spoofed entries rejected`
                                       : '') +
+                                    (res.documentErrors?.length
+                                      ? `. Couldn't use ${res.documentErrors.map((e) => e.doc).join(', ')} (see Sync problem)`
+                                      : '') +
                                     '.'
                                 );
                               } else if (res?.blocked) {
@@ -4674,11 +4966,11 @@ export const App: React.FC = () => {
                           {friend.keyStatus === 'changed' && (
                             <button
                               type="button"
-                              onClick={() => handleTrustFriendKey(friend)}
+                              onClick={() => setKeyChangeFriendId(friend.id)}
                               className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-medium"
-                              title="Emergency TOFU recovery: re-pin their new key if they lost their previous private key without a KeyRotationCertificate"
+                              title="Review their new key and compare its fingerprint with them before trusting it"
                             >
-                              Trust New Key &amp; Re-sync
+                              Review New Key…
                             </button>
                           )}
                           {friend.keyStatus !== 'unverified' && (
@@ -4929,12 +5221,8 @@ export const App: React.FC = () => {
                             <div className="flex items-start justify-between gap-3">
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
-                                  src={
-                                    entry.friendAvatarUrl ||
-                                    `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                                      entry.friendName
-                                    )}`
-                                  }
+                                  src={friendAvatarSrc(entry.friendAvatarUrl, entry.friendSiteUrl)}
+                                  referrerPolicy="no-referrer"
                                   alt={entry.friendName}
                                   className="w-8 h-8 rounded-full object-cover shrink-0"
                                 />
@@ -5224,7 +5512,7 @@ export const App: React.FC = () => {
                 mediaSrc={mediaSrc}
                 onSave={async (updates) => {
                   if (!window.studioApi) return;
-                  await window.studioApi.updateProfile(updates);
+                  await saveProfile(updates);
                   await refreshStudioData();
                 }}
               />
@@ -5786,7 +6074,7 @@ export const App: React.FC = () => {
                     </p>
                   )}
 
-                  <div className="border-t border-slate-800 pt-4 space-y-2">
+                  <div id="proxy-settings" className="border-t border-slate-800 pt-4 space-y-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <label className="flex items-center gap-2 text-xs font-semibold text-slate-200">
                         <input
@@ -5819,6 +6107,11 @@ export const App: React.FC = () => {
                         Save Proxy
                       </button>
                     </div>
+                    {proxySettings.unavailable && (
+                      <p className="text-[11px] text-rose-300">
+                        Saved proxy can't be unlocked on this device. Re-enter it to continue.
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
@@ -6816,7 +7109,7 @@ export const App: React.FC = () => {
                                 await window.studioApi?.resolveMcpApproval?.(item.id, true);
                                 const info = await window.studioApi?.getMcpInfo?.();
                                 if (info) setMcpInfo(info);
-                                await refreshData();
+                                await refreshStudioData();
                                 notify(`Approved and ran ${item.toolName}.`);
                               }}
                               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
@@ -7304,6 +7597,7 @@ export const App: React.FC = () => {
                       { id: 'privacy-faq', label: '6. Security & Privacy FAQ' },
                       { id: 'webrings', label: '7. Webrings Guide' },
                       { id: 'hubs', label: '8. Webring Hubs' },
+                      { id: 'security-storage', label: '9. Secure Storage & Proxy' },
                     ] as const
                   ).map((sec) => (
                     <button
@@ -8678,6 +8972,47 @@ git push -u origin main --force`}
                 </div>
               )}
 
+              {/* SECTION 9: SECURE STORAGE & PROXY */}
+              {helpSection === 'security-storage' && (
+                <div className="space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
+                    <h3 className="text-xl font-bold">Secure Storage &amp; Proxy</h3>
+                    <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
+                      <h4 className="font-bold text-sm text-violet-400">Where Studio keeps your passwords and tokens</h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        Your signing key, SFTP/FTP password, GitHub token and a proxy login are encrypted with your
+                        operating system's secure storage: the Keychain on macOS, Windows' data protection, or the
+                        Secret Service (GNOME Keyring or KWallet) on Linux. Only you, signed in to this device, can
+                        unlock them.
+                      </p>
+                    </div>
+                    <div className="p-4 rounded-xl bg-slate-950 border border-amber-500/30 space-y-1.5">
+                      <h4 className="font-bold text-sm text-amber-300">"Secure storage unavailable"</h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        Some Linux desktops have no Secret Service running, and some remote or sandboxed sessions
+                        can't reach it. Then Studio can't encrypt anything. It shows a yellow notice, and before it
+                        saves a new password or token it asks whether to store it <strong>unencrypted</strong>.
+                        Anyone with access to your user account's files could read it. If you'd rather not, cancel:
+                        nothing is saved. On Linux, installing and starting GNOME Keyring or KWallet usually fixes it.
+                      </p>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        The command-line MCP never stores a secret unencrypted. Enter passwords and tokens in the app.
+                      </p>
+                    </div>
+                    <div className="p-4 rounded-xl bg-slate-950 border border-rose-500/30 space-y-1.5">
+                      <h4 className="font-bold text-sm text-rose-300">"Network activity paused"</h4>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        If you set a proxy (for example Tor) and Studio can't unlock it on this device, it doesn't
+                        fall back to connecting directly, which would reveal your IP address to your friends' hosts.
+                        Sync, hub requests and saving images all stop, and a red notice says so. Re-enter the proxy in{' '}
+                        <strong>Publish &amp; SFTP → Proxy</strong>, or turn the proxy off there, to continue.
+                        Publishing to your own host isn't routed through the proxy and isn't affected.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* SECTION 6: SECURITY, PRIVACY & TROUBLESHOOTING FAQ */}
               {helpSection === 'privacy-faq' && (
                 <div className="space-y-6">
@@ -8901,9 +9236,13 @@ git push -u origin main --force`}
                           certificate for the new one, published in <code>did.json</code> and{' '}
                           <code>manifest.json</code>, so after your next publish friends switch
                           over at their next sync with no warning. If a friend's key changes without
-                          one, their card offers <strong>Trust New Key &amp; Re-sync</strong>. Only
-                          use it after you've confirmed with them some other way that they really
-                          lost their key.
+                          one, their card shows <strong>Key Changed Warning</strong> and{' '}
+                          <strong>Review New Key…</strong>. The review shows the key you pinned and the
+                          new one as fingerprints. Ask your friend to read you the first and last 8
+                          characters of theirs (under <strong>Profile &amp; Identity</strong> →{' '}
+                          <em>Your key fingerprint</em>) by phone or another channel you already use,
+                          and trust it only if they match. If their site has shown more than one new
+                          key, Studio says so: that can mean someone is impersonating them.
                         </p>
                         <p className="text-xs text-slate-300 leading-relaxed">
                           Your SFTP/FTP password and GitHub token are encrypted the same way. Studio
@@ -9012,6 +9351,31 @@ git push -u origin main --force`}
       </main>
 
       {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {consentRequest && (
+        <PlaintextConsentDialog
+          secretLabel={consentRequest.label}
+          onAnswer={(allow) => {
+            consentRequest.resolve(allow);
+            setConsentRequest(null);
+          }}
+        />
+      )}
+
+      {(() => {
+        const reviewing = keyChangeFriendId ? allFriends.find((f) => f.id === keyChangeFriendId) : undefined;
+        return reviewing ? (
+          <KeyChangeDialog
+            friend={reviewing}
+            witness={
+              <KeyWitnessCheck api={webringHubApi} webringHubs={webringHubs} siteUrl={reviewing.siteUrl} emphasized />
+            }
+            onTrust={handleTrustFriendKey}
+            onRecheck={handleRecheckFriendKey}
+            onClose={() => setKeyChangeFriendId(null)}
+          />
+        ) : null;
+      })()}
+
       {showSetupWizard && setupApi && bundle && (
         <SetupWizard
           key={activePersonaId}
@@ -9022,7 +9386,7 @@ git push -u origin main --force`}
             siteUrl: bundle.profile.siteUrl,
           }}
           onSaveProfile={async (changes) => {
-            await window.studioApi?.updateProfile(changes);
+            await saveProfile(changes);
             await refreshStudioData();
           }}
           onEnableSchedule={async () => {
@@ -9123,10 +9487,7 @@ git push -u origin main --force`}
                           <div className="flex items-center gap-3 min-w-0">
                             <img
                               src={
-                                p.avatarUrl ||
-                                `https://api.dicebear.com/7.x/shapes/svg?seed=${encodeURIComponent(
-                                  p.displayName
-                                )}`
+                                p.avatarUrl || localAvatarDataUri(p.displayName)
                               }
                               alt={p.displayName}
                               className="w-12 h-12 rounded-xl object-cover border border-slate-700 shrink-0"

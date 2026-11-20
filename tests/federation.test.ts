@@ -31,6 +31,7 @@ import {
   type LayoutBlock,
   type ProfileTheme,
   parseWebringUri,
+  isUrlWithinSite,
   signDocument,
   siteUrlToDidWeb,
   verifyDocumentSignature,
@@ -40,7 +41,8 @@ import {
 import { parseProxyUrl } from '../electron/security/proxyAgent';
 import { planWindowProxy } from '../electron/security/windowProxy';
 import { encodeQrMatrix } from '../src/studio/QrCodeSvg';
-import { STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
+import { endorsementRowId, feedRowId, spkiFingerprint, STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
+import { formatFingerprint } from '../src/shared/fingerprint';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { buildRingDirectoryHtml, StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { renderTemplatePage } from '../electron/services/siteTemplates';
@@ -107,6 +109,53 @@ import {
 } from '../electron/services/setupService';
 import type { PagesBuildStatus } from '../electron/services/publisher';
 import { McpHttpServer } from '../electron/mcp/mcpHttpServer';
+
+/**
+ * Deletes a test's temp folder. Windows can't delete a file another handle still has open (a
+ * test's SQLite database, until it's garbage-collected), so there a leftover folder in the OS
+ * temp directory is accepted instead of failing the test.
+ */
+function removeTempDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EBUSY')) return;
+    throw err;
+  }
+}
+
+/**
+ * Stands in for the OS keychain (Electron safeStorage) the running app has, for tests that model
+ * the app storing passwords, tokens or a proxy login. Without one, new secrets need consent.
+ */
+const TEST_CIPHER: KeyCipher = {
+  isAvailable: () => true,
+  encrypt: (plainText) => Buffer.from(plainText, 'utf8').reverse(),
+  decrypt: (cipherText) => Buffer.from(cipherText).reverse().toString('utf8'),
+};
+
+/**
+ * Rewrites one of a site's published documents as its owner would: signed with the site key, with
+ * the manifest's digest of it updated and the manifest signed again. (A document changed without
+ * its manifest no longer matches the manifest's digest, and friends refuse it.)
+ */
+function republishDocument(
+  outDir: string,
+  relPath: string,
+  key: 'albums' | 'items' | 'connections' | 'profile',
+  doc: Record<string, unknown>,
+  siteUrl: string,
+  privateKeyPem: string
+): void {
+  const did = siteUrlToDidWeb(siteUrl);
+  const signed = signDocument(doc, did, privateKeyPem);
+  fs.writeFileSync(path.join(outDir, relPath), JSON.stringify(signed));
+  const manifestPath = path.join(outDir, 'api/manifest.json');
+  const { proof: _proof, ...manifest } = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.documents = { ...(manifest.documents || {}), [key]: { sha256: documentFingerprint(signed) } };
+  fs.writeFileSync(manifestPath, JSON.stringify(signDocument(manifest, did, privateKeyPem)));
+}
 
 describe('Webring Schema, DID Identity & Ed25519 Signatures', () => {
   it('converts website URLs into standard W3C / ATProto did:web identifiers', () => {
@@ -184,7 +233,7 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
 
   afterEach(() => {
     if (fs.existsSync(tempRoot)) {
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      removeTempDir(tempRoot);
     }
   });
 
@@ -421,13 +470,13 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
     aliceDb.close();
     bobDb.close();
     if (fs.existsSync(carolDir)) {
-      fs.rmSync(carolDir, { recursive: true, force: true });
+      removeTempDir(carolDir);
     }
   });
 
   it('compartmentalizes multiple online personas with isolated SQLite DBs, Ed25519 keys, DIDs, and friend graphs', () => {
     const userDataDir = path.join(tempRoot, 'multi-persona-studio');
-    const manager = new PersonaManager(userDataDir);
+    const manager = new PersonaManager(userDataDir, { keyCipher: TEST_CIPHER });
 
     try {
       // 1. Default persona is initialized automatically
@@ -751,13 +800,16 @@ describe('Two-Peer Pull Federation, Static Site Generation & Endorsement Discove
       // Overall crawl signature verification must fail because items.json was tampered with
       expect(tamperedCrawl.verifiedSignature).toBe(false);
 
-      // Photos from untampered albums.json remain verified, while tampered items/endorsements are marked unverified!
+      // Photos from untampered albums.json remain verified. The tampered items.json is unverified, so it
+      // can't overwrite the verified copies already stored: the original post and endorsement stay.
       const feedAfterTamper = aliceDb.getNetworkFeed();
       const photoEntry = aliceDb.getFeedAlbumPhotos(bobAlbum.canonicalUrl)[0];
       const itemEntry = feedAfterTamper.find((e) => e.entryType === 'like');
       expect(photoEntry?.verifiedSignature).toBe(true);
-      expect(itemEntry?.verifiedSignature).toBe(false);
-      expect(aliceDb.getEndorsements()[0]?.verifiedSignature).toBe(false);
+      expect(itemEntry?.verifiedSignature).toBe(true);
+      expect(itemEntry?.commentary).not.toContain('TAMPERED');
+      expect(JSON.stringify(aliceDb.getNetworkFeed())).not.toContain('TAMPERED');
+      expect(aliceDb.getEndorsements()[0]?.verifiedSignature).toBe(true);
 
       // 4. FIX-04: Simulate domain hijack / key swap on Bob's site with a rogue Ed25519 keypair
       const rogueDir = path.join(tempRoot, 'bob-rogue');
@@ -1113,7 +1165,7 @@ describe('Feed Integrity, Moderation & Publish Snapshot', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const makeSite = (name: string) => {
@@ -1141,12 +1193,7 @@ describe('Feed Integrity, Moderation & Publish Snapshot', () => {
       const itemsPath = path.join(mallory.outDir, 'api/items.json');
       const { proof: _proof, ...itemsDoc } = JSON.parse(fs.readFileSync(itemsPath, 'utf8'));
       itemsDoc.items[0].canonicalUrl = carolPost.canonicalUrl;
-      const resigned = signDocument(
-        itemsDoc,
-        siteUrlToDidWeb(mallory.siteUrl),
-        mallory.db.getKeys().privateKeyPem
-      );
-      fs.writeFileSync(itemsPath, JSON.stringify(resigned));
+      republishDocument(mallory.outDir, 'api/items.json', 'items', itemsDoc, mallory.siteUrl, mallory.db.getKeys().privateKeyPem);
 
       const res = await new RingCrawler(alice.db).crawlFriendSite(mallory.siteUrl, mallory.outDir);
       expect(res.success).toBe(true);
@@ -1310,7 +1357,7 @@ describe('Private Key Encryption at Rest', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   // Stand-in for Electron safeStorage: reversible, and obviously not plaintext
@@ -1348,7 +1395,7 @@ describe('Private Key Encryption at Rest', () => {
   it('seals publishing credentials, never returns them from getProfile, and keeps them through the form', () => {
     // An older install stored them in plaintext
     const legacy = new StudioDatabase(tempRoot, 'creds.sqlite');
-    legacy.updateProfile({ publishSettings: { password: 'sftp-secret', githubToken: 'ghp_legacy' } });
+    legacy.updateProfile({ publishSettings: { password: 'sftp-secret', githubToken: 'ghp_legacy' } }, { allowPlaintext: true });
     legacy.close();
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
@@ -1438,10 +1485,13 @@ describe('Loopback MCP HTTP Settings', () => {
 
       expect(secondStatus.port).toBe(firstStatus.port);
       expect(secondStatus.authorizedSseUrl).toBe(firstStatus.authorizedSseUrl);
-      expect((fs.statSync(settingsPath).mode & 0o777).toString(8)).toBe('600');
+      // Windows has no POSIX permission bits (Node reports 666 for any writable file)
+      if (process.platform !== 'win32') {
+        expect((fs.statSync(settingsPath).mode & 0o777).toString(8)).toBe('600');
+      }
     } finally {
       manager.closeAll();
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      removeTempDir(tempRoot);
     }
   });
 });
@@ -1487,13 +1537,18 @@ describe('SSRF Guard for Peer Crawling', () => {
   });
 
   it('refuses to fetch loopback addresses by IP or hostname', async () => {
+    // Plain http:// is refused first, outside dev mode
     await expect(defaultJsonFetcher(`http://127.0.0.1:${port}/api/manifest.json`)).rejects.toThrow(
+      /Refusing insecure http:\/\//
+    );
+    // https:// reaches the private-address guard, which refuses before connecting
+    await expect(defaultJsonFetcher(`https://127.0.0.1:${port}/api/manifest.json`)).rejects.toThrow(
       /private or local network address/
     );
-    await expect(defaultJsonFetcher(`http://localhost:${port}/api/manifest.json`)).rejects.toThrow(
+    await expect(defaultJsonFetcher(`https://localhost:${port}/api/manifest.json`)).rejects.toThrow(
       /private or local network address/
     );
-    await expect(defaultJsonFetcher(`http://[::1]:${port}/x`)).rejects.toThrow(
+    await expect(defaultJsonFetcher(`https://[::1]:${port}/x`)).rejects.toThrow(
       /private or local network address/
     );
   });
@@ -1502,7 +1557,7 @@ describe('SSRF Guard for Peer Crawling', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-ssrf-'));
     const db = new StudioDatabase(dir, 'ssrf.sqlite');
     try {
-      const res = await new RingCrawler(db).crawlFriendSite(`http://127.0.0.1:${port}`);
+      const res = await new RingCrawler(db).crawlFriendSite(`https://127.0.0.1:${port}`);
       expect(res.success).toBe(false);
       expect(res.error).toMatch(/private or local network address/);
 
@@ -1512,7 +1567,7 @@ describe('SSRF Guard for Peer Crawling', () => {
       });
     } finally {
       db.close();
-      fs.rmSync(dir, { recursive: true, force: true });
+      removeTempDir(dir);
     }
   });
 });
@@ -1556,7 +1611,7 @@ describe('Curated Webrings (hosted rings, signed requests, sync)', () => {
 
   afterEach(() => {
     for (const { db } of sites.values()) db.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('joins a ring end to end: signed request, approval, membership on both sides', async () => {
@@ -1959,7 +2014,7 @@ describe('Scheduled Sync & Publish', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const local = (y: number, mo: number, d: number, h: number, mi: number) => new Date(y, mo - 1, d, h, mi, 0, 0);
@@ -2195,7 +2250,7 @@ describe('Auto-publish after changes', () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const ok = (message: string): JobResult => ({ at: new Date().toISOString(), status: 'ok', message });
@@ -2429,7 +2484,7 @@ describe('Release defaults (no sample content)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('starts new installs empty, with a placeholder profile', () => {
@@ -2543,7 +2598,7 @@ describe('Media Library', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   /** A JPEG with an EXIF block (orientation + a fake GPS marker) like a phone photo. */
@@ -2582,16 +2637,16 @@ describe('Media Library', () => {
     return { db, library, generator, publisher: new SitePublisher(generator), dir };
   };
 
-  it('cleans up a post image that was replaced, removed or deleted with its post', () => {
+  it('cleans up a post image that was replaced, removed or deleted with its post', async () => {
     const site = makeSite('posts');
-    const image = (name: string, seed: number) => {
+    const image = async (name: string, seed: number) => {
       const file = path.join(tempRoot, name);
       fs.writeFileSync(file, makePhoneJpeg(600, 400, 1, seed));
-      return site.library.importPhoto(file, 'wall-posts').url;
+      return (await site.library.importPhoto(file, 'wall-posts')).url;
     };
-    const first = image('one.jpg', 1);
+    const first = await image('one.jpg', 1);
     const post = site.db.createItem({ type: 'post', commentary: 'Look', mediaUrl: first });
-    const second = image('two.jpg', 2);
+    const second = await image('two.jpg', 2);
     site.db.updateItem(post.id, { mediaUrl: second });
     cleanUpLibrary(site.db, site.library);
     expect(fs.existsSync(site.library.resolveLocalUrl(first)!)).toBe(false);
@@ -2602,22 +2657,22 @@ describe('Media Library', () => {
     site.db.close();
   });
 
-  it('keeps exactly one uploaded profile photo and banner, replacing the old file', () => {
+  it('keeps exactly one uploaded profile photo and banner, replacing the old file', async () => {
     const site = makeSite('prof');
     const write = (name: string, jpeg: Buffer) => {
       const file = path.join(tempRoot, name);
       fs.writeFileSync(file, jpeg);
       return file;
     };
-    const firstAvatar = setProfileImageFromFile(site.db, site.library, 'avatar', write('a1.jpg', makePhoneJpeg(1600, 1200, 6, 1)));
+    const firstAvatar = await setProfileImageFromFile(site.db, site.library, 'avatar', write('a1.jpg', makePhoneJpeg(1600, 1200, 6, 1)));
     expect(firstAvatar).toMatch(/^media\/profile\/avatar-[0-9a-f]{20}\.jpg$/);
     const firstFile = site.library.resolveLocalUrl(firstAvatar)!;
     const decoded = jpegJs.decode(fs.readFileSync(firstFile));
     expect([decoded.width, decoded.height]).toEqual([600, 800]); // upright (orientation 6), fits 800
     expect(fs.readFileSync(firstFile).includes(Buffer.from('GPS-SECRET'))).toBe(false);
 
-    const banner = setProfileImageFromFile(site.db, site.library, 'banner', write('b.jpg', makePhoneJpeg(3000, 1000, 1, 3)));
-    const avatar = setProfileImageFromFile(site.db, site.library, 'avatar', write('a2.jpg', makePhoneJpeg(1600, 1200, 1, 2)));
+    const banner = await setProfileImageFromFile(site.db, site.library, 'banner', write('b.jpg', makePhoneJpeg(3000, 1000, 1, 3)));
+    const avatar = await setProfileImageFromFile(site.db, site.library, 'avatar', write('a2.jpg', makePhoneJpeg(1600, 1200, 1, 2)));
     expect(avatar).not.toBe(firstAvatar);
     expect(fs.existsSync(firstFile)).toBe(false); // the old upload is gone
     expect(site.db.getProfile()).toMatchObject({ avatarUrl: avatar, bannerUrl: banner });
@@ -2630,7 +2685,7 @@ describe('Media Library', () => {
 
     // Switching to an album photo removes the uploaded file; the photo stays while it's in use
     const album = site.db.createAlbum({ title: 'Me' });
-    const report = importPhotosIntoAlbum(site.db, site.library, album.id, [write('me.jpg', makePhoneJpeg(900, 900, 1, 4))]);
+    const report = await importPhotosIntoAlbum(site.db, site.library, album.id, [write('me.jpg', makePhoneJpeg(900, 900, 1, 4))]);
     const photo = site.db.getAlbums()[0].photos[0];
     site.db.updateProfile({ avatarUrl: photo.thumbUrl });
     cleanUpLibrary(site.db, site.library);
@@ -2640,13 +2695,13 @@ describe('Media Library', () => {
     site.db.close();
   });
 
-  it('publishes upright, resized, metadata-free copies and keeps the original locally', () => {
+  it('publishes upright, resized, metadata-free copies and keeps the original locally', async () => {
     const source = path.join(tempRoot, 'phone.jpg');
     fs.writeFileSync(source, makePhoneJpeg(3000, 1000, 6));
     expect(readJpegOrientation(fs.readFileSync(source))).toBe(6);
 
     const library = new MediaLibrary(path.join(tempRoot, 'store'));
-    const media = library.importPhoto(source, 'album-1');
+    const media = await library.importPhoto(source, 'album-1');
     // Orientation 6 = rotate 90°, so a 3000x1000 landscape becomes portrait, then fits 2048
     expect([media.width, media.height]).toEqual([683, 2048]);
     expect(Math.max(media.thumbWidth, media.thumbHeight)).toBe(480);
@@ -2662,18 +2717,18 @@ describe('Media Library', () => {
     png.data.fill(0);
     const pngPath = path.join(tempRoot, 'logo.png');
     fs.writeFileSync(pngPath, PNG.sync.write(png));
-    const pngMedia = library.importPhoto(pngPath, 'album-1');
+    const pngMedia = await library.importPhoto(pngPath, 'album-1');
     expect(pngMedia.mimeType).toBe('image/png');
     expect(PNG.sync.read(fs.readFileSync(library.resolveLocalUrl(pngMedia.url)!)).data[3]).toBe(0);
 
     // Other formats are refused with a clear message, and paths can't escape the library
     const gif = path.join(tempRoot, 'anim.gif');
     fs.writeFileSync(gif, 'GIF89a....');
-    expect(() => library.importPhoto(gif, 'album-1')).toThrow(UnsupportedImageError);
+    await expect(library.importPhoto(gif, 'album-1')).rejects.toThrow(UnsupportedImageError);
     expect(library.resolveLocalUrl('media/../../etc/passwd')).toBeNull();
   });
 
-  it('exports albums with signed manifests and reflects replaced and removed photos', () => {
+  it('exports albums with signed manifests and reflects replaced and removed photos', async () => {
     const site = makeSite('alice');
     const album = site.db.createAlbum({ title: 'Trip' });
     const files = [0, 1].map((n) => {
@@ -2681,13 +2736,14 @@ describe('Media Library', () => {
       fs.writeFileSync(f, makePhoneJpeg(64, 48, 1, n * 50));
       return f;
     });
-    const report = importPhotosIntoAlbum(site.db, site.library, album.id, files);
+    const report = await importPhotosIntoAlbum(site.db, site.library, album.id, files);
     expect(report.added).toHaveLength(2);
 
     const out = path.join(tempRoot, 'export');
     fs.mkdirSync(path.join(out, 'media/albums/old'), { recursive: true });
     fs.writeFileSync(path.join(out, 'README.md'), 'mine'); // not Studio's: must survive
     fs.writeFileSync(path.join(out, 'media/albums/old/stale.jpg'), 'old'); // Studio's old photo area
+    fs.writeFileSync(path.join(out, '.webring-studio'), 'webring-studio\n'); // a folder Studio published before
     expect(site.publisher.publishToLocalDirectory(out).success).toBe(true);
 
     const manifestPath = path.join(out, `media/albums/${album.id}/manifest.json`);
@@ -2708,7 +2764,7 @@ describe('Media Library', () => {
     const [first, second] = manifest.photos;
     const replacement = path.join(tempRoot, 'new.jpg');
     fs.writeFileSync(replacement, makePhoneJpeg(64, 48, 1, 200));
-    replacePhotoImage(site.db, site.library, first.id, replacement);
+    await replacePhotoImage(site.db, site.library, first.id, replacement);
     site.publisher.publishToLocalDirectory(out);
     const afterReplace = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const replaced = afterReplace.photos.find((p: { id: string }) => p.id === first.id);
@@ -2732,7 +2788,7 @@ describe('Media Library', () => {
     const album = site.db.createAlbum({ title: 'Remote' });
     const photoFile = path.join(tempRoot, 'r.jpg');
     fs.writeFileSync(photoFile, makePhoneJpeg(40, 30, 1));
-    importPhotosIntoAlbum(site.db, site.library, album.id, [photoFile]);
+    await importPhotosIntoAlbum(site.db, site.library, album.id, [photoFile]);
 
     const remote = new Map<string, Buffer>([['notes/keep.txt', Buffer.from('user file')]]);
     const uploads: string[] = [];
@@ -2843,7 +2899,7 @@ describe('Media Library', () => {
     const album = site.db.createAlbum({ title: 'GH' });
     const f = path.join(tempRoot, 'g.jpg');
     fs.writeFileSync(f, makePhoneJpeg(40, 30, 1));
-    importPhotosIntoAlbum(site.db, site.library, album.id, [f]);
+    await importPhotosIntoAlbum(site.db, site.library, album.id, [f]);
     const photo = site.db.getAlbums()[0].photos[0];
 
     const first = await site.publisher.publishToGitHubPages(settings, fs.mkdtempSync(path.join(tempRoot, 'gh-')));
@@ -2869,7 +2925,7 @@ describe('Media Library', () => {
     site.db.close();
   });
 
-  it('upgrades photos imported before the Media Library, once', () => {
+  it('upgrades photos imported before the Media Library, once', async () => {
     const site = makeSite('dave');
     const album = site.db.createAlbum({ title: 'Old' });
     const legacyDir = path.join(site.library.rootDir, 'albums', album.id);
@@ -2877,12 +2933,12 @@ describe('Media Library', () => {
     fs.writeFileSync(path.join(legacyDir, 'photo-123.jpg'), makePhoneJpeg(100, 80, 1));
     site.db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/${album.id}/photo-123.jpg` });
 
-    expect(optimizeLegacyPhotos(site.db, site.library)).toBe(1);
+    expect(await optimizeLegacyPhotos(site.db, site.library)).toBe(1);
     const photo = site.db.getAlbums()[0].photos[0];
     expect(photo.sha256).toBeTruthy();
     expect(photo.url).not.toContain('photo-123');
     expect(fs.existsSync(path.join(legacyDir, 'photo-123.jpg'))).toBe(false);
-    expect(optimizeLegacyPhotos(site.db, site.library)).toBe(0);
+    expect(await optimizeLegacyPhotos(site.db, site.library)).toBe(0);
     site.db.close();
   });
 
@@ -2894,7 +2950,7 @@ describe('Media Library', () => {
       fs.writeFileSync(f, makePhoneJpeg(32, 32, 1, n * 70));
       return f;
     });
-    importPhotosIntoAlbum(owner.db, owner.library, album.id, files);
+    await importPhotosIntoAlbum(owner.db, owner.library, album.id, files);
     const out = path.join(tempRoot, 'erin-site');
     owner.publisher.publishToLocalDirectory(out);
 
@@ -2906,7 +2962,7 @@ describe('Media Library', () => {
 
     const replacement = path.join(tempRoot, 'swap.jpg');
     fs.writeFileSync(replacement, makePhoneJpeg(32, 32, 1, 222));
-    replacePhotoImage(owner.db, owner.library, keep.id, replacement);
+    await replacePhotoImage(owner.db, owner.library, keep.id, replacement);
     deletePhotoWithFiles(owner.db, owner.library, drop.id);
     owner.publisher.publishToLocalDirectory(out);
     await crawler.crawlFriendSite('https://erin.example', out);
@@ -2928,7 +2984,7 @@ describe('History window: published archives, feed window, conditional sync, sav
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const DAY = 86400000;
@@ -3221,7 +3277,7 @@ describe('Media Library references', () => {
       expect(fs.existsSync(path.join(out, 'media/albums/wall-posts/post.jpg'))).toBe(true);
       db.close();
     } finally {
-      fs.rmSync(tempRoot, { recursive: true, force: true });
+      removeTempDir(tempRoot);
     }
   });
 });
@@ -3278,7 +3334,7 @@ describe('Site Design (look & feel, page layout)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const blockOrder = (html: string) => [...html.matchAll(/data-block="([a-z]+)"/g)].map((m) => m[1]);
@@ -3706,7 +3762,7 @@ describe('Letting people know you added them (friend notices, mutual, "Added you
   afterEach(() => {
     vi.useRealTimers();
     for (const { db } of sites.values()) db.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('sends a signed "I added you" link that the recipient verifies, keeps and can add back', async () => {
@@ -3888,7 +3944,7 @@ describe('Sync at scale', () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const makePersona = (name: string) => {
@@ -4018,7 +4074,7 @@ describe('One request per unchanged friend (manifest fingerprints)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const DOCS = ['.well-known/did.json', 'api/manifest.json', 'api/profile.json', 'api/albums.json', 'api/items.json', 'api/connections.json'];
@@ -4223,7 +4279,7 @@ describe('Album cards', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   it('stores album settings and a stable, unique slug', () => {
@@ -4482,7 +4538,7 @@ describe('Album feed cards (syncing friends)', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   const DAY = 86400000;
@@ -4640,7 +4696,7 @@ describe('Album feed cards (syncing friends)', () => {
         delete a.slug;
         delete a.pageUrl;
       }
-      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+      republishDocument(carol.outDir, 'api/albums.json', 'albums', doc, carol.siteUrl, carol.db.getKeys().privateKeyPem);
 
       const res = await crawl(alice, carol);
       expect(res.verifiedSignature).toBe(true);
@@ -4707,7 +4763,7 @@ describe('Album feed cards (syncing friends)', () => {
       const albumsPath = path.join(mallory.outDir, 'api/albums.json');
       const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
       doc.albums[0].canonicalUrl = album.canonicalUrl;
-      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(mallory.siteUrl), mallory.db.getKeys().privateKeyPem)));
+      republishDocument(mallory.outDir, 'api/albums.json', 'albums', doc, mallory.siteUrl, mallory.db.getKeys().privateKeyPem);
 
       const res = await crawl(alice, mallory);
       expect(res.verifiedSignature).toBe(true);
@@ -4736,7 +4792,7 @@ describe('Album feed cards (syncing friends)', () => {
       const albumsPath = path.join(carol.outDir, 'api/albums.json');
       const { proof: _proof, ...doc } = JSON.parse(fs.readFileSync(albumsPath, 'utf8'));
       doc.albums[0].pageUrl = 'https://evil.example/phish/';
-      fs.writeFileSync(albumsPath, JSON.stringify(signDocument(doc, siteUrlToDidWeb(carol.siteUrl), carol.db.getKeys().privateKeyPem)));
+      republishDocument(carol.outDir, 'api/albums.json', 'albums', doc, carol.siteUrl, carol.db.getKeys().privateKeyPem);
 
       const res = await crawl(alice, carol);
       expect(res.verifiedSignature).toBe(true);
@@ -4793,7 +4849,7 @@ describe('Published page freshness and the Studio preview', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   const makeSite = () => {
@@ -4893,7 +4949,7 @@ describe('Editing friend details', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   it('updates a friend in place, allows clearing optional fields, and cleans up old feed data when siteUrl changes', async () => {
@@ -4981,7 +5037,7 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
   });
 
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   it('verifies planned Ed25519 key rotations (single-hop and multi-hop) while rejecting forged certificates, and supports emergency re-pinning', async () => {
@@ -5093,11 +5149,15 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
     // Pinned key remains Alice's legitimate Key 4
     expect(bobDb.getSiteKey('https://alice.ring.test')?.publicKeyPem).toBe(rot3.publicKeyPem);
 
-    // 5. Emergency recovery: Bob explicitly trusts a new key after out-of-band verification
-    // Restore legitimate export with a brand-new uncertified keypair
-    const recoveredFriend = bobDb.trustNewFriendKey(friendRecord.id);
-    expect(recoveredFriend.keyStatus).toBe('unverified');
-    expect(bobDb.getSiteKey('https://alice.ring.test')).toBeUndefined();
+    // 5. Emergency recovery: Bob trusts the new key only after reviewing its fingerprint (phase 6:
+    // no more "clear the pin and take whatever comes next")
+    const changed = bobDb.getFriendBySiteUrl('https://alice.ring.test')!;
+    expect(changed.candidateFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(() => bobDb.trustNewFriendKey(friendRecord.id, 'deadbeef')).toThrow(/doesn't match/);
+    const recoveredFriend = bobDb.trustNewFriendKey(friendRecord.id, changed.candidateFingerprint!);
+    expect(recoveredFriend.keyStatus).toBe('pinned');
+    expect(recoveredFriend.candidateFingerprint).toBeUndefined();
+    expect(spkiFingerprint(bobDb.getSiteKey('https://alice.ring.test')!.publicKeyPem)).toBe(changed.candidateFingerprint);
 
     aliceDb.close();
     bobDb.close();
@@ -5295,7 +5355,7 @@ describe('Guided setup: GitHub sign-in, site creation, publish and live check', 
   let dir: string;
   let managers: PersonaManager[] = [];
   const openManager = () => {
-    const manager = new PersonaManager(dir);
+    const manager = new PersonaManager(dir, { keyCipher: TEST_CIPHER });
     managers.push(manager);
     return manager;
   };
@@ -5308,7 +5368,7 @@ describe('Guided setup: GitHub sign-in, site creation, publish and live check', 
     vi.unstubAllGlobals();
     for (const manager of managers) manager.getActiveContext().db.close();
     managers = [];
-    fs.rmSync(dir, { recursive: true, force: true });
+    removeTempDir(dir);
   });
 
   /** A scripted GitHub device-flow endpoint: each poll returns the next answer. */
@@ -5624,7 +5684,8 @@ describe('Webring Hubs (optional third-party index)', () => {
         const row = listed.get(did);
         if (!row) return { status: 404, json: { error: 'not_found', message: 'No such entry.' } };
         const body = init.body as { siteUrl: string; nonce: string; createdAt: string; signature: string };
-        const payload = { action: 'remove', siteUrl: row.siteUrl, did, nonce: body.nonce, createdAt: body.createdAt };
+        // The real hub binds the signature to its own address, so a removal can't be replayed elsewhere
+        const payload = { action: 'remove', siteUrl: row.siteUrl, did, hubUrl: HUB, nonce: body.nonce, createdAt: body.createdAt };
         const ok = crypto.verify(
           null,
           Buffer.from(canonicalizeJson(payload), 'utf8'),
@@ -5660,7 +5721,7 @@ describe('Webring Hubs (optional third-party index)', () => {
 
   afterEach(() => {
     db.close();
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('adds a hub only after it answers /api/info, unlisted by default, https only', async () => {
@@ -5920,7 +5981,7 @@ describe('Webring Hubs (optional third-party index)', () => {
 
   it('sends hub API calls through the private-network guard', async () => {
     await expect(
-      requestPublicJson('http://127.0.0.1:9/api/entries', { method: 'POST', body: { siteUrl: SITE } })
+      requestPublicJson('https://127.0.0.1:9/api/entries', { method: 'POST', body: { siteUrl: SITE } })
     ).rejects.toThrow(/private or local network address/);
   });
 
@@ -6091,7 +6152,7 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('requires the access token on every MCP HTTP route even without an Origin header', async () => {
@@ -6152,7 +6213,7 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
     });
     mcpServer.attachScheduler(scheduler);
     mcpServer.attachAppServices({
-      publishPaths: () => ({}),
+      publishPaths: () => ({ userDataDir: os.tmpdir(), tempDir: os.tmpdir() }),
       deviceLogin: { start: async () => ({}), poll: async () => ({ status: 'pending' }) } as never,
       onLocalChange: (personaId, reason, opts) => {
         autoPub.noteLocalChange(personaId, reason, opts);
@@ -6225,7 +6286,8 @@ describe('Security Phase 2: MCP Auth, Read-Only/Confirmation Policy, and Verific
         publicKeyEncoding: { type: 'spki', format: 'pem' },
         privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
       });
-      friendDb.db
+      // Reaches into the friend's database directly, as a hijacker of their site would
+      (friendDb as unknown as { db: DatabaseSync }).db
         .prepare('UPDATE profile SET public_key_pem = ?, private_key_pem = ?, display_name = ? WHERE id = 1')
         .run(newKeys.publicKey, newKeys.privateKey, 'Hijacked Name');
       new StaticSiteGenerator(friendDb).generateToDirectory(friendOut);
@@ -6264,7 +6326,7 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('pins SFTP host key fingerprints on first use and fails closed on change', async () => {
@@ -6282,7 +6344,7 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
   });
 
   it('isolates MCP personaId calls without switching the app active persona and redacts proxy credentials', async () => {
-    const manager = new PersonaManager(path.join(tempRoot, 'iso'));
+    const manager = new PersonaManager(path.join(tempRoot, 'iso'), { keyCipher: TEST_CIPHER });
     const created = manager.createPersona({
       label: 'Alt',
       displayName: 'Alt Persona',
@@ -6386,9 +6448,14 @@ describe('Security Phase 3: Transport, Isolation, Integrity, and Secrets', () =>
         createdAt: '2026-11-16T11:00:00.000Z',
         verifiedSignature: false,
       });
+      // Rows are scoped per friend (phase 6): Mallory's write is a separate row of Mallory's and
+      // can't touch Alice's, and Alice's unverified copy doesn't replace her verified one
       const feed = myDb.getNetworkFeed();
-      expect(feed).toHaveLength(1);
-      expect(feed[0].commentary).toBe('Verified content');
+      const alices = feed.filter((e) => e.friendSiteUrl === 'https://alice.sec.test');
+      expect(alices).toHaveLength(1);
+      expect(alices[0].commentary).toBe('Verified content');
+      expect(alices[0].verifiedSignature).toBe(true);
+      expect(feed.filter((e) => e.friendSiteUrl === 'https://mallory.sec.test')).toHaveLength(1);
     } finally {
       myDb.close();
       friendDb.close();
@@ -6404,7 +6471,7 @@ describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', ()
   });
 
   afterEach(() => {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    removeTempDir(tempRoot);
   });
 
   it('blocks IPv6 transition and documentation ranges in networkGuard', () => {
@@ -6450,9 +6517,9 @@ describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', ()
       expect(db.pinSiteKey('https://peer.p4.test', 'did:web:peer.p4.test', rewrapped)).toBe('pinned');
 
       // Candidate key mismatch is refused when trusting
-      db.setCandidateSiteKey('https://peer.p4.test', keys2.publicKey);
-      expect(() => db.trustNewFriendKey(friend.id, keys1.publicKey)).toThrow(/candidate key/);
-      expect(db.trustNewFriendKey(friend.id, keys2.publicKey).keyStatus).toBe('pinned');
+      db.recordFriendCandidateKey('https://peer.p4.test', keys2.publicKey);
+      expect(() => db.trustNewFriendKey(friend.id, spkiFingerprint(keys1.publicKey))).toThrow(/candidate key/);
+      expect(db.trustNewFriendKey(friend.id, spkiFingerprint(keys2.publicKey)).keyStatus).toBe('pinned');
 
       // Exported connections.json omits lastCrawledAt
       db.updateProfile({
@@ -6501,5 +6568,525 @@ describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', ()
     } finally {
       await server.stop();
     }
+  });
+});
+
+describe('Security Phase 6: upgrade migrations', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  /** Alice's published site with one post, for a friend to sync. */
+  const publishAlice = () => {
+    const aliceDb = new StudioDatabase(path.join(tempRoot, 'alice'), 'alice.sqlite');
+    aliceDb.updateProfile({ siteUrl: 'https://alice.p6.test', displayName: 'Alice' });
+    const post = aliceDb.createItem({ type: 'post', title: 'New title', commentary: 'Hello from the new build' });
+    const out = path.join(tempRoot, 'alice-out');
+    new StaticSiteGenerator(aliceDb).generateToDirectory(out);
+    return { aliceDb, post, out };
+  };
+
+  /**
+   * A persona database as builds before phase 3 left it: feed and endorsement rows unique per URL
+   * across all friends, with the old 10-hex-digit ids.
+   */
+  const writeV0Database = (
+    dir: string,
+    rows: {
+      feed: Array<{ id: string; friend: string; title: string; url: string; createdAt: string; verified: boolean }>;
+      endorsements: Array<{ id: string; target: string; author: string; url: string; createdAt: string }>;
+    }
+  ) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const raw = new DatabaseSync(path.join(dir, 'legacy.sqlite'));
+    raw.exec(`
+      CREATE TABLE endorsements (
+        id TEXT PRIMARY KEY,
+        target_canonical_url TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        author_avatar_url TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        source_item_url TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE network_feed (
+        id TEXT PRIMARY KEY,
+        friend_site_url TEXT NOT NULL,
+        friend_name TEXT NOT NULL,
+        friend_avatar_url TEXT NOT NULL DEFAULT '',
+        friend_did TEXT NOT NULL DEFAULT '',
+        entry_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        canonical_url TEXT NOT NULL UNIQUE,
+        target_url TEXT NOT NULL,
+        commentary TEXT NOT NULL DEFAULT '',
+        media_url TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        verified_signature INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const feed = raw.prepare(
+      `INSERT INTO network_feed (id, friend_site_url, friend_name, entry_type, title, canonical_url, target_url, created_at, verified_signature)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const r of rows.feed) feed.run(r.id, r.friend, 'Alice', 'post', r.title, r.url, '', r.createdAt, r.verified ? 1 : 0);
+    const end = raw.prepare(
+      `INSERT INTO endorsements (id, target_canonical_url, author_site_url, author_name, type, source_item_url, created_at, verified_signature)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+    );
+    for (const r of rows.endorsements) end.run(r.id, r.target, r.author, 'Alice', 'like', r.url, r.createdAt);
+    raw.close();
+  };
+
+  it('upgrades a pre-phase-3 database: ids recomputed, and sync updates, prunes and reports no error', async () => {
+    const { aliceDb, post, out } = publishAlice();
+    const bobDir = path.join(tempRoot, 'bob');
+    const gone = 'https://alice.p6.test/posts/deleted';
+    writeV0Database(bobDir, {
+      feed: [
+        { id: 'feed-0123456789', friend: 'https://alice.p6.test', title: 'Old title', url: post.canonicalUrl, createdAt: post.createdAt, verified: true },
+        { id: 'feed-abcdef0123', friend: 'https://alice.p6.test', title: 'Removed post', url: gone, createdAt: post.createdAt, verified: true },
+      ],
+      endorsements: [
+        { id: 'end-0123456789', target: 'https://bob.p6.test/posts/1', author: 'https://alice.p6.test', url: 'https://alice.p6.test/likes/1', createdAt: '2026-01-01T00:00:00.000Z' },
+      ],
+    });
+
+    const bobDb = new StudioDatabase(bobDir, 'legacy.sqlite');
+    try {
+      expect(bobDb.getSchemaVersion()).toBeGreaterThanOrEqual(1);
+      const ids = bobDb.getNetworkFeed().map((e) => e.id).sort();
+      expect(ids).toEqual([feedRowId('https://alice.p6.test', post.canonicalUrl), feedRowId('https://alice.p6.test', gone)].sort());
+      expect(bobDb.getEndorsements()[0].id).toBe(endorsementRowId('https://alice.p6.test', 'https://alice.p6.test/likes/1'));
+
+      bobDb.updateProfile({ siteUrl: 'https://bob.p6.test', displayName: 'Bob' });
+      const res = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(res.success).toBe(true);
+      expect(res.documentErrors).toBeUndefined();
+      const feed = bobDb.getNetworkFeed().filter((e) => e.friendSiteUrl === 'https://alice.p6.test');
+      // The old row is updated in place (the bug left it frozen), and the removed post is pruned
+      expect(feed.map((e) => e.canonicalUrl)).toEqual([post.canonicalUrl]);
+      expect(feed[0].title).toBe('New title');
+      expect(bobDb.getFriendBySiteUrl('https://alice.p6.test')?.lastSyncError).toBeUndefined();
+    } finally {
+      bobDb.close();
+      aliceDb.close();
+    }
+
+    // Opening again doesn't run the upgrade a second time
+    const reopened = new StudioDatabase(bobDir, 'legacy.sqlite');
+    try {
+      expect(reopened.getNetworkFeed().map((e) => e.title)).toEqual(['New title']);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('gives two friends that publish the same canonical URL a row each', () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'two'), 'two.sqlite');
+    try {
+      for (const friend of ['https://a.p6.test', 'https://b.p6.test']) {
+        db.upsertNetworkFeedEntry({
+          friendSiteUrl: friend,
+          friendName: friend,
+          friendAvatarUrl: '',
+          friendDid: '',
+          entryType: 'post',
+          title: friend,
+          canonicalUrl: 'https://shared.p6.test/post',
+          targetUrl: '',
+          commentary: '',
+          mediaUrl: '',
+          tags: [],
+          createdAt: '2026-11-01T00:00:00.000Z',
+          verifiedSignature: true,
+        });
+      }
+      expect(db.getNetworkFeed().map((e) => e.friendSiteUrl).sort()).toEqual(['https://a.p6.test', 'https://b.p6.test']);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('reports a broken items.json as a sync problem, and clears it once the file is fixed', async () => {
+    const { aliceDb, out } = publishAlice();
+    const bobDb = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    try {
+      bobDb.updateProfile({ siteUrl: 'https://bob.p6.test', displayName: 'Bob', publishSettings: { publishFriendsList: true } });
+      const itemsPath = path.join(out, 'api/items.json');
+      const good = fs.readFileSync(itemsPath, 'utf8');
+      fs.writeFileSync(itemsPath, '{ "items": [ not json', 'utf8');
+
+      const broken = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(broken.success).toBe(true);
+      expect(broken.documentErrors).toHaveLength(1);
+      expect(broken.documentErrors![0].doc).toBe('items.json');
+      const friend = bobDb.getFriendBySiteUrl('https://alice.p6.test')!;
+      expect(friend.lastSyncError).toMatch(/^items\.json: /);
+      expect(friend.lastSyncErrorAt).toBeTruthy();
+
+      // Local only: never in the published friends list
+      bobDb.addOrUpdateFriend({ siteUrl: 'https://alice.p6.test', displayName: 'Alice', visibility: 'public' });
+      const exported = bobDb.buildSignedSiteBundle({ publish: true }).connections.friends;
+      expect(exported).toHaveLength(1);
+      expect(JSON.stringify(exported)).not.toMatch(/lastSyncError|items\.json/);
+
+      // A missing document is normal, not a problem
+      fs.rmSync(itemsPath);
+      const missing = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(missing.documentErrors).toBeUndefined();
+      expect(bobDb.getFriendBySiteUrl('https://alice.p6.test')?.lastSyncError).toBeUndefined();
+
+      fs.writeFileSync(itemsPath, '{ "items": [ not json', 'utf8');
+      await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      fs.writeFileSync(itemsPath, good, 'utf8');
+      const fixed = await new RingCrawler(bobDb).crawlFriendSite('https://alice.p6.test', out);
+      expect(fixed.documentErrors).toBeUndefined();
+      expect(bobDb.getFriendBySiteUrl('https://alice.p6.test')?.lastSyncError).toBeUndefined();
+    } finally {
+      bobDb.close();
+      aliceDb.close();
+    }
+  });
+});
+
+describe('Security Phase 6: rollback protection for every document', () => {
+  let tempRoot: string;
+  const ALICE = 'https://alice.rb.test';
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-rollback-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  const tick = () => new Promise((r) => setTimeout(r, 15));
+
+  /** Alice's site, published into one folder; `snapshot` copies the current state aside. */
+  const makeAlice = () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'alice'), 'alice.sqlite');
+    db.updateProfile({ siteUrl: ALICE, displayName: 'Alice' });
+    const out = path.join(tempRoot, 'alice-out');
+    const publish = () => new StaticSiteGenerator(db).generateToDirectory(out);
+    const snapshot = (name: string) => {
+      const copy = path.join(tempRoot, name);
+      fs.cpSync(out, copy, { recursive: true });
+      return copy;
+    };
+    const serve = (copy: string) => {
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.cpSync(copy, out, { recursive: true });
+    };
+    return { db, out, publish, snapshot, serve };
+  };
+
+  const makeBob = () => {
+    const db = new StudioDatabase(path.join(tempRoot, 'bob'), 'bob.sqlite');
+    db.updateProfile({ siteUrl: 'https://bob.rb.test', displayName: 'Bob' });
+    return db;
+  };
+
+  it('refuses an older signed copy: nothing pruned, the newer copy kept, and a notice recorded', async () => {
+    const alice = makeAlice();
+    const bob = makeBob();
+    try {
+      alice.db.createItem({ type: 'post', title: 'First', commentary: 'one' });
+      alice.publish();
+      const v1 = alice.snapshot('v1');
+      await tick();
+      const second = alice.db.createItem({ type: 'post', title: 'Second', commentary: 'two' });
+      alice.publish();
+
+      const synced = await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(synced.rollbacksBlocked).toBeUndefined();
+      expect(bob.getNetworkFeed().map((e) => e.title).sort()).toEqual(['First', 'Second']);
+      const itemsPath = path.join(alice.out, 'api/items.json');
+      const v2ItemsDate = JSON.parse(fs.readFileSync(itemsPath, 'utf8')).updatedAt;
+
+      // The host serves the old, validly signed copy of everything
+      alice.serve(v1);
+      const replayed = await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(replayed.success).toBe(true);
+      expect(replayed.entriesPruned).toBe(0);
+      expect(replayed.rollbacksBlocked).toBeGreaterThan(0);
+      expect(bob.getNetworkFeed().map((e) => e.canonicalUrl)).toContain(second.canonicalUrl);
+      // The newest verified date is still v2's
+      expect(bob.getDocumentFreshnessMark(itemsPath)).toBe(v2ItemsDate);
+
+      const notices = bob.getFriendSyncNotices();
+      expect(notices.map((n) => n.doc)).toEqual(expect.arrayContaining(['manifest.json', 'items.json']));
+      const itemsNotice = notices.find((n) => n.doc === 'items.json')!;
+      expect(itemsNotice).toMatchObject({ siteUrl: ALICE, friendName: 'Alice', kind: 'rollback_blocked', lastVerifiedUpdatedAt: v2ItemsDate });
+      expect(itemsNotice.servedUpdatedAt < v2ItemsDate).toBe(true);
+
+      bob.dismissFriendSyncNotice(ALICE, 'rollback_blocked', 'items.json');
+      expect(bob.getFriendSyncNotices().some((n) => n.doc === 'items.json')).toBe(false);
+    } finally {
+      bob.close();
+      alice.db.close();
+    }
+  });
+
+  it('treats a document with no date, or an unreadable one, as stale', () => {
+    const db = makeBob();
+    try {
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', undefined)).toBe(false);
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', '')).toBe(false);
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', 'not a date')).toBe(false);
+      expect(db.checkDocumentFreshness('https://x.rb.test/api/items.json', '2026-11-20T00:00:00.000Z')).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses a document that doesn't match its digest in the signed manifest: no upsert, no prune", async () => {
+    const alice = makeAlice();
+    const bob = makeBob();
+    try {
+      const first = alice.db.createItem({ type: 'post', title: 'First', commentary: 'one' });
+      alice.publish();
+      await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(bob.getNetworkFeed().map((e) => e.title)).toEqual(['First']);
+
+      // A newer, validly signed items.json (First removed, Third added) without the manifest that lists it
+      const manifestV2 = fs.readFileSync(path.join(alice.out, 'api/manifest.json'), 'utf8');
+      await tick();
+      alice.db.deleteItem(first.id);
+      alice.db.createItem({ type: 'post', title: 'Third', commentary: 'three' });
+      alice.publish();
+      fs.writeFileSync(path.join(alice.out, 'api/manifest.json'), manifestV2);
+
+      const res = await new RingCrawler(bob).crawlFriendSite(ALICE, alice.out);
+      expect(res.success).toBe(true);
+      expect(res.entriesPruned).toBe(0);
+      expect(res.documentErrors?.map((e) => e.doc)).toContain('items.json');
+      expect(bob.getNetworkFeed().map((e) => e.title)).toEqual(['First']);
+      expect(bob.getFriendBySiteUrl(ALICE)?.lastSyncError).toMatch(/items\.json: .*fingerprint/);
+    } finally {
+      bob.close();
+      alice.db.close();
+    }
+  });
+});
+
+describe('Security Phase 6: unverified friend profiles from before the upgrade', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-reset-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  it('migration 2 resets a profile that never verified, flags it for a re-crawl, and leaves a one-time notice', async () => {
+    const dir = path.join(tempRoot, 'bob');
+    const db = new StudioDatabase(dir, 'bob.sqlite');
+    db.updateProfile({ siteUrl: 'https://bob.reset.test', displayName: 'Bob', publishSettings: { publishFriendsList: true } });
+    // Stored by an old build from a document that never verified
+    db.addOrUpdateFriend({
+      siteUrl: 'https://eve.reset.test',
+      displayName: 'Definitely Your Bank',
+      handle: 'bank',
+      bio: 'Send your password here',
+      avatarUrl: 'https://tracker.example/pixel.png',
+      did: 'did:web:someone.else',
+      visibility: 'public',
+    });
+    // A friend whose profile verified (pinned key, verified copy saved) is left alone
+    db.addOrUpdateFriend({
+      siteUrl: 'https://carol.reset.test',
+      displayName: 'Carol',
+      bio: 'Real bio',
+      pinnedPublicKeyPem: crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      keyStatus: 'pinned',
+    });
+    db.setFetchValidators(
+      'https://carol.reset.test/api/profile.json',
+      'https://carol.reset.test',
+      { etag: '"1"' },
+      JSON.stringify({ siteUrl: 'https://carol.reset.test', displayName: 'Carol' }),
+      'abc'
+    );
+    db.close();
+
+    // Back to version 1, as a database from before this upgrade
+    const raw = new DatabaseSync(path.join(dir, 'bob.sqlite'));
+    raw.exec('PRAGMA user_version = 1');
+    raw.close();
+
+    const upgraded = new StudioDatabase(dir, 'bob.sqlite');
+    try {
+      expect(upgraded.getSchemaVersion()).toBeGreaterThanOrEqual(2);
+      const eve = upgraded.getFriendBySiteUrl('https://eve.reset.test')!;
+      expect(eve).toMatchObject({ displayName: 'eve.reset.test', handle: '', bio: '', avatarUrl: '', did: 'did:web:eve.reset.test' });
+      expect(upgraded.getFriendBySiteUrl('https://carol.reset.test')).toMatchObject({ displayName: 'Carol', bio: 'Real bio' });
+      expect([...upgraded.getNeedsRecrawlUrls()]).toEqual(['https://eve.reset.test']);
+
+      const exported = upgraded.buildSignedSiteBundle({ publish: true }).connections.friends;
+      expect(exported.find((f) => f.siteUrl === 'https://eve.reset.test')).toMatchObject({ displayName: 'eve.reset.test', bio: '' });
+      expect(JSON.stringify(exported)).not.toMatch(/Bank|password|tracker/);
+
+      // Shown once
+      expect(upgraded.takeUpgradeNotices()).toEqual([expect.stringMatching(/reset 1 friend profile/)]);
+      expect(upgraded.takeUpgradeNotices()).toEqual([]);
+
+      // A verified sync clears the flag
+      upgraded.clearNeedsRecrawl('https://eve.reset.test');
+      expect(upgraded.getNeedsRecrawlUrls().size).toBe(0);
+    } finally {
+      upgraded.close();
+    }
+  });
+});
+
+describe('Security Phase 6: reviewed key trust', () => {
+  let tempRoot: string;
+  const PEER = 'https://peer.keys.test';
+  const newKey = () =>
+    crypto.generateKeyPairSync('ed25519', {
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    }).publicKey;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-keys-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  const withChangedFriend = (fn: (db: StudioDatabase, friendId: string) => void) => {
+    const db = new StudioDatabase(tempRoot, 'keys.sqlite');
+    try {
+      const friend = db.addOrUpdateFriend({ siteUrl: PEER, displayName: 'Peer' });
+      expect(db.pinSiteKey(PEER, 'did:web:peer.keys.test', newKey())).toBe('pinned');
+      fn(db, friend.id);
+    } finally {
+      db.close();
+    }
+  };
+
+  it('stores the first candidate key; a different later key flags a conflict and does not replace it', () => {
+    withChangedFriend((db) => {
+      const first = newKey();
+      db.recordFriendCandidateKey(PEER, first);
+      const seen = db.getFriendBySiteUrl(PEER)!;
+      expect(seen.candidateFingerprint).toBe(spkiFingerprint(first));
+      expect(seen.candidateFirstSeenAt).toBeTruthy();
+      expect(seen.candidateConflict).toBe(false);
+
+      // The same key again (re-wrapped PEM) changes nothing
+      db.recordFriendCandidateKey(PEER, first.replace(/\n/g, '\r\n'));
+      expect(db.getFriendBySiteUrl(PEER)).toMatchObject({ candidateFingerprint: spkiFingerprint(first), candidateConflict: false });
+
+      db.recordFriendCandidateKey(PEER, newKey());
+      expect(db.getFriendBySiteUrl(PEER)).toMatchObject({ candidateFingerprint: spkiFingerprint(first), candidateConflict: true });
+    });
+  });
+
+  it('trusts only the reviewed candidate: a wrong fingerprint throws, the right one (any formatting) pins it', () => {
+    withChangedFriend((db, friendId) => {
+      const candidate = newKey();
+      db.recordFriendCandidateKey(PEER, candidate);
+      expect(() => db.trustNewFriendKey(friendId, spkiFingerprint(newKey()))).toThrow(/doesn't match/);
+      expect(() => db.trustNewFriendKey(friendId, '')).toThrow(/fingerprint you reviewed/);
+      const trusted = db.trustNewFriendKey(friendId, formatFingerprint(spkiFingerprint(candidate)));
+      expect(trusted.keyStatus).toBe('pinned');
+      expect(trusted.pinnedFingerprint).toBe(spkiFingerprint(candidate));
+      expect(trusted.candidateFingerprint).toBeUndefined();
+      expect(spkiFingerprint(db.getSiteKey(PEER)!.publicKeyPem)).toBe(spkiFingerprint(candidate));
+    });
+  });
+
+  it('cannot trust a friend flagged before the upgrade that has no candidate yet', () => {
+    withChangedFriend((db, friendId) => {
+      expect(() => db.trustNewFriendKey(friendId, 'a'.repeat(64))).toThrow(/hasn't recorded a new key/);
+    });
+  });
+
+  it('migration 3 moves candidate keys from local_settings into the friend row', () => {
+    const candidate = newKey();
+    const first = new StudioDatabase(tempRoot, 'keys.sqlite');
+    first.addOrUpdateFriend({ siteUrl: PEER, displayName: 'Peer' });
+    first.close();
+    const raw = new DatabaseSync(path.join(tempRoot, 'keys.sqlite'));
+    raw.prepare('INSERT INTO local_settings (key, value) VALUES (?, ?)').run(`candidate_key:${PEER}`, candidate);
+    raw.exec('PRAGMA user_version = 2');
+    raw.close();
+
+    const db = new StudioDatabase(tempRoot, 'keys.sqlite');
+    try {
+      expect(db.getSchemaVersion()).toBeGreaterThanOrEqual(3);
+      expect(db.getFriendBySiteUrl(PEER)?.candidateFingerprint).toBe(spkiFingerprint(candidate));
+      const left = new DatabaseSync(path.join(tempRoot, 'keys.sqlite'));
+      expect(left.prepare("SELECT COUNT(*) AS n FROM local_settings WHERE key LIKE 'candidate_key:%'").get()).toMatchObject({ n: 0 });
+      left.close();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('the MCP trust tool requires expectedFingerprint', async () => {
+    const studioDir = path.join(tempRoot, 'mcp-studio');
+    const manager = new PersonaManager(studioDir);
+    const mcp = new WebringMcpServer(manager, studioDir);
+    const ctx = manager.getActiveContext();
+    const friend = ctx.db.addOrUpdateFriend({ siteUrl: PEER, displayName: 'Peer' });
+    ctx.db.pinSiteKey(PEER, 'did:web:peer.keys.test', newKey());
+    const candidate = newKey();
+    ctx.db.recordFriendCandidateKey(PEER, candidate);
+
+    const missing = await mcp.executeToolCall('webring_trust_friend_key', { friendId: friend.id });
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0].text).toMatch(/expectedFingerprint is required/);
+    expect(ctx.db.getFriendBySiteUrl(PEER)?.candidateFingerprint).toBe(spkiFingerprint(candidate));
+
+    const ok = await mcp.executeToolCall('webring_trust_friend_key', {
+      friendId: friend.id,
+      expectedFingerprint: spkiFingerprint(candidate),
+    });
+    expect(ok.isError).toBeUndefined();
+    expect(ctx.db.getFriendBySiteUrl(PEER)?.keyStatus).toBe('pinned');
+  });
+
+  it('formats fingerprints in uppercase groups of four, eight groups per line', () => {
+    const hex = 'ab'.repeat(32);
+    expect(formatFingerprint(hex)).toBe('ABAB ABAB ABAB ABAB ABAB ABAB ABAB ABAB\nABAB ABAB ABAB ABAB ABAB ABAB ABAB ABAB');
+    expect(formatFingerprint('0123 4567 89ab')).toBe('0123 4567 89AB');
+  });
+});
+
+describe('Security Phase 6: network guard and endorsement matching', () => {
+  it('blocks IPv4-compatible and site-local IPv6 addresses, and hex IPv4-mapped loopback', () => {
+    for (const ip of ['::7f00:1', '::a00:1', '::', '::1', 'fec0::1', 'feff::1', '::ffff:7f00:1', '::ffff:a9fe:a9fe']) {
+      expect(isPrivateNetworkAddress(ip), ip).toBe(true);
+    }
+    for (const ip of ['2606:4700:4700::1111', '::ffff:808:808', '8.8.8.8']) {
+      expect(isPrivateNetworkAddress(ip), ip).toBe(false);
+    }
+  });
+
+  it('matches endorsements of our items by origin and path, not by text prefix', () => {
+    expect(isUrlWithinSite('https://me.com.evil.net/x', 'https://me.com')).toBe(false);
+    expect(isUrlWithinSite('https://me.com:8443/x', 'https://me.com')).toBe(false);
+    expect(isUrlWithinSite('https://me.com/blog/x', 'https://me.com')).toBe(true);
+    expect(isUrlWithinSite('https://me.com/blogger/x', 'https://me.com/blog')).toBe(false);
+    expect(isUrlWithinSite('https://me.com/blog', 'https://me.com/blog')).toBe(true);
+    expect(isUrlWithinSite('https://me.com/blog/post', 'https://me.com/blog/')).toBe(true);
   });
 });

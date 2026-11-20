@@ -1,4 +1,5 @@
 import { FriendNotice, HostedRing, JoinedRing, StudioDatabase } from '../db/database';
+import { requireUsableProxy } from '../security/proxyAgent';
 import {
   buildFriendNoticeUri,
   buildRingRequestUri,
@@ -88,8 +89,7 @@ export class RingService {
     this.fetcher =
       customFetcher ||
       ((url: string) => {
-        const proxy = this.db.getProxySettings();
-        return defaultJsonFetcher(url, proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined);
+        return defaultJsonFetcher(url, requireUsableProxy(this.db.getProxySettings()));
       });
   }
 

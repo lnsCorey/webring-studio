@@ -532,7 +532,7 @@ export function WebringHubSearchPanel(props: {
             {shown.map((r) => (
               <li key={r.siteUrl} className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex gap-3">
                 {r.avatarUrl ? (
-                  <img src={r.avatarUrl} alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" />
+                  <img src={r.avatarUrl} referrerPolicy="no-referrer" alt="" className="w-10 h-10 rounded-full object-cover flex-shrink-0" />
                 ) : (
                   <div className="w-10 h-10 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center text-sm font-bold flex-shrink-0">
                     {(r.displayName || '?').slice(0, 1).toUpperCase()}

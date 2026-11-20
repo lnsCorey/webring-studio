@@ -17,12 +17,48 @@ export interface KeyCipher {
 export const ENCRYPTED_KEY_PREFIX = 'enc:v1:';
 
 export class KeyVaultUnavailableError extends Error {
-  constructor() {
+  constructor(message?: string) {
     super(
-      'This persona’s signing key and publishing credentials are encrypted with the OS keychain, which is only available inside the Webring Studio app. Open Webring Studio to publish (or use its in-app HTTP MCP endpoint).'
+      message ||
+        'This persona’s signing key and publishing credentials are encrypted with the OS keychain, which is only available inside the Webring Studio app. Open Webring Studio to publish (or use its in-app HTTP MCP endpoint).'
     );
     this.name = 'KeyVaultUnavailableError';
   }
+}
+
+/**
+ * Thrown when a new password, token or proxy login would be stored without encryption because the
+ * OS keychain isn't available, and the caller didn't get the user's consent to store it as is
+ * (`allowPlaintext`). The Studio app asks first; the MCP never stores secrets unencrypted.
+ */
+export class SecretStorageUnavailableError extends KeyVaultUnavailableError {
+  constructor() {
+    super(
+      "This device's secure storage isn't available, so the password or token wasn't saved. " +
+        'Studio can store it unencrypted only if you allow that in the app.'
+    );
+    this.name = 'SecretStorageUnavailableError';
+  }
+}
+
+/** True when `cipher` can seal secrets now (the OS keychain is available). */
+export function isAvailable(cipher?: KeyCipher): boolean {
+  try {
+    return Boolean(cipher?.isAvailable());
+  } catch {
+    return false;
+  }
+}
+
+const fallbackListeners = new Set<() => void>();
+
+/**
+ * Called whenever a secret couldn't be sealed because the keychain is unavailable, so the app can
+ * show it (the security banner). Returns an unsubscribe function.
+ */
+export function onKeyVaultFallback(listener: () => void): () => void {
+  fallbackListeners.add(listener);
+  return () => fallbackListeners.delete(listener);
 }
 
 export function isEncryptedKey(stored: string): boolean {
@@ -39,10 +75,17 @@ export function sealPrivateKey(privateKeyPem: string, cipher?: KeyCipher): strin
   if (!privateKeyPem || isEncryptedKey(privateKeyPem)) {
     return privateKeyPem;
   }
-  if (!cipher?.isAvailable()) {
+  if (!cipher || !isAvailable(cipher)) {
     if (!warnedPlaintextFallback) {
       warnedPlaintextFallback = true;
       console.warn('[keyVault] OS keychain is unavailable; secret cannot be sealed at rest.');
+    }
+    for (const listener of fallbackListeners) {
+      try {
+        listener();
+      } catch {
+        // A listener's failure never stops a save
+      }
     }
     return privateKeyPem;
   }

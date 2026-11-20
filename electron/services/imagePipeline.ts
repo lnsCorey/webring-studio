@@ -1,3 +1,5 @@
+import * as path from 'path';
+import { Worker } from 'worker_threads';
 import * as jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
 
@@ -217,6 +219,151 @@ export function encodeImage(image: RawImage, format: ImageFormat, quality = JPEG
     mimeType: 'image/jpeg',
     extension: 'jpg',
   };
+}
+
+/** Width and height from a JPEG's frame header (SOFn), without decoding it; null if not found. */
+export function readJpegDimensions(buffer: Buffer): { width: number; height: number } | null {
+  let offset = 2;
+  while (offset + 9 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset++;
+      continue;
+    }
+    const marker = buffer[offset + 1];
+    // Standalone markers have no length
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0xff) {
+      offset += marker === 0xff ? 1 : 2;
+      continue;
+    }
+    const length = buffer.readUInt16BE(offset + 2);
+    const isFrame = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    if (isFrame) {
+      return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+    }
+    if (marker === 0xda || length < 2) return null; // image data starts; no frame header seen
+    offset += 2 + length;
+  }
+  return null;
+}
+
+/**
+ * Cheap checks run before any decoding (on the main thread, before a worker is started): the
+ * format is JPEG or PNG and the declared size is within the limit, so an oversized image is
+ * refused without allocating its pixels.
+ */
+export function assertProcessableImage(buffer: Buffer): ImageFormat {
+  const format = detectImageFormat(buffer);
+  if (!format) {
+    throw new UnsupportedImageError(
+      'Only JPEG and PNG photos are supported. Convert HEIC, WebP or other formats to JPEG first.'
+    );
+  }
+  const size =
+    format === 'png'
+      ? buffer.length >= 24 && buffer.toString('ascii', 12, 16) === 'IHDR'
+        ? { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
+        : null
+      : readJpegDimensions(buffer);
+  if (size && (size.width === 0 || size.height === 0 || size.width * size.height > MAX_INPUT_MEGAPIXELS * 1_000_000)) {
+    throw new UnsupportedImageError('This image is too large to process.');
+  }
+  return format;
+}
+
+/** What to make from a source image: a photo's web copy and thumbnail, or one copy fitted to a size. */
+export type ImageTask = { kind: 'web' } | { kind: 'fit'; maxSide: number };
+export type ImageTaskResult<T extends ImageTask> = T extends { kind: 'web' }
+  ? { web: EncodedImage; thumb: EncodedImage }
+  : EncodedImage;
+
+/** Runs an image task in the current thread (the worker calls this). */
+export function runImageTask(buffer: Buffer, task: ImageTask): { web: EncodedImage; thumb: EncodedImage } | EncodedImage {
+  if (task.kind === 'web') return makeWebImages(buffer);
+  const { image, format } = decodeImage(buffer);
+  return encodeImage(resizeToFit(image, task.maxSide), format);
+}
+
+const WORKER_TIMEOUT_MS = 20_000;
+const WORKER_HEAP_MB = 512;
+
+/** Where the compiled worker is: beside this file, or WEBRING_IMAGE_WORKER (the tests build one). */
+function imageWorkerPath(): string {
+  return process.env.WEBRING_IMAGE_WORKER || path.join(__dirname, 'imageWorker.js');
+}
+
+const reviveEncoded = (e: EncodedImage & { buffer: Uint8Array }): EncodedImage => ({
+  ...e,
+  buffer: Buffer.from(e.buffer.buffer, e.buffer.byteOffset, e.buffer.byteLength),
+});
+
+/**
+ * Decodes, resizes and re-encodes an image in a worker thread, so a huge or hostile image can't
+ * freeze or crash the app: the worker has its own memory limit and is stopped after 20 seconds.
+ * The format and size checks run here first, so an oversized image never starts a worker.
+ */
+export async function processImage<T extends ImageTask>(
+  buffer: Buffer,
+  task: T,
+  options: { timeoutMs?: number; workerPath?: string } = {}
+): Promise<ImageTaskResult<T>> {
+  assertProcessableImage(buffer);
+  return new Promise((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(options.workerPath || imageWorkerPath(), {
+        resourceLimits: { maxOldGenerationSizeMb: WORKER_HEAP_MB },
+      });
+    } catch (err) {
+      reject(new Error(`Couldn't start the image worker: ${err instanceof Error ? err.message : String(err)}`));
+      return;
+    }
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void worker.terminate();
+      fn();
+    };
+    const timer = setTimeout(
+      () => finish(() => reject(new UnsupportedImageError('This image took too long to process.'))),
+      options.timeoutMs ?? WORKER_TIMEOUT_MS
+    );
+    worker.once('message', (msg: { ok: true; result: unknown } | { ok: false; error: { name: string; message: string } }) =>
+      finish(() => {
+        if (!msg.ok) {
+          reject(
+            msg.error.name === 'UnsupportedImageError'
+              ? new UnsupportedImageError(msg.error.message)
+              : new UnsupportedImageError(`This image couldn't be processed: ${msg.error.message}`)
+          );
+          return;
+        }
+        const result = msg.result as Record<string, unknown>;
+        resolve(
+          (task.kind === 'web'
+            ? {
+                web: reviveEncoded(result.web as EncodedImage & { buffer: Uint8Array }),
+                thumb: reviveEncoded(result.thumb as EncodedImage & { buffer: Uint8Array }),
+              }
+            : reviveEncoded(result as unknown as EncodedImage & { buffer: Uint8Array })) as ImageTaskResult<T>
+        );
+      })
+    );
+    worker.once('error', (err: Error & { code?: string }) =>
+      finish(() =>
+        reject(
+          new UnsupportedImageError(
+            err.code === 'ERR_WORKER_OUT_OF_MEMORY'
+              ? 'This image is too large to process.'
+              : "This image couldn't be processed."
+          )
+        )
+      )
+    );
+    worker.once('exit', () => finish(() => reject(new UnsupportedImageError("This image couldn't be processed."))));
+    worker.postMessage({ buffer, task });
+  });
 }
 
 /** The published web copy and thumbnail for one photo. */

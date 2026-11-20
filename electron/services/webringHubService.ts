@@ -1,4 +1,5 @@
 import { WebringHubExtensionInfo, WebringHubRecord, StudioDatabase } from '../db/database';
+import { requireUsableProxy } from '../security/proxyAgent';
 import {
   canonicalizeJson,
   isPlaceholderSiteUrl,
@@ -193,10 +194,8 @@ export class WebringHubService {
   private now: () => Date;
 
   constructor(private db: StudioDatabase, deps: WebringHubServiceDeps = {}) {
-    const proxyUrl = () => {
-      const proxy = this.db.getProxySettings();
-      return proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined;
-    };
+    // Throws ProxyUnavailableError (no request is made) when the saved proxy can't be unlocked
+    const proxyUrl = () => requireUsableProxy(this.db.getProxySettings());
     this.request = deps.request || ((url, init) => requestPublicJson(url, { ...init, proxyUrl: proxyUrl() }));
     this.fetchJson = deps.fetchJson || ((url) => defaultJsonFetcher(url, proxyUrl()));
     this.now = deps.now || (() => new Date());
