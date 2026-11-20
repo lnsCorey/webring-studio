@@ -48,6 +48,38 @@ export class HostKeyMismatchError extends Error {
   }
 }
 
+/**
+ * A secure (FTPS) connection couldn't be started and unencrypted FTP isn't allowed. Studio never
+ * falls back to plain FTP on its own: the user decides in Publishing settings.
+ */
+export class FtpTlsError extends Error {
+  constructor(host: string, detail: string) {
+    super(
+      `Couldn't start a secure (FTPS) connection to ${host}. Ask your host whether FTPS or SFTP is available. ` +
+        `As a last resort you can allow unencrypted FTP in Publishing settings. (${detail})`
+    );
+    this.name = 'FtpTlsError';
+  }
+}
+
+/** FTP connection options: FTPS with certificate checks unless the user allowed unencrypted FTP. */
+export function ftpAccessOptions(settings: Pick<PublishSettings, 'host' | 'username' | 'password' | 'ftpAllowInsecure'>, port: number) {
+  return {
+    host: settings.host,
+    port,
+    user: settings.username,
+    password: settings.password,
+    secure: !settings.ftpAllowInsecure,
+  };
+}
+
+/** Whether an FTP connection error looks like the TLS (FTPS) part failing. */
+export function isFtpTlsFailure(err: unknown): boolean {
+  const e = err as { message?: string; code?: unknown };
+  const text = `${e?.message || ''} ${String(e?.code || '')}`;
+  return /\b(tls|ssl|certificate|handshake|EPROTO|ERR_TLS\w*|SELF_SIGNED\w*|UNABLE_TO_VERIFY\w*|AUTH TLS)\b|\b(500|502|504|534)\b/i.test(text);
+}
+
 /** The Windows OpenSSH agent's pipe, used when SSH_AUTH_SOCK isn't set. */
 export const WINDOWS_OPENSSH_AGENT_PIPE = '\\\\.\\pipe\\openssh-ssh-agent';
 
@@ -305,13 +337,14 @@ export class SitePublisher {
 
     const client = new ftp.Client();
     try {
-      await client.access({
-        host: settings.host,
-        port,
-        user: settings.username,
-        password: settings.password,
-        secure: !settings.ftpAllowInsecure,
-      });
+      try {
+        await client.access(ftpAccessOptions(settings, port));
+      } catch (err) {
+        if (!settings.ftpAllowInsecure && isFtpTlsFailure(err)) {
+          throw new FtpTlsError(settings.host, err instanceof Error ? err.message : String(err));
+        }
+        throw err;
+      }
       const owned = await this.listFtpOwned(client, root);
       const plan = planSync(files, db.getPublishLedger(destination), owned);
       const outcome = await applySyncPlan(db, destination, stagingDir, plan, {
@@ -341,7 +374,8 @@ export class SitePublisher {
         mode,
         destination: settings.host,
         filesPublished: 0,
-        message: `FTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
+        message:
+          err instanceof FtpTlsError ? err.message : `FTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
   }

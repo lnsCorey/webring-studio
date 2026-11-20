@@ -3,8 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { sftpAuthMethodOf, StudioDatabase } from '../electron/db/database';
+import { PersonaManager } from '../electron/services/personaManager';
+import { WebringMcpServer } from '../electron/mcp/mcpServer';
 import {
+  ftpAccessOptions,
+  FtpTlsError,
   HostKeyMismatchError,
+  isFtpTlsFailure,
   resolveSshAgent,
   verifyOrPinSftpHostKey,
   WINDOWS_OPENSSH_AGENT_PIPE,
@@ -99,5 +104,45 @@ describe('Security Phase 8: SFTP sign-in and host keys', () => {
     expect(main).toContain("ipcMain.handle('studio:pick-sftp-key', async () => {");
     expect(main).toMatch(/delete updates\.publishSettings\.sftpPrivateKeyPath/);
     expect(read('electron/preload.ts')).toContain("pickSftpKey: () => ipcRenderer.invoke('studio:pick-sftp-key'),");
+  });
+});
+
+describe('Security Phase 8: unencrypted FTP only on request', () => {
+  it('connects with FTPS (secure: true) unless the user allowed unencrypted FTP', () => {
+    const base = { host: 'ftp.example', username: 'me', password: 'pw' };
+    expect(ftpAccessOptions(base, 21).secure).toBe(true);
+    expect(ftpAccessOptions({ ...base, ftpAllowInsecure: false }, 21).secure).toBe(true);
+    expect(ftpAccessOptions({ ...base, ftpAllowInsecure: true }, 21).secure).toBe(false);
+  });
+
+  it('recognises a failed FTPS start and explains what to do', () => {
+    expect(isFtpTlsFailure(new Error('534 AUTH TLS not supported'))).toBe(true);
+    expect(isFtpTlsFailure(Object.assign(new Error('x'), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }))).toBe(true);
+    expect(isFtpTlsFailure(new Error('self signed certificate'))).toBe(true);
+    expect(isFtpTlsFailure(new Error('530 Login incorrect'))).toBe(false);
+    expect(isFtpTlsFailure(new Error('connect ECONNREFUSED 10.0.0.1:5000'))).toBe(false);
+    expect(new FtpTlsError('ftp.example', 'detail').message).toMatch(
+      /^Couldn't start a secure \(FTPS\) connection to ftp\.example\. Ask your host whether FTPS or SFTP is available\. As a last resort you can allow unencrypted FTP in Publishing settings\./
+    );
+  });
+
+  it('no MCP tool can allow unencrypted FTP', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p8-ftp-'));
+    const manager = new PersonaManager(dir);
+    try {
+      const mcp = new WebringMcpServer(manager, dir);
+      const before = manager.getActiveContext().db.getProfile().publishSettings.ftpAllowInsecure;
+      await mcp.executeToolCall('webring_update_profile', { ftpAllowInsecure: true, displayName: 'Still me' });
+      expect(manager.getActiveContext().db.getProfile().publishSettings.ftpAllowInsecure).toBe(before);
+      const schemas = JSON.stringify(mcp.getTools().map((t) => t.inputSchema));
+      expect(schemas).not.toContain('ftpAllowInsecure');
+    } finally {
+      manager.closeAll();
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Windows may still hold the database file
+      }
+    }
   });
 });
