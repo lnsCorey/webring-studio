@@ -32,6 +32,7 @@ import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNotice
 import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
 import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
 import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
+import { HeldAgentChangeView, HeldChangesPanel } from './HeldChangesPanel';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -232,9 +233,15 @@ type SchedulePreset =
   | { kind: 'daily'; time: string }
   | { kind: 'weekly'; weekday: number; time: string };
 
+/** A manual publish while agent changes are held goes ahead only with this (after the user confirms). */
+interface PublishHeldOptions {
+  includeAgentChanges?: boolean;
+}
+
 interface ScheduleJobResult {
   at: string;
-  status: 'ok' | 'skipped' | 'failed';
+  /** held: not published because an agent's changes wait for review. */
+  status: 'ok' | 'skipped' | 'failed' | 'held';
   message: string;
 }
 
@@ -494,6 +501,9 @@ declare global {
       }>;
       updateProfile: (updates: unknown, options?: { allowPlaintext?: boolean }) => Promise<unknown>;
       getSecurityStatus?: () => Promise<SecurityStatusView>;
+      getAgentChanges?: () => Promise<HeldAgentChangeView[]>;
+      releaseAgentChanges?: () => Promise<unknown>;
+      onShowAutoPublish?: (cb: () => void) => () => void;
       onSecurityStatusChanged?: (cb: (status: SecurityStatusView) => void) => () => void;
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
@@ -593,11 +603,14 @@ declare global {
         personaId: string,
         job: 'sync' | 'publish'
       ) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
-      autoPublishNow?: (personaId: string) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
+      autoPublishNow?: (
+        personaId: string,
+        options?: PublishHeldOptions
+      ) => Promise<{ result: ScheduleJobResult; overview: ScheduleOverview }>;
       autoPublishCancel?: (personaId: string) => Promise<ScheduleOverview>;
       onScheduleUpdated?: (cb: () => void) => () => void;
       chooseExportFolder: () => Promise<string | null>;
-      exportLocal: (targetDir?: string) => Promise<{
+      exportLocal: (targetDir?: string, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
         filesPublished: number;
@@ -606,13 +619,13 @@ declare global {
       testExportPreview: (openInBrowser?: boolean) => Promise<TestExportPreviewState>;
       openExternal: (url: string) => Promise<unknown>;
       openMedia: (url: string) => Promise<{ ok: boolean }>;
-      publishRemote: (settings: unknown) => Promise<{
+      publishRemote: (settings: unknown, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
         filesPublished: number;
         message: string;
       }>;
-      publishGithub: (settings: unknown) => Promise<{
+      publishGithub: (settings: unknown, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
         filesPublished: number;
@@ -627,7 +640,7 @@ declare global {
       ) => ReturnType<SetupApi['githubLoginPoll']>;
       githubConnectToken?: (token: string, options?: { allowPlaintext?: boolean }) => ReturnType<SetupApi['githubConnectToken']>;
       setupConfigureSite?: SetupApi['setupConfigureSite'];
-      setupPublish?: SetupApi['setupPublish'];
+      setupPublish?: (options?: PublishHeldOptions) => ReturnType<SetupApi['setupPublish']>;
       setupCheckLive?: SetupApi['setupCheckLive'];
       setupDismiss?: SetupApi['setupDismiss'];
       checkGithubRepo: (settings: unknown) => Promise<{
@@ -995,7 +1008,7 @@ export const App: React.FC = () => {
   const [securityStatus, setSecurityStatus] = useState<SecurityStatusView>({
     keyVaultAvailable: true,
     proxyUnavailable: false,
-    agentChangesHeld: false,
+    agentChangesHeld: 0,
   });
   const [vaultBannerDismissed, setVaultBannerDismissed] = useState(false);
   const refreshSecurityStatus = async () => {
@@ -1051,6 +1064,68 @@ export const App: React.FC = () => {
     await reloadMcpInfo();
     setApprovalModalOpen(false);
     notify(`Denied ${res?.denied ?? 0} agent request(s).`);
+  };
+
+  // Agent changes held from publishing until the user reviews them
+  const [heldChanges, setHeldChanges] = useState<HeldAgentChangeView[]>([]);
+  const [heldPanelOpen, setHeldPanelOpen] = useState(true);
+  useEffect(() => {
+    void window.studioApi?.getAgentChanges?.().then((list) => setHeldChanges(list || []), () => setHeldChanges([]));
+    if (securityStatus.agentChangesHeld > 0) setHeldPanelOpen(true);
+  }, [securityStatus.agentChangesHeld, activePersonaId]);
+  const showHeldChanges = () => {
+    setHeldPanelOpen(true);
+    setActiveTab('publish');
+    setTimeout(
+      () => document.getElementById('held-changes-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+      100
+    );
+  };
+  useEffect(
+    () =>
+      window.studioApi?.onShowAutoPublish?.(() => {
+        setActiveTab('publish');
+        setTimeout(
+          () => document.getElementById('auto-publish-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+          100
+        );
+      }),
+    []
+  );
+  /**
+   * Before a manual publish: while agent changes are held, ask whether to publish them too.
+   * Returns null when the user cancels; otherwise the options for the publish call.
+   */
+  const confirmPublishWithHeldChanges = async (): Promise<{ includeAgentChanges?: boolean } | null> => {
+    const list = (await window.studioApi?.getAgentChanges?.().catch(() => [])) || [];
+    if (!list.length) return {};
+    const confirmed = await askConfirm({
+      title: 'Publish including agent changes?',
+      message: (
+        <>
+          <p>An agent made these changes, which haven't been reviewed. Publishing now puts them on your site:</p>
+          <ul className="list-disc list-inside text-xs text-slate-200 space-y-0.5 max-h-40 overflow-y-auto">
+            {list.map((change, i) => (
+              <li key={`${change.at}-${i}`}>{change.summary}</li>
+            ))}
+          </ul>
+        </>
+      ),
+      confirmLabel: 'Publish including agent changes',
+    });
+    return confirmed ? { includeAgentChanges: true } : null;
+  };
+  const releaseHeldChanges = async () => {
+    const confirmed = await askConfirm({
+      title: 'Release these changes for publishing?',
+      message: 'These changes will be published with your next publish.',
+      confirmLabel: 'Release for publishing',
+    });
+    if (!confirmed) return;
+    await window.studioApi?.releaseAgentChanges?.();
+    await refreshSecurityStatus();
+    setHeldChanges([]);
+    notify('Agent changes released. They go out with your next publish.');
   };
 
   const askConfirm = (request: {
@@ -1127,7 +1202,14 @@ export const App: React.FC = () => {
             return window.studioApi!.githubConnectToken!(token, allowPlaintext ? { allowPlaintext } : undefined);
           },
           setupConfigureSite: window.studioApi.setupConfigureSite,
-          setupPublish: window.studioApi.setupPublish,
+          // Guided setup's publish asks about held agent changes like any manual publish
+          setupPublish: async () => {
+            const options = await confirmPublishWithHeldChanges();
+            if (!options) return { success: false, message: 'Publish cancelled: agent changes are waiting for your review.' };
+            const res = await window.studioApi!.setupPublish!(options);
+            void refreshSecurityStatus();
+            return res;
+          },
           setupCheckLive: window.studioApi.setupCheckLive,
           setupDismiss: window.studioApi.setupDismiss,
           openExternal: window.studioApi.openExternal,
@@ -2170,8 +2252,11 @@ export const App: React.FC = () => {
 
   const handleAutoPublishNow = async () => {
     if (!window.studioApi?.autoPublishNow) return;
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
     notify('Publishing now...');
-    const { result, overview } = await window.studioApi.autoPublishNow(activePersonaId);
+    const { result, overview } = await window.studioApi.autoPublishNow(activePersonaId, options);
+    void refreshSecurityStatus();
     setScheduleOverview(overview);
     await refreshStudioData();
     notify(result.message);
@@ -2184,6 +2269,18 @@ export const App: React.FC = () => {
   };
 
   const renderAutoPublishPill = () => {
+    if (securityStatus.agentChangesHeld > 0) {
+      return (
+        <button
+          type="button"
+          onClick={showHeldChanges}
+          className="w-full text-left text-xs px-3 py-1.5 rounded-full bg-amber-500/15 text-amber-200 border border-amber-500/40 hover:bg-amber-500/25"
+          title="An agent's changes won't be published until you review them"
+        >
+          Held — agent changes need review
+        </button>
+      );
+    }
     if (!autoPublishStatus) return null;
     if (autoPublishStatus.state === 'pending' && autoPublishStatus.dueAt) {
       return (
@@ -2287,13 +2384,17 @@ export const App: React.FC = () => {
           className={
             job.lastResult.status === 'failed'
               ? 'text-rose-300'
-              : job.lastResult.status === 'skipped'
+              : job.lastResult.status === 'held'
+                ? 'text-amber-300'
+                : job.lastResult.status === 'skipped'
                 ? 'text-slate-400'
                 : 'text-emerald-300'
           }
           title={job.lastResult.at}
         >
-          Last run {formatRelativeTime(job.lastResult.at)}: {job.lastResult.message}
+          {job.lastResult.status === 'held'
+            ? 'Last run: skipped (agent changes held)'
+            : `Last run ${formatRelativeTime(job.lastResult.at)}: ${job.lastResult.message}`}
         </div>
       )}
     </div>
@@ -2301,7 +2402,10 @@ export const App: React.FC = () => {
 
   const handleExportLocalSite = async () => {
     if (!window.studioApi) return;
-    const res = await window.studioApi.exportLocal(publishSettings.exportPath || undefined);
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
+    const res = await window.studioApi.exportLocal(publishSettings.exportPath || undefined, options);
+    void refreshSecurityStatus();
     await refreshStudioData();
     notify(res.message);
   };
@@ -2367,8 +2471,11 @@ export const App: React.FC = () => {
     e.preventDefault();
     if (!window.studioApi) return;
     await saveProfile({ publishSettings });
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
     notify(`Saved settings & connecting to ${publishSettings.protocol.toUpperCase()} host ${publishSettings.host}...`);
-    const res = await window.studioApi.publishRemote(publishSettings);
+    const res = await window.studioApi.publishRemote(publishSettings, options);
+    void refreshSecurityStatus();
     await refreshStudioData();
     notify(res.message);
   };
@@ -2420,10 +2527,13 @@ export const App: React.FC = () => {
     e.preventDefault();
     if (!window.studioApi) return;
     await saveProfile({ publishSettings });
+    const options = await confirmPublishWithHeldChanges();
+    if (!options) return;
     notify(`Saved settings & deploying to github.com/${publishSettings.githubOwner}/${publishSettings.githubRepo}...`);
     setGithubDeploying(true);
     try {
-      const res = await window.studioApi.publishGithub(publishSettings);
+      const res = await window.studioApi.publishGithub(publishSettings, options);
+      void refreshSecurityStatus();
       await refreshStudioData();
       notify(res.message);
     } finally {
@@ -2865,6 +2975,17 @@ export const App: React.FC = () => {
                 },
               },
             ]}
+          />
+        )}
+        {securityStatus.agentChangesHeld > 0 && (
+          <SecurityBanner
+            severity="warning"
+            title="Agent changes held."
+            message={`An agent made ${securityStatus.agentChangesHeld} change${
+              securityStatus.agentChangesHeld === 1 ? '' : 's'
+            } that won't be published until you review them.`}
+            actions={[{ label: 'Review', onClick: showHeldChanges }]}
+            dismissible={false}
           />
         )}
         {!securityStatus.keyVaultAvailable && !vaultBannerDismissed && (
@@ -6008,7 +6129,15 @@ export const App: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                  {heldPanelOpen && (
+                    <HeldChangesPanel
+                      changes={heldChanges}
+                      onPreview={() => setActiveTab('preview')}
+                      onRelease={releaseHeldChanges}
+                      onKeepHolding={() => setHeldPanelOpen(false)}
+                    />
+                  )}
+                  <div id="auto-publish-card" className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
                     <label className="flex items-center gap-2 text-sm font-semibold">
                       <input
                         type="checkbox"

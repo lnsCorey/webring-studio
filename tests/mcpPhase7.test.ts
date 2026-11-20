@@ -6,6 +6,9 @@ import * as path from 'path';
 import { PersonaManager } from '../electron/services/personaManager';
 import { getMcpToolTier, MAX_PENDING_APPROVALS, McpPendingApproval, WebringMcpServer } from '../electron/mcp/mcpServer';
 import { describeToolCall } from '../electron/mcp/describeToolCall';
+import { AutoPublisher } from '../electron/services/autoPublisher';
+import { runScheduledPublish } from '../electron/services/jobs';
+import { Scheduler } from '../electron/services/scheduler';
 import { runWithoutNetwork } from '../electron/security/networkPolicy';
 import { requestPublicJson } from '../electron/services/ringCrawler';
 import { EXPECTED_TOOL_TIERS } from './mcpToolTiers.expected';
@@ -390,5 +393,147 @@ describe('Security Phase 7: the approval queue', () => {
       /^Change your profile site URL to https:\/\/new\.example/
     );
     expect(describeToolCall('webring_set_proxy', { proxyUrl: 'socks5h://me:secret@127.0.0.1:9050' })).not.toContain('secret');
+  });
+});
+
+describe('Security Phase 7: agent changes are held from every kind of publishing', () => {
+  let dir: string;
+  let manager: PersonaManager;
+  let mcp: WebringMcpServer;
+  let notes: Array<{ personaId: string; reason: string; fromAgent?: boolean }>;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p7-hold-'));
+    manager = new PersonaManager(dir);
+    const db = manager.getActiveContext().db;
+    db.updateProfile({ siteUrl: 'https://me.hold.test', displayName: 'Me' });
+    db.updateProfile({ publishSettings: { ...db.getProfile().publishSettings, exportPath: path.join(dir, 'site') } });
+    mcp = new WebringMcpServer(manager, dir);
+    mcp.setReadOnlyMode(false);
+    notes = [];
+    mcp.attachAppServices({
+      publishPaths: () => ({ userDataDir: dir, tempDir: dir }),
+      deviceLogin: {} as never,
+      onLocalChange: (personaId, reason, options) => notes.push({ personaId, reason, fromAgent: options?.fromAgent }),
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    manager.closeAll();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows may still hold a database file
+    }
+  });
+
+  const agent = (name: string, args: Record<string, unknown> = {}) =>
+    mcp.executeToolCall(name, args, { enforcePolicy: true });
+
+  const newAutoPublisher = (published: string[]) => {
+    const scheduler = new Scheduler({
+      configPath: path.join(dir, 'scheduler.json'),
+      listPersonaIds: () => ['default'],
+      runner: { sync: () => Promise.reject(new Error('unused')), publish: () => Promise.reject(new Error('unused')) },
+    });
+    return new AutoPublisher({
+      scheduler,
+      listPersonaIds: () => ['default'],
+      hasUnpublishedChanges: async () => false,
+      publish: async (personaId) => {
+        published.push(personaId);
+        return { at: new Date().toISOString(), status: 'ok', message: 'published' };
+      },
+      loadAgentHold: (personaId) => manager.withPersonaContext(personaId, async (ctx) => ctx.db.getHeldAgentChanges().length),
+      clearAgentHold: (personaId) => manager.withPersonaContext(personaId, async (ctx) => ctx.db.clearHeldAgentChanges()),
+    });
+  };
+
+  it("holds an agent's profile change (formerly untracked), and the hold survives a restart", async () => {
+    // update_profile is outward: queued, then approved by the user
+    await agent('webring_update_profile', { tagline: 'Written by an agent' });
+    const [request] = mcp.listPendingApprovals();
+    expect((await mcp.resolveApproval(request.id, true)).ok).toBe(true);
+
+    const held = manager.getActiveContext().db.getHeldAgentChanges();
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({ tool: 'webring_update_profile', summary: expect.any(String) });
+    expect(notes).toEqual([{ personaId: 'default', reason: expect.any(String), fromAgent: true }]);
+
+    // A read doesn't count as a change
+    await agent('webring_list_items');
+    expect(manager.getActiveContext().db.getHeldAgentChanges()).toHaveLength(1);
+
+    // A fresh AutoPublisher (an app restart) picks the hold up from the persona
+    const restarted = newAutoPublisher([]);
+    await restarted.refresh();
+    expect(restarted.status('default').agentHeld).toBe(true);
+    const now = await restarted.publishNow('default');
+    expect(now.status).toBe('held');
+
+    restarted.approveAgentChanges('default');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(manager.getActiveContext().db.getHeldAgentChanges()).toEqual([]);
+    restarted.dispose();
+  });
+
+  it('a scheduled publish with held changes returns held and publishes nothing; after release it runs', async () => {
+    await agent('webring_create_post', { commentary: 'An agent post' });
+    const ctx = manager.getActiveContext();
+    expect(ctx.db.getHeldAgentChanges()).toHaveLength(1);
+
+    const local = vi.spyOn(ctx.sitePublisher, 'publishToLocalDirectory');
+    const heldRun = await runScheduledPublish(ctx, 'local', false, { userDataDir: dir, tempDir: dir });
+    expect(heldRun).toMatchObject({ status: 'held', message: 'Agent changes awaiting review' });
+    expect(local).not.toHaveBeenCalled();
+
+    // An agent's own publish is refused too
+    const agentPublish = await mcp.executeToolCall('webring_publish', { destination: 'local' }, { enforcePolicy: true, approved: true });
+    expect(agentPublish.isError).toBe(true);
+    expect(agentPublish.content[0].text).toMatch(/waiting for the user's review/);
+    expect(local).not.toHaveBeenCalled();
+
+    ctx.db.clearHeldAgentChanges();
+    const released = await runScheduledPublish(ctx, 'local', false, { userDataDir: dir, tempDir: dir });
+    expect(released.status).toBe('ok');
+    expect(local).toHaveBeenCalledTimes(1);
+  });
+
+  it('an edit during a publish starts a follow-up countdown instead of counting as published', async () => {
+    const scheduler = new Scheduler({
+      configPath: path.join(dir, 'scheduler2.json'),
+      listPersonaIds: () => ['default'],
+      runner: { sync: () => Promise.reject(new Error('unused')), publish: () => Promise.reject(new Error('unused')) },
+    });
+    scheduler.setPersonaSchedule('default', { autoPublish: { enabled: true, delaySeconds: 30 } });
+    let release!: () => void;
+    const runs: number[] = [];
+    const armed: number[] = [];
+    const auto = new AutoPublisher({
+      scheduler,
+      listPersonaIds: () => ['default'],
+      hasUnpublishedChanges: async () => false,
+      publish: async () => {
+        runs.push(Date.now());
+        await new Promise<void>((r) => (release = r));
+        return { at: new Date().toISOString(), status: 'ok', message: 'published' };
+      },
+      onArmed: (_id, seconds) => armed.push(seconds),
+    });
+    auto.noteLocalChange('default', 'post');
+    expect(armed).toHaveLength(1);
+    const first = auto.publishNow('default');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(auto.status('default').state).toBe('running');
+    auto.noteLocalChange('default', 'edit during publish');
+    release();
+    await first;
+    // The edit wasn't part of that run: a new countdown is armed for it
+    expect(runs).toHaveLength(1);
+    expect(auto.status('default').state).toBe('pending');
+    expect(auto.status('default').reasons).toContain('edit during publish');
+    expect(armed).toHaveLength(2);
+    auto.dispose();
   });
 });

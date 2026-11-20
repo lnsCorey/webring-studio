@@ -143,6 +143,10 @@ export async function runScheduledPublish(
   syncFirst: boolean,
   paths: PublishPaths
 ): Promise<JobResult> {
+  // An agent's changes wait for the user's review: no scheduled or automatic publish includes them
+  if (ctx.db.getHeldAgentChanges().length > 0) {
+    return { at: new Date().toISOString(), status: 'held', message: 'Agent changes awaiting review' };
+  }
   if (syncFirst) {
     await runSyncAll(ctx);
   }

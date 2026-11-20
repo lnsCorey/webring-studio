@@ -49,6 +49,13 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:set-proxy-settings', input, options),
   // Keychain and proxy state for the security banner
   getSecurityStatus: () => ipcRenderer.invoke('studio:get-security-status'),
+  getAgentChanges: () => ipcRenderer.invoke('studio:get-agent-changes'),
+  releaseAgentChanges: () => ipcRenderer.invoke('studio:release-agent-changes'),
+  onShowAutoPublish: (cb: () => void) => {
+    const listener = () => cb();
+    ipcRenderer.on('studio:show-auto-publish', listener);
+    return () => ipcRenderer.removeListener('studio:show-auto-publish', listener);
+  },
   onSecurityStatusChanged: (cb: (status: unknown) => void) => {
     const listener = (_e: unknown, status: unknown) => cb(status);
     ipcRenderer.on('studio:security-status-changed', listener);
@@ -102,13 +109,16 @@ contextBridge.exposeInMainWorld('studioApi', {
     change: { action: 'remove' | 'ban' | 'unban' | 'hide' | 'show' | 'up' | 'down'; reason?: string }
   ) => ipcRenderer.invoke('studio:hosted-ring-member', ringId, siteUrl, change),
   chooseExportFolder: () => ipcRenderer.invoke('studio:choose-export-folder'),
-  exportLocal: (targetDir?: string) => ipcRenderer.invoke('studio:export-local', targetDir),
+  exportLocal: (targetDir?: string, options?: { includeAgentChanges?: boolean }) =>
+    ipcRenderer.invoke('studio:export-local', targetDir, options),
   testExportPreview: (openInBrowser?: boolean) =>
     ipcRenderer.invoke('studio:test-export-preview', openInBrowser),
   openExternal: (url: string) => ipcRenderer.invoke('studio:open-external', url),
   openMedia: (url: string) => ipcRenderer.invoke('studio:open-media', url),
-  publishRemote: (settings: unknown) => ipcRenderer.invoke('studio:publish-remote', settings),
-  publishGithub: (settings: unknown) => ipcRenderer.invoke('studio:publish-github', settings),
+  publishRemote: (settings: unknown, options?: { includeAgentChanges?: boolean }) =>
+    ipcRenderer.invoke('studio:publish-remote', settings, options),
+  publishGithub: (settings: unknown, options?: { includeAgentChanges?: boolean }) =>
+    ipcRenderer.invoke('studio:publish-github', settings, options),
   checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),
   getSetupStatus: (options?: { checkGitHub?: boolean }) => ipcRenderer.invoke('studio:setup-status', options),
   githubLoginAvailable: () => ipcRenderer.invoke('studio:github-login-available'),
@@ -119,7 +129,7 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:github-connect-token', token, options),
   setupConfigureSite: (options?: { repoName?: string; allowAddressChange?: boolean }) =>
     ipcRenderer.invoke('studio:setup-configure-site', options),
-  setupPublish: () => ipcRenderer.invoke('studio:setup-publish'),
+  setupPublish: (options?: { includeAgentChanges?: boolean }) => ipcRenderer.invoke('studio:setup-publish', options),
   setupCheckLive: () => ipcRenderer.invoke('studio:setup-check-live'),
   setupDismiss: (dismissed: boolean) => ipcRenderer.invoke('studio:setup-dismiss', dismissed),
   openPath: (targetPath: string) => ipcRenderer.invoke('studio:open-path', targetPath),
@@ -146,7 +156,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   setSchedule: (change: unknown) => ipcRenderer.invoke('studio:set-schedule', change),
   runJobNow: (personaId: string, job: 'sync' | 'publish') =>
     ipcRenderer.invoke('studio:run-job-now', personaId, job),
-  autoPublishNow: (personaId: string) => ipcRenderer.invoke('studio:auto-publish-now', personaId),
+  autoPublishNow: (personaId: string, options?: { includeAgentChanges?: boolean }) =>
+    ipcRenderer.invoke('studio:auto-publish-now', personaId, options),
   autoPublishCancel: (personaId: string) => ipcRenderer.invoke('studio:auto-publish-cancel', personaId),
   onScheduleUpdated: (callback: () => void) => {
     const listener = () => callback();

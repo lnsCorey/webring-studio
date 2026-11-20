@@ -5,7 +5,8 @@ import { AlertTriangle, Info, ShieldAlert, X } from 'lucide-react';
 export interface SecurityStatusView {
   keyVaultAvailable: boolean;
   proxyUnavailable: boolean;
-  agentChangesHeld: boolean;
+  /** How many agent changes wait for review (0 when none). */
+  agentChangesHeld: number;
 }
 
 export interface SecurityBannerProps {

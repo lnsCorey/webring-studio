@@ -90,8 +90,8 @@ let windowProxyPlan: WindowProxyPlan | null = null;
 interface SecurityStatus {
   keyVaultAvailable: boolean;
   proxyUnavailable: boolean;
-  /** Phase 7: agent changes held for review. */
-  agentChangesHeld: boolean;
+  /** How many agent changes wait for the user's review (0 when none). */
+  agentChangesHeld: number;
 }
 
 function getSecurityStatus(): SecurityStatus {
@@ -99,7 +99,7 @@ function getSecurityStatus(): SecurityStatus {
   return {
     keyVaultAvailable: db.isKeyVaultAvailable(),
     proxyUnavailable: Boolean(db.getProxySettings().unavailable),
-    agentChangesHeld: false,
+    agentChangesHeld: db.getHeldAgentChanges().length,
   };
 }
 
@@ -207,6 +207,15 @@ function scheduleWebringHubFollowUp(personaId: string): void {
 /** After a scheduled job or an auto-publish: hub follow-ups, failure notice, tray and UI refresh. */
 function handleJobFinished(personaId: string, job: ScheduledJobKind, result: JobResult, title: string): void {
   if (job === 'publish' && result.status === 'ok') scheduleWebringHubFollowUp(personaId);
+  // Held for review isn't a failure: say why it didn't publish, once
+  if (result.status === 'held' && Notification.isSupported()) {
+    const note = new Notification({
+      title: `${title} skipped — agent changes need review`,
+      body: `${personaLabel(personaId)}: an agent's changes won't be published until you review them in Webring Studio.`,
+    });
+    note.on('click', () => showMainWindow());
+    note.show();
+  }
   const config = scheduler.loadConfig();
   if (result.status === 'failed' && config.notifyOnFailure && Notification.isSupported()) {
     new Notification({
@@ -230,6 +239,23 @@ function noteLocalChange(personaId: string, reason: string, options?: { fromAgen
   } catch {
     // Auto-publish is a convenience; the change is saved either way
   }
+  // An agent's change is held: the banner and the review panel show it
+  if (options?.fromAgent) pushSecurityStatus(true);
+}
+
+/**
+ * Before a publish the user started: while an agent's changes are held, it goes ahead only when
+ * the user chose to include them (the app asks first), which releases the hold.
+ */
+function releaseHeldChangesFor(personaId: string, ctx: ActivePersonaContext, includeAgentChanges: boolean): void {
+  const held = ctx.db.getHeldAgentChanges().length;
+  if (!held) return;
+  if (!includeAgentChanges) {
+    throw new Error(`${held} agent change(s) are waiting for your review. Review them, or publish including them.`);
+  }
+  ctx.db.clearHeldAgentChanges();
+  autoPublisher?.approveAgentChanges(personaId);
+  pushSecurityStatus(true);
 }
 
 const noteActiveChange = (reason: string) => noteLocalChange(personaManager.getActivePersonaId(), reason);
@@ -411,12 +437,21 @@ async function initServices() {
       refreshTrayMenu();
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:schedule-updated');
     },
-    onBeforePublish: (personaId, status) => {
-      if ((!mainWindow || !mainWindow.isVisible()) && Notification.isSupported()) {
-        const label = personaManager.listPersonaRecords().find((p) => p.id === personaId)?.label || 'Webring Studio';
+    // The stored hold (survives a restart) and releasing it
+    loadAgentHold: (personaId) =>
+      personaManager.withPersonaContext(personaId, async (ctx) => ctx.db.getHeldAgentChanges().length),
+    clearAgentHold: (personaId) =>
+      personaManager.withPersonaContext(personaId, async (ctx) => ctx.db.clearHeldAgentChanges()),
+    // Tell the user when a countdown starts, while there's still time to cancel it
+    onArmed: (personaId, seconds) => {
+      if ((!mainWindow || !mainWindow.isVisible() || !mainWindow.isFocused()) && Notification.isSupported()) {
         const note = new Notification({
-          title: `Auto-publishing ${label}`,
-          body: `Publishing changes (${status.reasons.join(', ') || 'site update'}).`,
+          title: `Auto-publishing ${personaLabel(personaId)}`,
+          body: `Your site will publish in ${seconds}s. Click to review or cancel.`,
+        });
+        note.on('click', () => {
+          showMainWindow();
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('studio:show-auto-publish');
         });
         note.show();
       }
@@ -1135,9 +1170,25 @@ function registerIpcHandlers() {
     return { result, overview: scheduleOverview() };
   });
 
-  ipcMain.handle('studio:auto-publish-now', async (_e, personaId: string) => {
-    const result = await autoPublisher.publishNow(String(personaId));
-    return { result, overview: scheduleOverview() };
+  ipcMain.handle(
+    'studio:auto-publish-now',
+    async (_e, personaId: string, options?: { includeAgentChanges?: boolean }) => {
+      const result = await autoPublisher.publishNow(String(personaId), {
+        includeAgentChanges: options?.includeAgentChanges === true,
+      });
+      pushSecurityStatus(true);
+      return { result, overview: scheduleOverview() };
+    }
+  );
+
+  // Agent changes held for review (the review panel), and releasing them
+  ipcMain.handle('studio:get-agent-changes', () => personaManager.getActiveContext().db.getHeldAgentChanges());
+  ipcMain.handle('studio:release-agent-changes', () => {
+    const personaId = personaManager.getActivePersonaId();
+    personaManager.getActiveContext().db.clearHeldAgentChanges();
+    const status = autoPublisher.approveAgentChanges(personaId);
+    pushSecurityStatus(true);
+    return status;
   });
 
   ipcMain.handle('studio:auto-publish-cancel', (_e, personaId: string) => {
@@ -1199,8 +1250,9 @@ function registerIpcHandlers() {
     return res.filePaths[0];
   });
 
-  ipcMain.handle('studio:export-local', (_e, targetDir?: string) => {
+  ipcMain.handle('studio:export-local', (_e, targetDir?: string, options?: { includeAgentChanges?: boolean }) => {
     return withActiveLock(async (personaId, ctx) => {
+      releaseHeldChangesFor(personaId, ctx, options?.includeAgentChanges === true);
       const result = await publishTo(ctx, 'local', publishPaths(), { targetDir });
       if (result.success) scheduleWebringHubFollowUp(personaId);
       return result;
@@ -1236,8 +1288,9 @@ function registerIpcHandlers() {
   });
 
   // The Publish tab sends its current form; save it, then publish with the saved settings
-  const publishWithSettings = (destination: PublishDestination, settings: unknown) =>
+  const publishWithSettings = (destination: PublishDestination, settings: unknown, includeAgentChanges = false) =>
     withActiveLock(async (personaId, ctx) => {
+      releaseHeldChangesFor(personaId, ctx, includeAgentChanges);
       const currentProfile = ctx.db.getProfile();
       ctx.db.updateProfile({
         publishSettings: {
@@ -1250,9 +1303,13 @@ function registerIpcHandlers() {
       return result;
     });
 
-  ipcMain.handle('studio:publish-remote', async (_e, settings) => publishWithSettings('remote', settings));
+  ipcMain.handle('studio:publish-remote', async (_e, settings, options?: { includeAgentChanges?: boolean }) =>
+    publishWithSettings('remote', settings, options?.includeAgentChanges === true)
+  );
 
-  ipcMain.handle('studio:publish-github', async (_e, settings) => publishWithSettings('github', settings));
+  ipcMain.handle('studio:publish-github', async (_e, settings, options?: { includeAgentChanges?: boolean }) =>
+    publishWithSettings('github', settings, options?.includeAgentChanges === true)
+  );
 
   // Guided setup (shared with the MCP tools through setupService)
   ipcMain.handle('studio:setup-status', (_e, options?: { checkGitHub?: boolean }) =>
@@ -1283,8 +1340,9 @@ function registerIpcHandlers() {
       allowAddressChange: options?.allowAddressChange === true,
     })
   );
-  ipcMain.handle('studio:setup-publish', async () => {
+  ipcMain.handle('studio:setup-publish', async (_e, options?: { includeAgentChanges?: boolean }) => {
     const personaId = personaManager.getActivePersonaId();
+    releaseHeldChangesFor(personaId, personaManager.getActiveContext(), options?.includeAgentChanges === true);
     const result = await publishGitHubSite(personaManager.getActiveContext(), publishPaths());
     if (result.success) scheduleWebringHubFollowUp(personaId);
     refreshTrayMenu();

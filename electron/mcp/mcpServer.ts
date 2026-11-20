@@ -253,29 +253,6 @@ export const MCP_SERVER_INSTRUCTIONS =
   'call webring_get_setup_status first, or use the "guided-setup" prompt to walk them through connecting GitHub, ' +
   'creating their site and publishing it.';
 
-/**
- * Tools whose changes friends should see, and the reason shown for the pending auto-publish.
- * An auto-publish that finds nothing changed (e.g. a declined request) is skipped.
- */
-const LOCAL_CHANGE_TOOLS: Record<string, string> = {
-  webring_create_post: 'post',
-  webring_interact_with_url: 'interaction',
-  webring_update_item: 'post',
-  webring_delete_item: 'deleted item',
-  webring_create_album: 'album',
-  webring_add_photo: 'photo',
-  webring_delete_album: 'album',
-  webring_delete_photo: 'photo',
-  webring_add_friend: 'friend',
-  webring_update_friend: 'friend',
-  webring_set_friend_visibility: 'friend',
-  webring_delete_friend: 'friend',
-  webring_join_ring: 'webring',
-  webring_create_hosted_ring: 'webring',
-  webring_review_ring_request: 'webring',
-  webring_review_friend_notice: 'friend',
-  webring_set_ring_member: 'webring',
-};
 
 /** What only the running app can provide: publishing (keychain), GitHub sign-in and the browser. */
 export interface McpAppServices {
@@ -2582,6 +2559,13 @@ export class WebringMcpServer {
           if (destination !== 'github' && destination !== 'remote' && destination !== 'local') {
             throw new Error('destination must be "github", "remote" or "local".');
           }
+          // An agent can't publish its own (or another agent's) changes past the user's review
+          const held = ctx.db.getHeldAgentChanges().length;
+          if (held > 0) {
+            throw new Error(
+              `${held} agent change(s) are waiting for the user's review in Webring Studio and can't be published until they release them.`
+            );
+          }
           const res = await this.withPersonaLock(ctx.persona.id, () =>
             destination === 'github'
               ? publishGitHubSite(ctx, app.publishPaths())
@@ -2849,15 +2833,32 @@ export class WebringMcpServer {
       // if the user switches persona meanwhile; another persona gets its own context for the call.
       // A read-only agent call can't reach the network, whatever the tool does
       const noNetwork = enforcePolicy && this.readOnlyMode;
+      // A write that changes what the site would publish is a change friends could see. An agent's
+      // is held from every kind of publishing until the user reviews it (stored in the persona).
+      const tracksChanges = getMcpToolTier(name, args) !== 'read';
+      let changed = false;
       const runIn = (ctx: ActivePersonaContext) =>
-        callContext.run({ ctx, personaId: targetPersonaId, agent: enforcePolicy }, () =>
-          noNetwork ? runWithoutNetwork(runTool) : runTool()
-        );
+        callContext.run({ ctx, personaId: targetPersonaId, agent: enforcePolicy }, async () => {
+          const fingerprint = () => {
+            try {
+              return ctx.siteGenerator.contentFingerprint();
+            } catch {
+              return '';
+            }
+          };
+          const before = tracksChanges ? fingerprint() : '';
+          const out = await (noNetwork ? runWithoutNetwork(runTool) : runTool());
+          if (tracksChanges && fingerprint() !== before) {
+            changed = true;
+            if (enforcePolicy) {
+              ctx.db.addHeldAgentChange({ tool: name, summary: out.summary, at: new Date().toISOString() });
+            }
+          }
+          return out;
+        });
       const { resultData, summary } = await this.runInPersona(targetPersonaId, runIn);
 
-      if (LOCAL_CHANGE_TOOLS[name]) {
-        this.noteChange(targetPersonaId, LOCAL_CHANGE_TOOLS[name], enforcePolicy);
-      }
+      if (changed) this.noteChange(targetPersonaId, summary, enforcePolicy);
       this.recordActivity('tools/call', summary, true, name, targetPersonaId);
       return {
         content: [

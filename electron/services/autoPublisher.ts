@@ -19,7 +19,11 @@ export interface AutoPublishStatus {
   dueAt: string | null;
   /** What changed since the last publish, e.g. "post", "friend" (local only, for the UI). */
   reasons: string[];
-  /** True when an MCP agent made a local change that is held for human approval before auto-publish. */
+  /**
+   * True while an agent's changes wait for the user's review: nothing publishes them (auto,
+   * scheduled or an agent's publish) until they're released. Survives a restart (stored in the
+   * persona as agent_changes_held).
+   */
   agentHeld?: boolean;
   lastResult: JobResult | null;
 }
@@ -46,6 +50,12 @@ export interface AutoPublisherOptions {
   now?: () => Date;
   onStatusChange?: (personaId: string, status: AutoPublishStatus) => void;
   onBeforePublish?: (personaId: string, status: AutoPublishStatus) => void;
+  /** A countdown started: the site publishes in `seconds` unless the user cancels. */
+  onArmed?: (personaId: string, seconds: number, status: AutoPublishStatus) => void;
+  /** How many agent changes the persona has held (its stored hold), read on refresh(). */
+  loadAgentHold?: (personaId: string) => Promise<number>;
+  /** Clears the persona's stored hold, when the user releases it. */
+  clearAgentHold?: (personaId: string) => Promise<void>;
   onFinished?: (personaId: string, result: JobResult) => void;
 }
 
@@ -130,6 +140,11 @@ export class AutoPublisher {
     entry.dueAt = targetDue;
     entry.timer = setTimeout(() => void this.fire(personaId, false), waitMs);
     entry.timer.unref?.();
+    try {
+      this.options.onArmed?.(personaId, Math.round(waitMs / 1000), this.status(personaId));
+    } catch {
+      // A notification is best-effort
+    }
   }
 
   /**
@@ -179,10 +194,11 @@ export class AutoPublisher {
     return this.status(personaId);
   }
 
-  /** Releases an agent-change hold and resumes auto-publish if enabled. */
+  /** Releases an agent-change hold (and its stored copy) and resumes auto-publish if enabled. */
   public approveAgentChanges(personaId: string): AutoPublishStatus {
     const entry = this.entry(personaId);
     entry.agentHeld = false;
+    void this.options.clearAgentHold?.(personaId).catch(() => undefined);
     const settings = this.activeSettings(personaId);
     if (settings && entry.state === 'idle' && entry.reasons.size > 0) {
       this.arm(personaId, entry, settings.delaySeconds);
@@ -191,10 +207,22 @@ export class AutoPublisher {
     return this.status(personaId);
   }
 
-  /** Publishes the pending changes now (the "Publish now" button), or waits for a running one. */
-  public publishNow(personaId: string): Promise<JobResult> {
+  /**
+   * Publishes the pending changes now (the "Publish now" button), or waits for a running one.
+   * While agent changes are held, it doesn't publish unless the user chose to include them.
+   */
+  public publishNow(personaId: string, options: { includeAgentChanges?: boolean } = {}): Promise<JobResult> {
     const entry = this.entry(personaId);
-    entry.agentHeld = false;
+    if (entry.agentHeld) {
+      if (!options.includeAgentChanges) {
+        return Promise.resolve({
+          at: new Date(this.now()).toISOString(),
+          status: 'held',
+          message: 'Agent changes awaiting review',
+        });
+      }
+      this.approveAgentChanges(personaId);
+    }
     if (entry.state === 'running' && entry.running) return entry.running;
     return this.fire(personaId, true);
   }
@@ -206,7 +234,7 @@ export class AutoPublisher {
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = null;
     entry.rerun = false;
-    entry.agentHeld = false;
+    // Cancelling a countdown doesn't release held agent changes
     if (entry.state === 'pending') {
       entry.state = 'idle';
       entry.dueAt = null;
@@ -221,6 +249,19 @@ export class AutoPublisher {
    */
   public async refresh(personaIds: string[] = this.options.listPersonaIds()): Promise<void> {
     for (const personaId of personaIds) {
+      // The stored hold (agent changes not yet reviewed) comes back after a restart
+      if (this.options.loadAgentHold) {
+        try {
+          const held = (await this.options.loadAgentHold(personaId)) > 0;
+          const entry = this.entry(personaId);
+          if (entry.agentHeld !== held) {
+            entry.agentHeld = held;
+            this.emit(personaId);
+          }
+        } catch {
+          // A persona that can't be opened is left alone
+        }
+      }
       const settings = this.activeSettings(personaId);
       const entry = this.entries.get(personaId);
       if (!settings) {
@@ -254,8 +295,8 @@ export class AutoPublisher {
         this.emit(personaId);
         return Promise.resolve({
           at: new Date(this.now()).toISOString(),
-          status: 'skipped',
-          message: 'Auto-publish held: agent-made changes require review.',
+          status: 'held',
+          message: 'Agent changes awaiting review',
         });
       }
       entry.state = 'idle';

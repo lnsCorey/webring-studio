@@ -2450,10 +2450,12 @@ describe('Auto-publish after changes', () => {
         onLocalChange: (personaId, reason) => changes.push(`${personaId}:${reason}`),
       });
 
+      // A change counts when it alters what the site would publish (phase 7): a post does; a read
+      // and a private friend (never published) don't
       await mcp.executeToolCall('webring_create_post', { commentary: 'Hello ring' });
       await mcp.executeToolCall('webring_list_items', {});
       await mcp.executeToolCall('webring_add_friend', { siteUrl: 'https://friend.ring.test', displayName: 'Friend' });
-      expect(changes).toEqual([`${ctx.persona.id}:post`, `${ctx.persona.id}:friend`]);
+      expect(changes).toEqual([`${ctx.persona.id}:Published Wall Post "Hello ring"`]);
 
       // Settings through MCP
       const set = await mcp.executeToolCall('webring_set_schedule', { autoPublishEnabled: true, autoPublishDelaySeconds: 600 });
