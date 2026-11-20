@@ -325,6 +325,15 @@ interface CrawlSiteResult {
   rollbacksBlocked?: number;
 }
 
+/**
+ * Why an image couldn't be imported, in plain words. Images are processed in a worker thread
+ * that's stopped if it runs too long or out of memory; its messages say so already.
+ */
+function imageErrorText(err: unknown): string {
+  const text = (err instanceof Error ? err.message : String(err)).replace(/^Error invoking remote method '[^']+': (\w*Error: )?/, '');
+  return text || "This image is too large or couldn't be processed.";
+}
+
 /** Media Library files (media/...) are served to the Studio window by the studio-media protocol. */
 function mediaSrc(url: string): string {
   return url.startsWith('media/') ? `studio-media://local/${url.slice('media/'.length)}` : url;
@@ -1433,8 +1442,13 @@ export const App: React.FC = () => {
       notify('Set as album cover.');
     }
     if (action === 'replace') {
-      const res = await window.studioApi.replacePhoto(photo.id);
-      if (res.replaced) notify('Photo replaced. It goes live at your next publish.');
+      try {
+        const res = await window.studioApi.replacePhoto(photo.id);
+        if (res.replaced) notify('Photo replaced. It goes live at your next publish.');
+      } catch (err) {
+        notify(`Couldn't use that image: ${imageErrorText(err)}`);
+        return;
+      }
     }
     if (action === 'delete') {
       if (!window.confirm(`Delete this photo${photo.caption ? ` ("${photo.caption}")` : ''}? It's removed from your site at the next publish.`)) {
@@ -1493,7 +1507,13 @@ export const App: React.FC = () => {
 
   const handlePickLocalPostImage = async () => {
     if (!window.studioApi) return;
-    const imported = await window.studioApi.importImage();
+    let imported: { url: string; fileName: string } | null;
+    try {
+      imported = await window.studioApi.importImage();
+    } catch (err) {
+      notify(`Couldn't use that image: ${imageErrorText(err)}`);
+      return;
+    }
     if (imported) {
       setItemMediaUrl(imported.url);
       notify(`Attached ${imported.fileName} to your post (resized, location data removed).`);
@@ -3683,8 +3703,13 @@ export const App: React.FC = () => {
                             item={item}
                             mediaSrc={mediaSrc}
                             onPickImage={async () => {
-                              const imported = await window.studioApi?.importImage();
-                              return imported ? imported.url : null;
+                              try {
+                                const imported = await window.studioApi?.importImage();
+                                return imported ? imported.url : null;
+                              } catch (err) {
+                                notify(`Couldn't use that image: ${imageErrorText(err)}`);
+                                return null;
+                              }
                             }}
                             onSave={(edit) => handleSaveItemEdit(item, edit)}
                             onCancel={() => setEditingItemId(null)}

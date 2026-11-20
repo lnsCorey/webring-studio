@@ -725,7 +725,7 @@ function registerIpcHandlers() {
       file = result.filePaths[0];
     }
     const ctx = personaManager.getActiveContext();
-    return { url: setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file) };
+    return { url: await setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file) };
   });
 
   ipcMain.handle('studio:create-album', (_e, input) => {
@@ -767,7 +767,7 @@ function registerIpcHandlers() {
       files = result.filePaths;
     }
     const ctx = personaManager.getActiveContext();
-    const imported = importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
+    const imported = await importPhotosIntoAlbum(ctx.db, ctx.mediaLibrary, albumId, files);
     if (imported.added.length > 0) noteActiveChange('photos');
     return imported;
   });
@@ -781,7 +781,7 @@ function registerIpcHandlers() {
       filters: photoFilters,
     });
     if (result.canceled || result.filePaths.length === 0) return null;
-    const media = personaManager.getActiveContext().mediaLibrary.importPhoto(result.filePaths[0], 'wall-posts');
+    const media = await personaManager.getActiveContext().mediaLibrary.importPhoto(result.filePaths[0], 'wall-posts');
     return { url: media.url, fileName: path.basename(result.filePaths[0]) };
   });
 
@@ -794,7 +794,7 @@ function registerIpcHandlers() {
     });
     if (result.canceled || result.filePaths.length === 0) return { replaced: false };
     const ctx = personaManager.getActiveContext();
-    replacePhotoImage(ctx.db, ctx.mediaLibrary, photoId, result.filePaths[0]);
+    await replacePhotoImage(ctx.db, ctx.mediaLibrary, photoId, result.filePaths[0]);
     noteActiveChange('photo');
     return { replaced: true };
   });

@@ -28,7 +28,7 @@ export async function savePost(
       const image = options.fetchImage
         ? await options.fetchImage(saved.mediaUrl)
         : await fetchPublicImage(saved.mediaUrl, proxy.enabled && proxy.proxyUrl ? proxy.proxyUrl : undefined);
-      db.setSavedLocalMedia(saved.id, library.importSavedImage(image.body, image.contentType));
+      db.setSavedLocalMedia(saved.id, await library.importSavedImage(image.body, image.contentType));
     } catch {
       // Keep the saved text and the link to the original image
     }

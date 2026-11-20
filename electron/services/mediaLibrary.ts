@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { decodeImage, detectImageFormat, encodeImage, makeWebImages, resizeToFit, WEB_MAX_SIDE } from './imagePipeline';
+import { detectImageFormat, processImage, WEB_MAX_SIDE } from './imagePipeline';
 
 /**
  * The persona's local photo library (its media store folder):
@@ -53,13 +53,14 @@ export class MediaLibrary {
   /**
    * Imports a local JPEG or PNG: keeps the original, writes a web copy (≤ 2048 px) and a
    * thumbnail (≤ 480 px) with all metadata stripped, and returns their published URLs and hashes.
+   * Decoding runs in a worker thread (imagePipeline.processImage), so a huge image can't freeze the app.
    */
-  public importPhoto(sourcePath: string, albumId: string): ImportedMedia {
+  public async importPhoto(sourcePath: string, albumId: string): Promise<ImportedMedia> {
     const stat = fs.statSync(sourcePath);
     if (!stat.isFile()) throw new Error(`Not a file: ${sourcePath}`);
     if (stat.size > MAX_SOURCE_BYTES) throw new Error('This file is larger than 200 MB.');
     const source = fs.readFileSync(sourcePath);
-    const { web, thumb } = makeWebImages(source);
+    const { web, thumb } = await processImage(source, { kind: 'web' });
 
     const safeAlbum = albumId.replace(/[^a-zA-Z0-9_-]/g, '');
     const albumDir = path.join(this.mediaStoreDir, 'albums', safeAlbum);
@@ -100,12 +101,11 @@ export class MediaLibrary {
    * metadata stripped. The file is named by its content, so a new image gets a new URL; the
    * previous one is removed by the next clean-up once the profile stops pointing at it.
    */
-  public importProfileImage(sourcePath: string, kind: ProfileImageKind): string {
+  public async importProfileImage(sourcePath: string, kind: ProfileImageKind): Promise<string> {
     const stat = fs.statSync(sourcePath);
     if (!stat.isFile()) throw new Error(`Not a file: ${sourcePath}`);
     if (stat.size > MAX_SOURCE_BYTES) throw new Error('This file is larger than 200 MB.');
-    const { image, format } = decodeImage(fs.readFileSync(sourcePath));
-    const encoded = encodeImage(resizeToFit(image, PROFILE_IMAGE_MAX_SIDE[kind]), format);
+    const encoded = await processImage(fs.readFileSync(sourcePath), { kind: 'fit', maxSide: PROFILE_IMAGE_MAX_SIDE[kind] });
     const dir = path.join(this.mediaStoreDir, 'profile');
     fs.mkdirSync(dir, { recursive: true });
     const file = `${kind}-${sha256Hex(encoded.buffer).slice(0, 20)}.${encoded.extension}`;
@@ -117,12 +117,11 @@ export class MediaLibrary {
    * Stores the image of a saved post. JPEG and PNG are re-encoded (upright, ≤ 2048 px, metadata
    * removed); GIF, WebP and AVIF are kept as they are. Returns its library URL (media/saved/...).
    */
-  public importSavedImage(buffer: Buffer, contentType = ''): string {
+  public async importSavedImage(buffer: Buffer, contentType = ''): Promise<string> {
     let data = buffer;
     let extension: string;
     if (detectImageFormat(buffer)) {
-      const { image, format } = decodeImage(buffer);
-      const encoded = encodeImage(resizeToFit(image, WEB_MAX_SIDE), format);
+      const encoded = await processImage(buffer, { kind: 'fit', maxSide: WEB_MAX_SIDE });
       data = encoded.buffer;
       extension = encoded.extension;
     } else {
@@ -230,16 +229,16 @@ export interface ImportReport {
 }
 
 /** Imports local files into an album, one photo each; files that can't be read are reported, not fatal. */
-export function importPhotosIntoAlbum(
+export async function importPhotosIntoAlbum(
   db: MediaLibraryDb,
   library: MediaLibrary,
   albumId: string,
   files: string[]
-): ImportReport {
+): Promise<ImportReport> {
   const report: ImportReport = { added: [], failed: [] };
   for (const file of files) {
     try {
-      const media = library.importPhoto(file, albumId);
+      const media = await library.importPhoto(file, albumId);
       report.added.push(db.addPhotoToAlbum({ albumId, url: media.url, media }).id);
     } catch (err) {
       report.failed.push({ file: path.basename(file), error: err instanceof Error ? err.message : String(err) });
@@ -249,10 +248,10 @@ export function importPhotosIntoAlbum(
 }
 
 /** Swaps a photo's image, keeping its id, caption and place; the old files are cleaned up. */
-export function replacePhotoImage(db: MediaLibraryDb, library: MediaLibrary, photoId: string, file: string): void {
+export async function replacePhotoImage(db: MediaLibraryDb, library: MediaLibrary, photoId: string, file: string): Promise<void> {
   const albumId = db.getPhotoAlbumId(photoId);
   if (!albumId) throw new Error(`Photo "${photoId}" not found.`);
-  db.replacePhotoMedia(photoId, library.importPhoto(file, albumId));
+  db.replacePhotoMedia(photoId, await library.importPhoto(file, albumId));
   cleanUpLibrary(db, library);
 }
 
@@ -271,8 +270,13 @@ export function deleteAlbumWithFiles(db: MediaLibraryDb, library: MediaLibrary, 
  * (so the clean-up keeps it). The previous uploaded one, if any, is deleted: there is only ever one
  * of each.
  */
-export function setProfileImageFromFile(db: MediaLibraryDb, library: MediaLibrary, kind: ProfileImageKind, file: string): string {
-  const url = library.importProfileImage(file, kind);
+export async function setProfileImageFromFile(
+  db: MediaLibraryDb,
+  library: MediaLibrary,
+  kind: ProfileImageKind,
+  file: string
+): Promise<string> {
+  const url = await library.importProfileImage(file, kind);
   db.updateProfile(kind === 'avatar' ? { avatarUrl: url } : { bannerUrl: url });
   cleanUpLibrary(db, library);
   return url;
@@ -290,13 +294,13 @@ export function cleanUpLibrary(db: MediaLibraryDb, library: MediaLibrary): numbe
  * metadata). Re-process each one into an optimized, metadata-free copy, once. Files that can't be
  * processed (e.g. HEIC) are left as they were.
  */
-export function optimizeLegacyPhotos(db: MediaLibraryDb, library: MediaLibrary): number {
+export async function optimizeLegacyPhotos(db: MediaLibraryDb, library: MediaLibrary): Promise<number> {
   let converted = 0;
   for (const photo of db.getLegacyLocalPhotos()) {
     const file = library.resolveLocalUrl(photo.url);
     if (!file || !fs.existsSync(file)) continue;
     try {
-      db.replacePhotoMedia(photo.id, library.importPhoto(file, photo.albumId));
+      db.replacePhotoMedia(photo.id, await library.importPhoto(file, photo.albumId));
       converted++;
     } catch {
       // Unsupported or unreadable: keep publishing the original file

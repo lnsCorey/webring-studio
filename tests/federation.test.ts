@@ -2627,16 +2627,16 @@ describe('Media Library', () => {
     return { db, library, generator, publisher: new SitePublisher(generator), dir };
   };
 
-  it('cleans up a post image that was replaced, removed or deleted with its post', () => {
+  it('cleans up a post image that was replaced, removed or deleted with its post', async () => {
     const site = makeSite('posts');
-    const image = (name: string, seed: number) => {
+    const image = async (name: string, seed: number) => {
       const file = path.join(tempRoot, name);
       fs.writeFileSync(file, makePhoneJpeg(600, 400, 1, seed));
-      return site.library.importPhoto(file, 'wall-posts').url;
+      return (await site.library.importPhoto(file, 'wall-posts')).url;
     };
-    const first = image('one.jpg', 1);
+    const first = await image('one.jpg', 1);
     const post = site.db.createItem({ type: 'post', commentary: 'Look', mediaUrl: first });
-    const second = image('two.jpg', 2);
+    const second = await image('two.jpg', 2);
     site.db.updateItem(post.id, { mediaUrl: second });
     cleanUpLibrary(site.db, site.library);
     expect(fs.existsSync(site.library.resolveLocalUrl(first)!)).toBe(false);
@@ -2647,22 +2647,22 @@ describe('Media Library', () => {
     site.db.close();
   });
 
-  it('keeps exactly one uploaded profile photo and banner, replacing the old file', () => {
+  it('keeps exactly one uploaded profile photo and banner, replacing the old file', async () => {
     const site = makeSite('prof');
     const write = (name: string, jpeg: Buffer) => {
       const file = path.join(tempRoot, name);
       fs.writeFileSync(file, jpeg);
       return file;
     };
-    const firstAvatar = setProfileImageFromFile(site.db, site.library, 'avatar', write('a1.jpg', makePhoneJpeg(1600, 1200, 6, 1)));
+    const firstAvatar = await setProfileImageFromFile(site.db, site.library, 'avatar', write('a1.jpg', makePhoneJpeg(1600, 1200, 6, 1)));
     expect(firstAvatar).toMatch(/^media\/profile\/avatar-[0-9a-f]{20}\.jpg$/);
     const firstFile = site.library.resolveLocalUrl(firstAvatar)!;
     const decoded = jpegJs.decode(fs.readFileSync(firstFile));
     expect([decoded.width, decoded.height]).toEqual([600, 800]); // upright (orientation 6), fits 800
     expect(fs.readFileSync(firstFile).includes(Buffer.from('GPS-SECRET'))).toBe(false);
 
-    const banner = setProfileImageFromFile(site.db, site.library, 'banner', write('b.jpg', makePhoneJpeg(3000, 1000, 1, 3)));
-    const avatar = setProfileImageFromFile(site.db, site.library, 'avatar', write('a2.jpg', makePhoneJpeg(1600, 1200, 1, 2)));
+    const banner = await setProfileImageFromFile(site.db, site.library, 'banner', write('b.jpg', makePhoneJpeg(3000, 1000, 1, 3)));
+    const avatar = await setProfileImageFromFile(site.db, site.library, 'avatar', write('a2.jpg', makePhoneJpeg(1600, 1200, 1, 2)));
     expect(avatar).not.toBe(firstAvatar);
     expect(fs.existsSync(firstFile)).toBe(false); // the old upload is gone
     expect(site.db.getProfile()).toMatchObject({ avatarUrl: avatar, bannerUrl: banner });
@@ -2675,7 +2675,7 @@ describe('Media Library', () => {
 
     // Switching to an album photo removes the uploaded file; the photo stays while it's in use
     const album = site.db.createAlbum({ title: 'Me' });
-    const report = importPhotosIntoAlbum(site.db, site.library, album.id, [write('me.jpg', makePhoneJpeg(900, 900, 1, 4))]);
+    const report = await importPhotosIntoAlbum(site.db, site.library, album.id, [write('me.jpg', makePhoneJpeg(900, 900, 1, 4))]);
     const photo = site.db.getAlbums()[0].photos[0];
     site.db.updateProfile({ avatarUrl: photo.thumbUrl });
     cleanUpLibrary(site.db, site.library);
@@ -2685,13 +2685,13 @@ describe('Media Library', () => {
     site.db.close();
   });
 
-  it('publishes upright, resized, metadata-free copies and keeps the original locally', () => {
+  it('publishes upright, resized, metadata-free copies and keeps the original locally', async () => {
     const source = path.join(tempRoot, 'phone.jpg');
     fs.writeFileSync(source, makePhoneJpeg(3000, 1000, 6));
     expect(readJpegOrientation(fs.readFileSync(source))).toBe(6);
 
     const library = new MediaLibrary(path.join(tempRoot, 'store'));
-    const media = library.importPhoto(source, 'album-1');
+    const media = await library.importPhoto(source, 'album-1');
     // Orientation 6 = rotate 90°, so a 3000x1000 landscape becomes portrait, then fits 2048
     expect([media.width, media.height]).toEqual([683, 2048]);
     expect(Math.max(media.thumbWidth, media.thumbHeight)).toBe(480);
@@ -2707,18 +2707,18 @@ describe('Media Library', () => {
     png.data.fill(0);
     const pngPath = path.join(tempRoot, 'logo.png');
     fs.writeFileSync(pngPath, PNG.sync.write(png));
-    const pngMedia = library.importPhoto(pngPath, 'album-1');
+    const pngMedia = await library.importPhoto(pngPath, 'album-1');
     expect(pngMedia.mimeType).toBe('image/png');
     expect(PNG.sync.read(fs.readFileSync(library.resolveLocalUrl(pngMedia.url)!)).data[3]).toBe(0);
 
     // Other formats are refused with a clear message, and paths can't escape the library
     const gif = path.join(tempRoot, 'anim.gif');
     fs.writeFileSync(gif, 'GIF89a....');
-    expect(() => library.importPhoto(gif, 'album-1')).toThrow(UnsupportedImageError);
+    await expect(library.importPhoto(gif, 'album-1')).rejects.toThrow(UnsupportedImageError);
     expect(library.resolveLocalUrl('media/../../etc/passwd')).toBeNull();
   });
 
-  it('exports albums with signed manifests and reflects replaced and removed photos', () => {
+  it('exports albums with signed manifests and reflects replaced and removed photos', async () => {
     const site = makeSite('alice');
     const album = site.db.createAlbum({ title: 'Trip' });
     const files = [0, 1].map((n) => {
@@ -2726,7 +2726,7 @@ describe('Media Library', () => {
       fs.writeFileSync(f, makePhoneJpeg(64, 48, 1, n * 50));
       return f;
     });
-    const report = importPhotosIntoAlbum(site.db, site.library, album.id, files);
+    const report = await importPhotosIntoAlbum(site.db, site.library, album.id, files);
     expect(report.added).toHaveLength(2);
 
     const out = path.join(tempRoot, 'export');
@@ -2754,7 +2754,7 @@ describe('Media Library', () => {
     const [first, second] = manifest.photos;
     const replacement = path.join(tempRoot, 'new.jpg');
     fs.writeFileSync(replacement, makePhoneJpeg(64, 48, 1, 200));
-    replacePhotoImage(site.db, site.library, first.id, replacement);
+    await replacePhotoImage(site.db, site.library, first.id, replacement);
     site.publisher.publishToLocalDirectory(out);
     const afterReplace = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const replaced = afterReplace.photos.find((p: { id: string }) => p.id === first.id);
@@ -2778,7 +2778,7 @@ describe('Media Library', () => {
     const album = site.db.createAlbum({ title: 'Remote' });
     const photoFile = path.join(tempRoot, 'r.jpg');
     fs.writeFileSync(photoFile, makePhoneJpeg(40, 30, 1));
-    importPhotosIntoAlbum(site.db, site.library, album.id, [photoFile]);
+    await importPhotosIntoAlbum(site.db, site.library, album.id, [photoFile]);
 
     const remote = new Map<string, Buffer>([['notes/keep.txt', Buffer.from('user file')]]);
     const uploads: string[] = [];
@@ -2889,7 +2889,7 @@ describe('Media Library', () => {
     const album = site.db.createAlbum({ title: 'GH' });
     const f = path.join(tempRoot, 'g.jpg');
     fs.writeFileSync(f, makePhoneJpeg(40, 30, 1));
-    importPhotosIntoAlbum(site.db, site.library, album.id, [f]);
+    await importPhotosIntoAlbum(site.db, site.library, album.id, [f]);
     const photo = site.db.getAlbums()[0].photos[0];
 
     const first = await site.publisher.publishToGitHubPages(settings, fs.mkdtempSync(path.join(tempRoot, 'gh-')));
@@ -2915,7 +2915,7 @@ describe('Media Library', () => {
     site.db.close();
   });
 
-  it('upgrades photos imported before the Media Library, once', () => {
+  it('upgrades photos imported before the Media Library, once', async () => {
     const site = makeSite('dave');
     const album = site.db.createAlbum({ title: 'Old' });
     const legacyDir = path.join(site.library.rootDir, 'albums', album.id);
@@ -2923,12 +2923,12 @@ describe('Media Library', () => {
     fs.writeFileSync(path.join(legacyDir, 'photo-123.jpg'), makePhoneJpeg(100, 80, 1));
     site.db.addPhotoToAlbum({ albumId: album.id, url: `media/albums/${album.id}/photo-123.jpg` });
 
-    expect(optimizeLegacyPhotos(site.db, site.library)).toBe(1);
+    expect(await optimizeLegacyPhotos(site.db, site.library)).toBe(1);
     const photo = site.db.getAlbums()[0].photos[0];
     expect(photo.sha256).toBeTruthy();
     expect(photo.url).not.toContain('photo-123');
     expect(fs.existsSync(path.join(legacyDir, 'photo-123.jpg'))).toBe(false);
-    expect(optimizeLegacyPhotos(site.db, site.library)).toBe(0);
+    expect(await optimizeLegacyPhotos(site.db, site.library)).toBe(0);
     site.db.close();
   });
 
@@ -2940,7 +2940,7 @@ describe('Media Library', () => {
       fs.writeFileSync(f, makePhoneJpeg(32, 32, 1, n * 70));
       return f;
     });
-    importPhotosIntoAlbum(owner.db, owner.library, album.id, files);
+    await importPhotosIntoAlbum(owner.db, owner.library, album.id, files);
     const out = path.join(tempRoot, 'erin-site');
     owner.publisher.publishToLocalDirectory(out);
 
@@ -2952,7 +2952,7 @@ describe('Media Library', () => {
 
     const replacement = path.join(tempRoot, 'swap.jpg');
     fs.writeFileSync(replacement, makePhoneJpeg(32, 32, 1, 222));
-    replacePhotoImage(owner.db, owner.library, keep.id, replacement);
+    await replacePhotoImage(owner.db, owner.library, keep.id, replacement);
     deletePhotoWithFiles(owner.db, owner.library, drop.id);
     owner.publisher.publishToLocalDirectory(out);
     await crawler.crawlFriendSite('https://erin.example', out);

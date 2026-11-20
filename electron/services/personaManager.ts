@@ -171,12 +171,9 @@ export class PersonaManager {
     });
     const siteGenerator = new StaticSiteGenerator(db, mediaStoreDir);
     const mediaLibrary = new MediaLibrary(mediaStoreDir);
-    try {
-      // One-time upgrade of photos imported before the Media Library (no-op afterwards)
-      optimizeLegacyPhotos(db, mediaLibrary);
-    } catch {
-      // Never block opening a persona over a photo
-    }
+    // One-time upgrade of photos imported before the Media Library (no-op afterwards). It runs in
+    // the background (image work is in a worker) and never blocks opening a persona over a photo.
+    void optimizeLegacyPhotos(db, mediaLibrary).catch(() => undefined);
     return {
       persona: this.hydratePersonaSummary(record, db),
       db,

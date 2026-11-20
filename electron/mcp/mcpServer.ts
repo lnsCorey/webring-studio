@@ -1651,7 +1651,7 @@ export class WebringMcpServer {
           const field = kind === 'avatar' ? 'avatarUrl' : 'bannerUrl';
           let url: string;
           if (args.localPath) {
-            url = setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, String(args.localPath));
+            url = await setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, String(args.localPath));
           } else if (args.photoId) {
             const photo = ctx.db.getAlbums().flatMap((a) => a.photos).find((p) => p.id === String(args.photoId));
             if (!photo) throw new Error(`Photo "${String(args.photoId)}" not found.`);
@@ -1783,7 +1783,7 @@ export class WebringMcpServer {
           const albumId = String(args.albumId || '');
           const urlOrPath = String(args.urlOrLocalPath || '');
           const isLocalFile = !/^https?:\/\//i.test(urlOrPath) && fs.existsSync(urlOrPath);
-          const media = isLocalFile ? ctx.mediaLibrary.importPhoto(urlOrPath, albumId) : undefined;
+          const media = isLocalFile ? await ctx.mediaLibrary.importPhoto(urlOrPath, albumId) : undefined;
           const photo = ctx.db.addPhotoToAlbum({
             albumId,
             url: urlOrPath,
