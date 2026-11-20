@@ -12,7 +12,7 @@ import {
   planSync,
   STUDIO_OWNED_PREFIXES,
 } from './publishSync';
-import { PublishSettings, StudioDatabase } from '../db/database';
+import { PublishSettings, sftpAuthMethodOf, StudioDatabase } from '../db/database';
 import { StaticSiteGenerator } from './siteGenerator';
 import { githubPagesSiteUrl } from '../../src/shared/setup';
 
@@ -25,6 +25,78 @@ export interface PublishResult {
   unchanged?: number;
   removed?: number;
   message: string;
+  /** The SFTP server presented a different key than the pinned one (the app asks the user). */
+  hostKeyMismatch?: { host: string; port: number; expectedFingerprint: string; presentedFingerprint: string };
+}
+
+/**
+ * The SFTP server's key isn't the one pinned at an earlier publish. Nothing was uploaded and the
+ * new key isn't pinned: the user decides, after checking with their host.
+ */
+export class HostKeyMismatchError extends Error {
+  constructor(
+    public host: string,
+    public port: number,
+    public expectedFingerprint: string,
+    public presentedFingerprint: string
+  ) {
+    super(
+      `The server's identity has changed: ${host}:${port} presented a different key than the one pinned at an earlier publish. ` +
+        'Check with your hosting provider before trusting it.'
+    );
+    this.name = 'HostKeyMismatchError';
+  }
+}
+
+/**
+ * A secure (FTPS) connection couldn't be started and unencrypted FTP isn't allowed. Studio never
+ * falls back to plain FTP on its own: the user decides in Publishing settings.
+ */
+export class FtpTlsError extends Error {
+  constructor(host: string, detail: string) {
+    super(
+      `Couldn't start a secure (FTPS) connection to ${host}. Ask your host whether FTPS or SFTP is available. ` +
+        `As a last resort you can allow unencrypted FTP in Publishing settings. (${detail})`
+    );
+    this.name = 'FtpTlsError';
+  }
+}
+
+/** FTP connection options: FTPS with certificate checks unless the user allowed unencrypted FTP. */
+export function ftpAccessOptions(settings: Pick<PublishSettings, 'host' | 'username' | 'password' | 'ftpAllowInsecure'>, port: number) {
+  return {
+    host: settings.host,
+    port,
+    user: settings.username,
+    password: settings.password,
+    secure: !settings.ftpAllowInsecure,
+  };
+}
+
+/** Whether an FTP connection error looks like the TLS (FTPS) part failing. */
+export function isFtpTlsFailure(err: unknown): boolean {
+  const e = err as { message?: string; code?: unknown };
+  const text = `${e?.message || ''} ${String(e?.code || '')}`;
+  return /\b(tls|ssl|certificate|handshake|EPROTO|ERR_TLS\w*|SELF_SIGNED\w*|UNABLE_TO_VERIFY\w*|AUTH TLS)\b|\b(500|502|504|534)\b/i.test(text);
+}
+
+/** The Windows OpenSSH agent's pipe, used when SSH_AUTH_SOCK isn't set. */
+export const WINDOWS_OPENSSH_AGENT_PIPE = '\\\\.\\pipe\\openssh-ssh-agent';
+
+/**
+ * The SSH agent to sign in with: SSH_AUTH_SOCK, or on Windows the OpenSSH agent's pipe. Throws a
+ * readable error when neither is there.
+ */
+export function resolveSshAgent(
+  options: { platform?: string; env?: Record<string, string | undefined>; exists?: (p: string) => boolean } = {}
+): string {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const exists = options.exists ?? ((p: string) => fs.existsSync(p));
+  const sock = env.SSH_AUTH_SOCK?.trim();
+  if (sock && exists(sock)) return sock;
+  if (platform === 'win32' && exists(WINDOWS_OPENSSH_AGENT_PIPE)) return WINDOWS_OPENSSH_AGENT_PIPE;
+  throw new Error('No SSH agent found. Start the OpenSSH Authentication Agent service or choose another sign-in method.');
 }
 
 /** Git's blob id for file contents: sha1("blob <size>\0" + content). */
@@ -49,6 +121,9 @@ export interface GitHubRepoCheckResult {
 }
 
 const GITHUB_API_BASE = 'https://api.github.com';
+
+export const GITHUB_BRANCH_BUSY_MESSAGE =
+  'The GitHub branch is changing too quickly (another publish or a manual commit). Try again in a minute.';
 
 /** A `<owner>.github.io` repo: GitHub Pages serves it at `https://<owner>.github.io` from its default branch. */
 export function isUserPagesRepo(owner: string, repo: string): boolean {
@@ -98,7 +173,7 @@ export function verifyOrPinSftpHostKey(
   host: string,
   port: number,
   presentedSha256Hex: string
-): { accepted: boolean; reason?: string } {
+): { accepted: boolean; reason?: string; mismatch?: HostKeyMismatchError } {
   const normalized = presentedSha256Hex.trim().toLowerCase();
   if (!normalized) {
     return { accepted: false, reason: 'Server did not present a host key.' };
@@ -111,14 +186,26 @@ export function verifyOrPinSftpHostKey(
   if (pinned === normalized) {
     return { accepted: true };
   }
+  // Never re-pinned automatically: recorded so the user can review it (studio:trust-sftp-host-key)
+  db.recordSftpHostKeyMismatch({
+    host,
+    port,
+    expectedFingerprint: pinned,
+    presentedFingerprint: normalized,
+    at: new Date().toISOString(),
+  });
   return {
     accepted: false,
     reason: `SFTP host key changed for ${host}:${port} (expected ${pinned.slice(0, 16)}…, got ${normalized.slice(0, 16)}…).`,
+    mismatch: new HostKeyMismatchError(host, port, pinned, normalized),
   };
 }
 
 export class SitePublisher {
   constructor(private generator: StaticSiteGenerator) {}
+
+  /** Waits before rebuilding on a branch that moved during a publish (3 attempts in all). Tests shorten these. */
+  public githubRetryDelaysMs: number[] = [500, 1000];
 
   /**
    * Exports the generated static website and JSON schemas to a local folder.
@@ -167,21 +254,34 @@ export class SitePublisher {
     if (mode === 'sftp') {
       const sftp = new SftpClient();
       let hostKeyError: string | undefined;
+      let mismatch: HostKeyMismatchError | undefined;
       try {
-        const privateKey = settings.sftpPrivateKeyPath
-          ? fs.readFileSync(settings.sftpPrivateKeyPath, 'utf8')
-          : undefined;
+        // Sign in the way the user chose; the key file is read only now, at connect time
+        const method = sftpAuthMethodOf(settings);
+        const auth: Record<string, unknown> =
+          method === 'agent'
+            ? { agent: resolveSshAgent() }
+            : method === 'privateKey'
+              ? {
+                  privateKey: fs.readFileSync(
+                    settings.sftpPrivateKeyPath || (() => { throw new Error('Choose a key file for SFTP in Publishing settings.'); })(),
+                    'utf8'
+                  ),
+                  ...(settings.sftpKeyPassphrase ? { passphrase: settings.sftpKeyPassphrase } : {}),
+                }
+              : { password: settings.password || '' };
         await sftp.connect({
           host: settings.host,
           port,
           username: settings.username,
-          ...(privateKey ? { privateKey } : {}),
-          ...(settings.sftpUseAgent && process.env.SSH_AUTH_SOCK ? { agent: process.env.SSH_AUTH_SOCK } : {}),
-          ...(settings.password ? { password: settings.password } : {}),
+          ...auth,
           hostHash: 'sha256',
           hostVerifier: (hashedKey: string) => {
             const check = verifyOrPinSftpHostKey(db, settings.host, port, hashedKey);
-            if (!check.accepted) hostKeyError = check.reason;
+            if (!check.accepted) {
+              hostKeyError = check.reason;
+              mismatch = check.mismatch;
+            }
             return check.accepted;
           },
         });
@@ -215,6 +315,21 @@ export class SitePublisher {
         };
       } catch (err: unknown) {
         await sftp.end().catch(() => undefined);
+        if (mismatch) {
+          return {
+            success: false,
+            mode,
+            destination: settings.host,
+            filesPublished: 0,
+            message: mismatch.message,
+            hostKeyMismatch: {
+              host: mismatch.host,
+              port: mismatch.port,
+              expectedFingerprint: mismatch.expectedFingerprint,
+              presentedFingerprint: mismatch.presentedFingerprint,
+            },
+          };
+        }
         const detail = hostKeyError || (err instanceof Error ? err.message : String(err));
         return {
           success: false,
@@ -228,13 +343,14 @@ export class SitePublisher {
 
     const client = new ftp.Client();
     try {
-      await client.access({
-        host: settings.host,
-        port,
-        user: settings.username,
-        password: settings.password,
-        secure: !settings.ftpAllowInsecure,
-      });
+      try {
+        await client.access(ftpAccessOptions(settings, port));
+      } catch (err) {
+        if (!settings.ftpAllowInsecure && isFtpTlsFailure(err)) {
+          throw new FtpTlsError(settings.host, err instanceof Error ? err.message : String(err));
+        }
+        throw err;
+      }
       const owned = await this.listFtpOwned(client, root);
       const plan = planSync(files, db.getPublishLedger(destination), owned);
       const outcome = await applySyncPlan(db, destination, stagingDir, plan, {
@@ -264,7 +380,8 @@ export class SitePublisher {
         mode,
         destination: settings.host,
         filesPublished: 0,
-        message: `FTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
+        message:
+          err instanceof FtpTlsError ? err.message : `FTP upload failed: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
   }
@@ -312,8 +429,9 @@ export class SitePublisher {
   /**
    * Generates the site to a staging folder and pushes it to a GitHub repository branch via the
    * GitHub REST "Git Data" API (blobs/trees/commits), then enables/updates GitHub Pages for that
-   * repo to serve from the branch. Requires a Personal Access Token with `repo` scope (classic)
-   * or Contents: Read & Write + Pages: Read & Write (fine-grained).
+   * repo to serve from the branch. Needs a fine-grained token limited to that repository, with
+   * Contents: Read & Write + Pages: Read & Write. A branch that moves mid-publish is rebuilt on its
+   * new head (never force-pushed), up to three attempts.
    */
   public async publishToGitHubPages(
     settings: PublishSettings,
@@ -361,8 +479,8 @@ export class SitePublisher {
       if (repoInfoBody.permissions && repoInfoBody.permissions.push === false) {
         throw new Error(
           `Resource not accessible by personal access token — it can read ${owner}/${repo} but not push to it. ` +
-            `For a classic token, grant the "repo" scope; for a fine-grained token, grant "Contents: Read and write" ` +
-            `(and "Pages: Read and write" to auto-enable Pages) on this repository, then save your settings again.`
+            `Use a fine-grained token limited to this repository with "Contents: Read and write" ` +
+            `(and "Pages: Read and write" to auto-enable Pages), then save your settings again.`
         );
       }
 
@@ -392,100 +510,125 @@ export class SitePublisher {
         throw new Error(`Failed to resolve branch "${branch}" (HTTP ${refRes.status})${this.githubErrorDetail(refRes.body)}`);
       }
 
-      const baseCommitRes = await gh(`${repoPath}/git/commits/${baseCommitSha}`);
-      if (baseCommitRes.status !== 200) {
-        throw new Error(`Failed to read base commit (HTTP ${baseCommitRes.status})${this.githubErrorDetail(baseCommitRes.body)}`);
-      }
-      const baseTreeSha = (baseCommitRes.body as { tree: { sha: string } }).tree.sha;
-
-      // 2. Compare with what's on the branch: GitHub identifies files by their git blob hash, so
-      // unchanged files (most photos, most of the time) aren't uploaded again.
-      const remoteTreeRes = await gh(`${repoPath}/git/trees/${baseTreeSha}?recursive=1`);
-      const remoteTree = new Map<string, string>();
-      let remoteComplete = false;
-      if (remoteTreeRes.status === 200) {
-        const body = remoteTreeRes.body as { truncated?: boolean; tree: Array<{ path: string; type: string; sha: string }> };
-        for (const entry of body.tree) if (entry.type === 'blob') remoteTree.set(entry.path, entry.sha);
-        remoteComplete = !body.truncated;
-      }
       const destination = `github:${owner}/${repo}@${branch}`;
       const db = this.generator.database;
       const ledger = db.getPublishLedger(destination);
       const files = hashStagedFiles(stagingDir);
-      const toUpload = [...files.keys()].filter(
-        (relPath) => remoteTree.get(relPath) !== gitBlobSha(fs.readFileSync(path.join(stagingDir, relPath)))
-      );
-      // Only delete what Studio published here (or owns outright), and only if it's still there
-      const plan = planSync(files, ledger, remoteComplete ? [...remoteTree.keys()] : []);
-      const toRemove = plan.remove.filter((relPath) => remoteTree.has(relPath));
-      if (toUpload.length === 0 && toRemove.length === 0) {
-        for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
-        this.generator.recordPublished(genResult.bundle);
-        return {
-          success: true,
-          mode: 'github-pages',
-          destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
-          filesPublished: 0,
-          uploaded: 0,
-          unchanged: files.size,
-          removed: 0,
-          message: `${owner}/${repo}@${branch} is already up to date.${missingNote(genResult.missingMedia)}`,
-        };
-      }
+      // Blobs already uploaded (by local path), so a retry on a moved branch doesn't upload them again
+      const uploadedBlobs = new Map<string, string>();
+      let toUpload: string[] = [];
+      let toRemove: string[] = [];
+      let plan: { remove: string[] } = { remove: [] };
+      const delays = this.githubRetryDelaysMs;
+      let published = false;
 
-      // 3. Upload changed files as blobs. GitHub's abuse-detection rate limiter flags concurrent
-      // writes to this endpoint, so these go one at a time (retried internally with backoff by
-      // githubRequest on 403/429) rather than in parallel chunks.
-      const treeEntries: Array<{ path: string; mode: string; type: string; sha: string | null }> = [];
-      for (const relPath of toUpload) {
-        const content = fs.readFileSync(path.join(stagingDir, relPath)).toString('base64');
-        const blobRes = await gh(`${repoPath}/git/blobs`, 'POST', {
-          content,
-          encoding: 'base64',
-        });
-        if (blobRes.status !== 201) {
-          throw new Error(
-            `Failed to upload "${relPath}" (HTTP ${blobRes.status})${this.githubErrorDetail(blobRes.body)}`
-          );
+      for (let attempt = 0; attempt < delays.length + 1 && !published; attempt++) {
+        if (attempt > 0) {
+          // The branch moved under us (another publish or a manual commit): wait, then rebuild on its new head
+          await new Promise((resolve) => setTimeout(resolve, delays[attempt - 1]));
+          const headRes = await gh(`${repoPath}/git/ref/heads/${encodeURIComponent(branch)}`);
+          if (headRes.status !== 200) {
+            throw new Error(`Failed to re-read branch "${branch}" (HTTP ${headRes.status})${this.githubErrorDetail(headRes.body)}`);
+          }
+          baseCommitSha = (headRes.body as { object: { sha: string } }).object.sha;
         }
-        treeEntries.push({
-          path: relPath,
-          mode: '100644',
-          type: 'blob',
-          sha: (blobRes.body as { sha: string }).sha,
+
+        const baseCommitRes = await gh(`${repoPath}/git/commits/${baseCommitSha}`);
+        if (baseCommitRes.status !== 200) {
+          throw new Error(`Failed to read base commit (HTTP ${baseCommitRes.status})${this.githubErrorDetail(baseCommitRes.body)}`);
+        }
+        const baseTreeSha = (baseCommitRes.body as { tree: { sha: string } }).tree.sha;
+
+        // 2. Compare with what's on the branch: GitHub identifies files by their git blob hash, so
+        // unchanged files (most photos, most of the time) aren't uploaded again.
+        const remoteTreeRes = await gh(`${repoPath}/git/trees/${baseTreeSha}?recursive=1`);
+        const remoteTree = new Map<string, string>();
+        let remoteComplete = false;
+        if (remoteTreeRes.status === 200) {
+          const body = remoteTreeRes.body as { truncated?: boolean; tree: Array<{ path: string; type: string; sha: string }> };
+          for (const entry of body.tree) if (entry.type === 'blob') remoteTree.set(entry.path, entry.sha);
+          remoteComplete = !body.truncated;
+        }
+        toUpload = [...files.keys()].filter(
+          (relPath) => remoteTree.get(relPath) !== gitBlobSha(fs.readFileSync(path.join(stagingDir, relPath)))
+        );
+        // Only delete what Studio published here (or owns outright), and only if it's still there
+        plan = planSync(files, ledger, remoteComplete ? [...remoteTree.keys()] : []);
+        toRemove = plan.remove.filter((relPath) => remoteTree.has(relPath));
+        if (toUpload.length === 0 && toRemove.length === 0) {
+          for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
+          this.generator.recordPublished(genResult.bundle);
+          return {
+            success: true,
+            mode: 'github-pages',
+            destination: `https://github.com/${owner}/${repo}/tree/${branch}`,
+            filesPublished: 0,
+            uploaded: 0,
+            unchanged: files.size,
+            removed: 0,
+            message: `${owner}/${repo}@${branch} is already up to date.${missingNote(genResult.missingMedia)}`,
+          };
+        }
+
+        // 3. Upload changed files as blobs. GitHub's abuse-detection rate limiter flags concurrent
+        // writes to this endpoint, so these go one at a time (retried internally with backoff by
+        // githubRequest on 403/429) rather than in parallel chunks.
+        const treeEntries: Array<{ path: string; mode: string; type: string; sha: string | null }> = [];
+        for (const relPath of toUpload) {
+          const content = fs.readFileSync(path.join(stagingDir, relPath));
+          const localSha = gitBlobSha(content);
+          let blobSha = uploadedBlobs.get(relPath) === localSha ? localSha : undefined;
+          if (!blobSha) {
+            const blobRes = await gh(`${repoPath}/git/blobs`, 'POST', {
+              content: content.toString('base64'),
+              encoding: 'base64',
+            });
+            if (blobRes.status !== 201) {
+              throw new Error(
+                `Failed to upload "${relPath}" (HTTP ${blobRes.status})${this.githubErrorDetail(blobRes.body)}`
+              );
+            }
+            blobSha = (blobRes.body as { sha: string }).sha;
+            uploadedBlobs.set(relPath, blobSha);
+          }
+          treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: blobSha });
+        }
+        for (const relPath of toRemove) {
+          treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: null });
+        }
+
+        // 4. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
+        const treeRes = await gh(`${repoPath}/git/trees`, 'POST', {
+          base_tree: baseTreeSha,
+          tree: treeEntries,
         });
-      }
-      for (const relPath of toRemove) {
-        treeEntries.push({ path: relPath, mode: '100644', type: 'blob', sha: null });
-      }
+        if (treeRes.status !== 201) {
+          throw new Error(`Failed to create tree (HTTP ${treeRes.status})${this.githubErrorDetail(treeRes.body)}`);
+        }
+        const newTreeSha = (treeRes.body as { sha: string }).sha;
 
-      // 4. Create a new tree + commit on top of the branch's current state, then fast-forward the ref.
-      const treeRes = await gh(`${repoPath}/git/trees`, 'POST', {
-        base_tree: baseTreeSha,
-        tree: treeEntries,
-      });
-      if (treeRes.status !== 201) {
-        throw new Error(`Failed to create tree (HTTP ${treeRes.status})${this.githubErrorDetail(treeRes.body)}`);
-      }
-      const newTreeSha = (treeRes.body as { sha: string }).sha;
+        const commitRes = await gh(`${repoPath}/git/commits`, 'POST', {
+          message: `Publish site via Webring Studio (${toUpload.length} changed, ${toRemove.length} removed)`,
+          tree: newTreeSha,
+          parents: [baseCommitSha],
+        });
+        if (commitRes.status !== 201) {
+          throw new Error(`Failed to create commit (HTTP ${commitRes.status})${this.githubErrorDetail(commitRes.body)}`);
+        }
+        const newCommitSha = (commitRes.body as { sha: string }).sha;
 
-      const commitRes = await gh(`${repoPath}/git/commits`, 'POST', {
-        message: `Publish site via Webring Studio (${toUpload.length} changed, ${toRemove.length} removed)`,
-        tree: newTreeSha,
-        parents: [baseCommitSha],
-      });
-      if (commitRes.status !== 201) {
-        throw new Error(`Failed to create commit (HTTP ${commitRes.status})${this.githubErrorDetail(commitRes.body)}`);
+        // Never forced: a 422 means the branch moved since we read it, so rebuild on its new head
+        const updateRefRes = await gh(`${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
+          sha: newCommitSha,
+          force: false,
+        });
+        if (updateRefRes.status === 200) {
+          published = true;
+        } else if (updateRefRes.status !== 422) {
+          throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
+        }
       }
-      const newCommitSha = (commitRes.body as { sha: string }).sha;
-
-      const updateRefRes = await gh(`${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`, 'PATCH', {
-        sha: newCommitSha,
-        force: false,
-      });
-      if (updateRefRes.status !== 200) {
-        throw new Error(`Failed to update branch "${branch}" (HTTP ${updateRefRes.status})${this.githubErrorDetail(updateRefRes.body)}`);
-      }
+      if (!published) throw new Error(GITHUB_BRANCH_BUSY_MESSAGE);
 
       for (const [relPath, hash] of files) db.setPublishLedgerEntry(destination, relPath, hash);
       for (const relPath of plan.remove) db.setPublishLedgerEntry(destination, relPath, null);

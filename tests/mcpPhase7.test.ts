@@ -615,7 +615,7 @@ describe('Security Phase 7: renderer boundary and MCP token', () => {
     for (const directive of ["object-src 'none'", "base-uri 'none'", "form-action 'none'", 'frame-src http://127.0.0.1:*']) {
       expect(csp).toContain(directive);
     }
-    const vite = read('vite.config.ts');
+    const vite = read('vite.config.mts');
     expect(vite).toMatch(/apply: 'serve'/);
     // A build in this checkout keeps it (checked when dist exists)
     if (fs.existsSync(path.join(root, 'dist/index.html'))) {

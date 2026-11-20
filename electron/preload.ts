@@ -51,6 +51,12 @@ contextBridge.exposeInMainWorld('studioApi', {
   getSecurityStatus: () => ipcRenderer.invoke('studio:get-security-status'),
   getAgentChanges: () => ipcRenderer.invoke('studio:get-agent-changes'),
   releaseAgentChanges: () => ipcRenderer.invoke('studio:release-agent-changes'),
+  previewClosed: () => ipcRenderer.invoke('studio:preview-closed'),
+  onPreviewStopped: (cb: () => void) => {
+    const listener = () => cb();
+    ipcRenderer.on('studio:preview-stopped', listener);
+    return () => ipcRenderer.removeListener('studio:preview-stopped', listener);
+  },
   onShowAutoPublish: (cb: () => void) => {
     const listener = () => cb();
     ipcRenderer.on('studio:show-auto-publish', listener);
@@ -109,6 +115,10 @@ contextBridge.exposeInMainWorld('studioApi', {
     change: { action: 'remove' | 'ban' | 'unban' | 'hide' | 'show' | 'up' | 'down'; reason?: string }
   ) => ipcRenderer.invoke('studio:hosted-ring-member', ringId, siteUrl, change),
   chooseExportFolder: () => ipcRenderer.invoke('studio:choose-export-folder'),
+  pickSftpKey: () => ipcRenderer.invoke('studio:pick-sftp-key'),
+  getSftpHostKey: () => ipcRenderer.invoke('studio:get-sftp-host-key'),
+  forgetSftpHostKey: () => ipcRenderer.invoke('studio:forget-sftp-host-key'),
+  trustSftpHostKey: (presentedFingerprint: string) => ipcRenderer.invoke('studio:trust-sftp-host-key', presentedFingerprint),
   exportLocal: (targetDir?: string, options?: { includeAgentChanges?: boolean }) =>
     ipcRenderer.invoke('studio:export-local', targetDir, options),
   testExportPreview: (openInBrowser?: boolean) =>

@@ -33,6 +33,13 @@ import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
 import { ConfirmDialog, PlaintextConsentDialog, SecurityBanner, SecurityStatusView } from './SecurityBanner';
 import { McpApprovalModal, McpApprovalPanel, McpApprovalView } from './McpApprovalModal';
 import { HeldAgentChangeView, HeldChangesPanel } from './HeldChangesPanel';
+import { SafetyControlsHelp } from './SafetyControlsHelp';
+import { authMethodOf, HostKeyMismatchDialog, SftpHostKeyApi, SftpSecurityControls } from './SftpSecurityControls';
+
+/** Where GitHub creates a fine-grained token (the user picks the one repository there). */
+export const GITHUB_NEW_TOKEN_URL = 'https://github.com/settings/personal-access-tokens/new';
+export const GITHUB_TOKEN_GUIDANCE =
+  'Create a fine-grained personal access token limited to only this repository, with Contents: Read and write and Pages: Read and write. Avoid classic tokens; they grant access to all your repositories.';
 import { formatFingerprint } from '../shared/fingerprint';
 import { friendAvatarSrc, localAvatarDataUri } from '../shared/avatar';
 import { MarkdownField } from './MarkdownField';
@@ -90,6 +97,12 @@ interface PublishSettingsState {
   port: number;
   username: string;
   password?: string;
+  sftpAuthMethod?: 'password' | 'privateKey' | 'agent';
+  sftpUseAgent?: boolean;
+  /** Shown by name only; set by the main-process key picker. */
+  sftpPrivateKeyPath?: string;
+  sftpKeyPassphrase?: string;
+  ftpAllowInsecure?: boolean;
   remotePath: string;
   atprotoPdsUrl?: string;
   publishFriendsList?: boolean;
@@ -524,6 +537,8 @@ declare global {
       getAgentChanges?: () => Promise<HeldAgentChangeView[]>;
       releaseAgentChanges?: () => Promise<unknown>;
       onShowAutoPublish?: (cb: () => void) => () => void;
+      previewClosed?: () => Promise<unknown>;
+      onPreviewStopped?: (cb: () => void) => () => void;
       onSecurityStatusChanged?: (cb: (status: SecurityStatusView) => void) => () => void;
       createAlbum: (input: unknown) => Promise<unknown>;
       deleteAlbum: (albumId: string) => Promise<unknown>;
@@ -630,6 +645,10 @@ declare global {
       autoPublishCancel?: (personaId: string) => Promise<ScheduleOverview>;
       onScheduleUpdated?: (cb: () => void) => () => void;
       chooseExportFolder: () => Promise<string | null>;
+      pickSftpKey?: SftpHostKeyApi['pickSftpKey'];
+      getSftpHostKey?: SftpHostKeyApi['getSftpHostKey'];
+      forgetSftpHostKey?: SftpHostKeyApi['forgetSftpHostKey'];
+      trustSftpHostKey?: (presentedFingerprint: string) => Promise<unknown>;
       exportLocal: (targetDir?: string, options?: PublishHeldOptions) => Promise<{
         success: boolean;
         destination: string;
@@ -644,6 +663,7 @@ declare global {
         destination: string;
         filesPublished: number;
         message: string;
+        hostKeyMismatch?: { host: string; port: number; expectedFingerprint: string; presentedFingerprint: string };
       }>;
       publishGithub: (settings: unknown, options?: PublishHeldOptions) => Promise<{
         success: boolean;
@@ -762,6 +782,7 @@ export const App: React.FC = () => {
     | 'webrings'
     | 'hubs'
     | 'security-storage'
+    | 'safety-controls'
   >('quickstart');
   const [bundle, setBundle] = useState<CompleteSiteBundle | null>(null);
   const [allFriends, setAllFriends] = useState<FriendConnection[]>([]);
@@ -965,6 +986,10 @@ export const App: React.FC = () => {
   const [testExportResult, setTestExportResult] = useState<TestExportPreviewState | null>(null);
   const [previewRenderMode, setPreviewRenderMode] = useState<'studio' | 'exported-http'>('studio');
   const [iframeRefreshKey, setIframeRefreshKey] = useState<number>(0);
+  // The loopback preview server stopped after 10 idle minutes while the preview was showing
+  const [previewIdleStopped, setPreviewIdleStopped] = useState(false);
+  // It isn't running (preview closed, or idle-stopped): start it again when the preview opens
+  const previewServerStopped = useRef(false);
 
   // MCP Agent Hub state
   const [mcpInfo, setMcpInfo] = useState<{
@@ -1163,12 +1188,14 @@ export const App: React.FC = () => {
     if (!window.studioApi) throw new Error('Not available.');
     const publish = (updates as { publishSettings?: Record<string, unknown> } | null)?.publishSettings;
     const newSecret = publish
-      ? (['password', 'githubToken'] as const).find(
+      ? (['password', 'githubToken', 'sftpKeyPassphrase'] as const).find(
           (field) => typeof publish[field] === 'string' && publish[field] && publish[field] !== '••••••••'
         )
       : undefined;
     if (newSecret && !securityStatus.keyVaultAvailable) {
-      const allow = await askConsent(newSecret === 'githubToken' ? 'GitHub token' : 'password');
+      const allow = await askConsent(
+        newSecret === 'githubToken' ? 'GitHub token' : newSecret === 'sftpKeyPassphrase' ? 'key passphrase' : 'password'
+      );
       if (!allow) {
         notify("Not saved: you chose not to store it without encryption.");
         throw new Error('Not saved: storing it without encryption was declined.');
@@ -1340,6 +1367,35 @@ export const App: React.FC = () => {
       setSelectedAlbumId('');
     }
   };
+
+  // The preview server runs only while needed: closing the preview stops it, and an idle stop
+  // (10 minutes) offers a restart. Getting the bundle starts it again.
+  const restartPreview = async () => {
+    await refreshStudioData();
+    previewServerStopped.current = false;
+    setPreviewIdleStopped(false);
+    setIframeRefreshKey((k) => k + 1);
+  };
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  useEffect(
+    () =>
+      window.studioApi?.onPreviewStopped?.(() => {
+        previewServerStopped.current = true;
+        if (activeTabRef.current === 'preview') setPreviewIdleStopped(true);
+      }),
+    []
+  );
+  useEffect(() => {
+    if (activeTab !== 'preview') return;
+    if (previewServerStopped.current) void restartPreview();
+    return () => {
+      previewServerStopped.current = true;
+      setPreviewIdleStopped(false);
+      void window.studioApi?.previewClosed?.();
+    };
+    // Only entering and leaving the Preview tab matter here
+  }, [activeTab]);
 
   const handleSwitchPersona = async (personaId: string) => {
     if (!window.studioApi || personaId === activePersonaId) return;
@@ -2487,8 +2543,17 @@ export const App: React.FC = () => {
     notify(`Deleted stored SFTP/FTP credentials from ${activeLabel}'s database.`);
   };
 
-  const handlePublishRemote = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // SFTP: the server presented a different key than the pinned one (the review dialog is open)
+  const [hostKeyMismatch, setHostKeyMismatch] = useState<{
+    host: string;
+    port: number;
+    expectedFingerprint: string;
+    presentedFingerprint: string;
+  } | null>(null);
+  const [sftpKeyRefresh, setSftpKeyRefresh] = useState(0);
+
+  const handlePublishRemote = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (!window.studioApi) return;
     await saveProfile({ publishSettings });
     const options = await confirmPublishWithHeldChanges();
@@ -2497,6 +2562,8 @@ export const App: React.FC = () => {
     const res = await window.studioApi.publishRemote(publishSettings, options);
     void refreshSecurityStatus();
     await refreshStudioData();
+    setSftpKeyRefresh((n) => n + 1);
+    if (res.hostKeyMismatch) setHostKeyMismatch(res.hostKeyMismatch);
     notify(res.message);
   };
 
@@ -5862,7 +5929,16 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className="rounded-2xl overflow-hidden border border-slate-800 shadow-2xl bg-slate-950">
+              <div className="relative rounded-2xl overflow-hidden border border-slate-800 shadow-2xl bg-slate-950">
+                {previewIdleStopped && (
+                  <button
+                    type="button"
+                    onClick={() => void restartPreview()}
+                    className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/85 text-sm font-semibold text-slate-200 hover:text-white"
+                  >
+                    Preview stopped — click to restart
+                  </button>
+                )}
                 {previewRenderMode === 'exported-http' && testExportResult ? (
                   <iframe
                     key={`${testExportResult.previewUrl}-${iframeRefreshKey}`}
@@ -6531,17 +6607,19 @@ export const App: React.FC = () => {
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     />
                   </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Password</label>
-                    <input
-                      type="password"
-                      value={publishSettings.password || ''}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, password: e.target.value }))
-                      }
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                  </div>
+                  {(publishSettings.protocol === 'ftp' || authMethodOf(publishSettings) === 'password') && (
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">Password</label>
+                      <input
+                        type="password"
+                        value={publishSettings.password || ''}
+                        onChange={(e) =>
+                          setPublishSettings((prev) => ({ ...prev, password: e.target.value }))
+                        }
+                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                      />
+                    </div>
+                  )}
                   <div>
                     <label className="block text-xs text-slate-400 mb-1">Remote Web Root Path</label>
                     <input
@@ -6556,6 +6634,15 @@ export const App: React.FC = () => {
                     />
                   </div>
                 </div>
+
+                <SftpSecurityControls
+                  settings={publishSettings}
+                  onChange={(changes) => setPublishSettings((prev) => ({ ...prev, ...changes }))}
+                  api={window.studioApi}
+                  askConfirm={askConfirm}
+                  notify={notify}
+                  refreshKey={sftpKeyRefresh}
+                />
 
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
                   <div className="flex flex-wrap items-center gap-2.5">
@@ -6607,9 +6694,18 @@ export const App: React.FC = () => {
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
                       Pushes the generated site straight to a repo branch via the GitHub API and
-                      enables Pages for it. Needs a token with <code>repo</code> scope (classic) or
-                      Contents + Pages read/write (fine-grained). Stored in this persona's SQLite
-                      database, same as the SFTP/FTP credentials above.
+                      enables Pages for it. Stored in this persona's SQLite database, same as the
+                      SFTP/FTP credentials above.
+                    </p>
+                    <p className="text-xs text-slate-300 mt-1.5">
+                      {GITHUB_TOKEN_GUIDANCE}{' '}
+                      <button
+                        type="button"
+                        onClick={() => window.studioApi?.openExternal(GITHUB_NEW_TOKEN_URL)}
+                        className="text-indigo-300 hover:text-indigo-200 font-semibold underline"
+                      >
+                        Create token on GitHub
+                      </button>
                     </p>
                   </div>
                   {(publishSettings.githubOwner || publishSettings.githubRepo) && (
@@ -7764,6 +7860,7 @@ export const App: React.FC = () => {
                       { id: 'webrings', label: '7. Webrings Guide' },
                       { id: 'hubs', label: '8. Webring Hubs' },
                       { id: 'security-storage', label: '9. Secure Storage & Proxy' },
+                      { id: 'safety-controls', label: '10. Safety Notices & Controls' },
                     ] as const
                   ).map((sec) => (
                     <button
@@ -8151,11 +8248,14 @@ export const App: React.FC = () => {
                             <strong>Add a README</strong> (Studio can't publish to a repo with no commits).
                           </li>
                           <li>
-                            Create a token at <strong>GitHub → Settings → Developer settings → Personal
-                            access tokens → Tokens (classic) → Generate new token</strong>, with the{' '}
-                            <code>public_repo</code> scope. (A fine-grained token needs{' '}
-                            <strong>Contents: Read and write</strong> and <strong>Pages: Read and
-                            write</strong> on that repository.)
+                            {GITHUB_TOKEN_GUIDANCE}{' '}
+                            <button
+                              type="button"
+                              onClick={() => window.studioApi?.openExternal(GITHUB_NEW_TOKEN_URL)}
+                              className="underline font-semibold"
+                            >
+                              Create token on GitHub
+                            </button>
                           </li>
                           <li>
                             Enter the owner, repository and token. For a{' '}
@@ -9155,6 +9255,8 @@ git push -u origin main --force`}
               )}
 
               {/* SECTION 9: SECURE STORAGE & PROXY */}
+              {helpSection === 'safety-controls' && <SafetyControlsHelp />}
+
               {helpSection === 'security-storage' && (
                 <div className="space-y-6">
                   <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
@@ -9542,6 +9644,24 @@ git push -u origin main --force`}
           onClose={() => {
             setApprovalModalOpen(false);
             setApprovalFocusId(null);
+          }}
+        />
+      )}
+
+      {hostKeyMismatch && (
+        <HostKeyMismatchDialog
+          mismatch={hostKeyMismatch}
+          onCancel={() => setHostKeyMismatch(null)}
+          onTrust={async () => {
+            try {
+              await window.studioApi?.trustSftpHostKey?.(hostKeyMismatch.presentedFingerprint);
+            } catch (err) {
+              notify(errorMessage(err));
+              return;
+            }
+            setHostKeyMismatch(null);
+            notify('Trusted the server\'s new key. Publishing…');
+            await handlePublishRemote();
           }}
         />
       )}

@@ -34,7 +34,7 @@ There are no packaged releases yet; run Webring Studio from source.
 
 **Requirements**
 
-- **Node.js 22.13 or newer** (Node 24 recommended) and npm. `npm install` refuses older versions. Ubuntu and Debian's `apt` package is too old (Node 18), so install Node with [nvm](https://github.com/nvm-sh/nvm) instead:
+- **Node.js 24** and npm. `npm install` refuses other versions (older ones lack features Studio uses, and the test tools don't run on Node 26 yet). Ubuntu and Debian's `apt` package is too old (Node 18), so install Node with [nvm](https://github.com/nvm-sh/nvm) instead:
   ```bash
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
   # open a new terminal, then:
@@ -64,7 +64,7 @@ The first launch creates an empty primary persona. Start by setting your site's 
 
 **Troubleshooting**
 
-- **`EBADENGINE` / "Unsupported engine":** your Node is too old. Check with `node -v`, run `nvm install 24 && nvm use 24`, delete `node_modules`, and run `npm install` again.
+- **`EBADENGINE` / "Unsupported engine":** your Node isn't version 24. Check with `node -v`, run `nvm install 24 && nvm use 24`, delete `node_modules`, and run `npm install` again.
 - **"N vulnerabilities" after `npm install`:** npm's audit report about the project's dependencies; it doesn't mean the install failed. **Don't run `npm audit fix --force`**: it upgrades packages across major versions and will break the app.
 
 ## Getting started
@@ -119,6 +119,15 @@ A persona is a separate online identity: its own SQLite database, Ed25519 key, `
 - **The proxy never falls back to a direct connection.** If a saved proxy can't be unlocked on this device, Studio pauses all of that persona's network activity and shows a red **Network activity paused** notice, rather than revealing your IP address. Re-enter the proxy to continue.
 - **Big photos can't freeze Studio.** Photos are processed in a separate thread with its own memory limit and a 20-second limit; an image that's too large or takes too long is refused with a message.
 - **Schedule jitter.** Scheduled syncs and publishes can start at a random time up to 5, 15 or 30 minutes after their slot, so several personas on one computer don't contact hosts at the same moment and give away that they're linked.
+
+#### Publishing safely
+
+- **SFTP sign-in.** In **Publish & SFTP**, choose **Password**, **Private key file** or **SSH agent**. A key file is chosen with **Choose key file…** (Studio keeps its location, never a typed path) and can have a passphrase, which is encrypted like your password. **SSH agent** uses `SSH_AUTH_SOCK`, or on Windows the OpenSSH Authentication Agent service.
+- **The server's key is pinned.** On the first SFTP publish Studio remembers the server's key fingerprint and shows it under the settings. If a later publish sees a different key, nothing is uploaded and **The server's identity has changed** shows both fingerprints. That happens when a host rebuilds a server, but also when someone intercepts the connection, so check with your host before **Trust new key and publish** (it asks twice, and trusts only the key the server presented). **Forget pinned key** is for a host that told you its key changed.
+- **FTP is encrypted by default (FTPS).** If your host doesn't support it, publishing stops and says so. Ask your host about FTPS or SFTP; **Allow unencrypted FTP** is a last resort, since it sends your password and files in clear text. Agents can't turn it on.
+- **GitHub: a token for one repository.** Click **Create token on GitHub** and create a fine-grained token limited to only that repository, with **Contents: Read and write** and **Pages: Read and write**. Avoid classic tokens; they grant access to all your repositories. If the branch changes while you publish (another publish or a manual commit), Studio rebuilds on top of it, up to three tries, and never force-pushes; if it keeps changing it asks you to try again in a minute.
+- **Your page runs only its own scripts.** The published page's Content Security Policy lists a hash of each of its scripts instead of allowing any inline script, and it has no inline event handlers. Add-ons you turn on (analytics, ads, comments) add only their own hosts.
+- **The preview server runs only while needed.** The site preview is served on `127.0.0.1`. It stops when you leave the Preview tab, when Studio quits, and after 10 minutes with no requests (**Preview stopped — click to restart**). Studio's window can only show that one preview address in a frame.
 
 #### Changing your signing key
 
@@ -268,7 +277,7 @@ While Studio is open, it serves MCP on `127.0.0.1` with a fixed port. This is th
 
 - Any other client: add a Streamable HTTP server at `http://127.0.0.1:<port>/mcp` and send the header `Authorization: Bearer <token>` with every request.
 
-Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the token in that header, whether or not an `Origin` header is sent. A token in the URL (`?token=`) isn't accepted: URLs end up in logs, shell history and process lists. Web pages are always refused. Treat the token like a password. It's kept in `mcp-http.json` in Studio's data folder, which is inside your user profile; on Windows that's what protects it (the file's `0600` mode has no effect there). To issue a new token, quit Studio, delete `mcp-http.json`, and reopen it.
+Every route on the loopback HTTP/SSE server (`/mcp`, `/mcp/message`, `/mcp/sse`, and `/mcp/health`) requires the token in that header, whether or not an `Origin` header is sent. A token in the URL (`?token=`) isn't accepted: URLs end up in logs, shell history and process lists. Web pages are always refused. Treat the token like a password. It's kept in `mcp-http.json` in Studio's data folder (see [Installation](#installation) for where that is), which is inside your user profile; on Windows that's what protects it (the file's `0600` mode has no effect there). To issue a new token, quit Studio, delete `mcp-http.json`, and reopen it.
 
 **MCP safety controls:**
 
@@ -299,12 +308,14 @@ Then configure your MCP client to run:
 
 ## Development
 
+Requires Node 24 (see .nvmrc). Run `nvm use` before `npm ci`.
+
 | Command | What it does |
 |---|---|
 | `npm run dev` | Build the UI and the Electron code, then launch the app |
 | `npm run build` | Build both without launching |
 | `npm run build:vite` / `npm run build:electron` | Build just the UI / just the Electron code |
-| `npm test` | Run the test suite (Vitest, `tests/federation.test.ts`) |
+| `npm test` | Run the test suite (Vitest, `tests/*.test.ts`) |
 | `npm run loadtest:sync` | Measure how syncing scales with 50–2000 friends ([tests/load/README.md](tests/load/README.md)) |
 | `npx tsc -p tsconfig.json --noEmit` | Type-check the UI |
 | `npx tsc -p tsconfig.electron.json --noEmit` | Type-check the Electron code |
@@ -312,7 +323,7 @@ Then configure your MCP client to run:
 | `node scripts/brand-dev-electron.mjs` | macOS: show "Webring Studio" and its icon in the Dock and app menu when running from source (runs automatically after `npm install` and before `npm run dev`) |
 | `python3 scripts/generate-icons.py` | Regenerate every app icon and branded image from `images/logo-icon.png` (macOS) |
 
-**No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 22.13+ (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
+**No native modules.** Storage uses Node's built-in `node:sqlite`, available in Node 24 (tests, stdio MCP server) and in Electron 45's bundled Node 24 (the app), so nothing is compiled during install. If `ELECTRON_RUN_AS_NODE=1` is set in your shell (some editors set it), `npm run dev` will fail to open a window; unset it first.
 
 **Testing against local sites.** Studio refuses `http://` and local-network addresses for friends, rings and hubs. To test with a site or hub on `127.0.0.1` (for example `php -S 127.0.0.1:8080 index.php` in `webring-hub-php`), start Studio with `WEBRING_ALLOW_PRIVATE_PEERS=1` set. Never set it for everyday use.
 

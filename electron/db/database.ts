@@ -76,7 +76,7 @@ import {
 } from './legacyDemoContent';
 
 /** Publishing credentials, sealed at rest and never returned by getProfile(). */
-const SECRET_PUBLISH_FIELDS = ['password', 'githubToken'] as const;
+const SECRET_PUBLISH_FIELDS = ['password', 'githubToken', 'sftpKeyPassphrase'] as const;
 type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
 
 /**
@@ -223,6 +223,27 @@ export interface WebringHubRecord {
   infoCheckedAt?: string;
 }
 
+export type SftpAuthMethod = 'password' | 'privateKey' | 'agent';
+
+/** The SFTP sign-in method, for settings saved before it was stored. */
+export function sftpAuthMethodOf(settings: { sftpAuthMethod?: string; sftpUseAgent?: boolean; sftpPrivateKeyPath?: string }): SftpAuthMethod {
+  if (settings.sftpAuthMethod === 'password' || settings.sftpAuthMethod === 'privateKey' || settings.sftpAuthMethod === 'agent') {
+    return settings.sftpAuthMethod;
+  }
+  if (settings.sftpUseAgent) return 'agent';
+  if (settings.sftpPrivateKeyPath) return 'privateKey';
+  return 'password';
+}
+
+/** The last time an SFTP server presented a different key than the pinned one. */
+export interface SftpHostKeyMismatch {
+  host: string;
+  port: number;
+  expectedFingerprint: string;
+  presentedFingerprint: string;
+  at: string;
+}
+
 export interface PublishSettings {
   exportPath: string;
   protocol: 'sftp' | 'ftp';
@@ -230,8 +251,13 @@ export interface PublishSettings {
   port: number;
   username: string;
   password?: string;
+  /** Set only by the main-process key picker (studio:pick-sftp-key), never from the window. */
   sftpPrivateKeyPath?: string;
   sftpUseAgent?: boolean;
+  /** How SFTP signs in. Older settings derive it: agent, else a key file, else the password. */
+  sftpAuthMethod?: SftpAuthMethod;
+  /** The key file's passphrase, sealed like the password. */
+  sftpKeyPassphrase?: string;
   ftpAllowInsecure?: boolean;
   remotePath: string;
   atprotoPdsUrl?: string;
@@ -809,13 +835,13 @@ export class StudioDatabase {
    * The real publishing credentials, decrypted. Only the publisher should call this, right before
    * connecting. Throws KeyVaultUnavailableError outside the app (where nothing can publish anyway).
    */
-  public getPublishCredentials(): { password: string; githubToken: string } {
+  public getPublishCredentials(): { password: string; githubToken: string; sftpKeyPassphrase: string } {
     const stored = this.readStoredPublishSettings();
     const open = (field: SecretPublishField) => {
       const value = stored[field];
       return typeof value === 'string' && value ? openSecret(value, this.keyCipher) : '';
     };
-    return { password: open('password'), githubToken: open('githubToken') };
+    return { password: open('password'), githubToken: open('githubToken'), sftpKeyPassphrase: open('sftpKeyPassphrase') };
   }
 
   /**
@@ -3737,11 +3763,69 @@ export class StudioDatabase {
 
   public setSftpHostKeyFingerprint(host: string, port: number, fingerprint: string): void {
     const key = `sftp_host_key:${host.trim().toLowerCase()}:${port}`;
+    const upsert = this.db.prepare(
+      'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    );
+    upsert.run(key, fingerprint);
+    upsert.run(`sftp_host_key_at:${host.trim().toLowerCase()}:${port}`, new Date().toISOString());
+  }
+
+  /** The pinned server key for a host, with when it was pinned (null before the first publish). */
+  public getSftpHostKey(host: string, port: number): { host: string; port: number; fingerprint: string; pinnedAt: string } | null {
+    const fingerprint = this.getSftpHostKeyFingerprint(host, port);
+    if (!fingerprint) return null;
+    const at = this.db
+      .prepare('SELECT value FROM local_settings WHERE key = ?')
+      .get(`sftp_host_key_at:${host.trim().toLowerCase()}:${port}`) as { value: string } | undefined;
+    return { host, port, fingerprint, pinnedAt: at?.value || '' };
+  }
+
+  /** Forgets a pinned server key: the next publish pins whatever key the server presents. */
+  public forgetSftpHostKey(host: string, port: number): void {
+    const h = host.trim().toLowerCase();
+    this.db
+      .prepare('DELETE FROM local_settings WHERE key IN (?, ?)')
+      .run(`sftp_host_key:${h}:${port}`, `sftp_host_key_at:${h}:${port}`);
+    this.clearSftpHostKeyMismatch();
+  }
+
+  public recordSftpHostKeyMismatch(mismatch: SftpHostKeyMismatch): void {
     this.db
       .prepare(
-        'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        "INSERT INTO local_settings (key, value) VALUES ('sftp_host_key_mismatch', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
       )
-      .run(key, fingerprint);
+      .run(JSON.stringify(mismatch));
+  }
+
+  public getSftpHostKeyMismatch(): SftpHostKeyMismatch | null {
+    const row = this.db.prepare("SELECT value FROM local_settings WHERE key = 'sftp_host_key_mismatch'").get() as
+      | { value: string }
+      | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value) as SftpHostKeyMismatch;
+    } catch {
+      return null;
+    }
+  }
+
+  public clearSftpHostKeyMismatch(): void {
+    this.db.prepare("DELETE FROM local_settings WHERE key = 'sftp_host_key_mismatch'").run();
+  }
+
+  /**
+   * Re-pins a server's new key after the user reviewed it, but only the exact key it presented in
+   * the last recorded mismatch: anything else is refused.
+   */
+  public trustSftpHostKey(presentedFingerprint: string): { host: string; port: number; fingerprint: string } {
+    const mismatch = this.getSftpHostKeyMismatch();
+    const given = presentedFingerprint.replace(/[\s:]/g, '').toLowerCase();
+    if (!mismatch || !given || mismatch.presentedFingerprint !== given) {
+      throw new Error("That isn't the key the server presented at the last failed publish, so it wasn't trusted.");
+    }
+    this.setSftpHostKeyFingerprint(mismatch.host, mismatch.port, given);
+    this.clearSftpHostKeyMismatch();
+    return { host: mismatch.host, port: mismatch.port, fingerprint: given };
   }
 
   // ---------------------------------------------------------------------------

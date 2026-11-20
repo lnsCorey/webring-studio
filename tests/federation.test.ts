@@ -1436,11 +1436,11 @@ describe('Private Key Encryption at Rest', () => {
       const shown = db.getProfile().publishSettings;
       expect(shown.password).toBe(STORED_SECRET_PLACEHOLDER);
       expect(shown.githubToken).toBe(STORED_SECRET_PLACEHOLDER);
-      expect(db.getPublishCredentials()).toEqual({ password: 'sftp-secret', githubToken: 'ghp_legacy' });
+      expect(db.getPublishCredentials()).toMatchObject({ password: 'sftp-secret', githubToken: 'ghp_legacy' });
 
       // Saving the form as shown (placeholders) keeps the stored values
       db.updateProfile({ publishSettings: { ...shown, host: 'example.org' } });
-      expect(db.getPublishCredentials()).toEqual({ password: 'sftp-secret', githubToken: 'ghp_legacy' });
+      expect(db.getPublishCredentials()).toMatchObject({ password: 'sftp-secret', githubToken: 'ghp_legacy' });
       expect(db.withStoredCredentials(db.getProfile().publishSettings).password).toBe('sftp-secret');
 
       // A new value replaces (sealed); '' clears

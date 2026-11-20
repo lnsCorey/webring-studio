@@ -104,7 +104,7 @@ describe('Security Phase 6: the proxy fails closed, and secrets need consent wit
       expect(db.isKeyVaultAvailable()).toBe(false);
       expect(() => db.updateProfile({ publishSettings: { password: 'hunter2' } })).toThrow(SecretStorageUnavailableError);
       expect(() => db.updateProfile({ publishSettings: { githubToken: 'ghp_x' } })).toThrow(SecretStorageUnavailableError);
-      expect(db.getPublishCredentials()).toEqual({ password: '', githubToken: '' });
+      expect(db.getPublishCredentials()).toMatchObject({ password: '', githubToken: '' });
 
       // Other settings, and the masked placeholder from the form, still save
       db.updateProfile({ publishSettings: { host: 'sftp.example', password: '••••••••' } });

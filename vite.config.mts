@@ -28,7 +28,7 @@ export default defineConfig({
     outDir: 'dist',
     rollupOptions: {
       input: {
-        main: resolve(__dirname, 'index.html'),
+        main: resolve(import.meta.dirname, 'index.html'),
       },
     },
   },
@@ -36,7 +36,7 @@ export default defineConfig({
     // Image decoding runs in a worker thread; the tests compile one (tests/setup/imageWorker.ts)
     globalSetup: ['tests/setup/imageWorker.ts'],
     env: {
-      WEBRING_IMAGE_WORKER: resolve(__dirname, 'node_modules/.cache/webring-image-worker/imageWorker.js'),
+      WEBRING_IMAGE_WORKER: resolve(import.meta.dirname, 'node_modules/.cache/webring-image-worker/imageWorker.js'),
     },
   },
 });
