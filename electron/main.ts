@@ -636,6 +636,8 @@ function registerIpcHandlers() {
       feedRetentionDays: ctx.db.getFeedRetentionDays(),
       friendNotices: ctx.db.getFriendNotices(),
       friendSyncNotices: ctx.db.getFriendSyncNotices(),
+      // One-time messages left by database upgrades; reading them removes them
+      upgradeNotices: ctx.db.takeUpgradeNotices(),
       mutualFriendUrls: ctx.db.getMutualFriendUrls(),
       proxySettings: ctx.db.getProxySettings(),
       keyRotations: ctx.db.getKeyRotations(),

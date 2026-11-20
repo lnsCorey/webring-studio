@@ -439,6 +439,7 @@ declare global {
         feedRetentionDays?: number;
         friendNotices?: FriendNoticeView[];
         friendSyncNotices?: FriendSyncNoticeView[];
+        upgradeNotices?: string[];
         mutualFriendUrls?: string[];
         proxySettings?: { enabled: boolean; proxyUrl: string };
         keyRotations?: KeyRotationCertificate[];
@@ -1036,6 +1037,7 @@ export const App: React.FC = () => {
     if (typeof data.feedRetentionDays === 'number') setFeedRetentionDays(data.feedRetentionDays);
     setFriendNotices(data.friendNotices || []);
     setFriendSyncNotices(data.friendSyncNotices || []);
+    for (const message of data.upgradeNotices || []) notify(message);
     setMutualFriendUrls(data.mutualFriendUrls || []);
     setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
     setModeration(data.moderation || []);

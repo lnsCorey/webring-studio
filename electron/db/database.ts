@@ -83,6 +83,9 @@ type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
  */
 export const STORED_SECRET_PLACEHOLDER = '••••••••';
 
+/** local_settings key: how many friend profiles migration 2 reset, for a one-time notice. */
+const PROFILES_RESET_NOTICE_KEY = 'notice:friend_profiles_reset';
+
 const sha256Hex = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
 
 /** A friend's feed row: one per (friend, canonical URL), so two friends never share a row. */
@@ -1212,7 +1215,95 @@ export class StudioDatabase {
         name: 'feed_endorsement_scoped_unique',
         up: () => this.migrateFeedAndEndorsementKeys(),
       },
+      {
+        version: 2,
+        name: 'reset_unverified_friend_profiles',
+        up: () => this.resetUnverifiedFriendProfiles(),
+      },
     ];
+  }
+
+  /**
+   * Migration 2. Builds before the fixes stored friends' names, bios and avatars from documents
+   * that never verified. A friend with no saved verified profile copy, or whose key isn't pinned,
+   * goes back to what its address alone proves (hostname and did:web) and is re-crawled first on
+   * the next sync. The count is kept for a one-time notice.
+   */
+  private resetUnverifiedFriendProfiles(): void {
+    const friendColumns = this.db.prepare('PRAGMA table_info(friends)').all() as Array<{ name: string }>;
+    if (!friendColumns.some((c) => c.name === 'needs_recrawl')) {
+      this.db.exec('ALTER TABLE friends ADD COLUMN needs_recrawl INTEGER NOT NULL DEFAULT 0');
+    }
+    const friends = this.db.prepare('SELECT id, site_url, key_status FROM friends').all() as Array<{
+      id: string;
+      site_url: string;
+      key_status: string;
+    }>;
+    const hasVerifiedProfileCopy = (siteUrl: string) =>
+      (
+        this.db.prepare("SELECT body FROM fetch_cache WHERE site_url = ? AND body != ''").all(siteUrl) as Array<{
+          body: string;
+        }>
+      ).some((row) => {
+        try {
+          const doc = JSON.parse(row.body) as { displayName?: unknown; siteUrl?: unknown };
+          return typeof doc.displayName === 'string' && normalizeSiteUrl(String(doc.siteUrl || '')) === siteUrl;
+        } catch {
+          return false;
+        }
+      });
+    const reset = this.db.prepare(
+      `UPDATE friends SET display_name = ?, bio = '', avatar_url = '', handle = '', did = ?, needs_recrawl = 1
+       WHERE id = ?`
+    );
+    let count = 0;
+    for (const friend of friends) {
+      if (friend.key_status === 'pinned' && hasVerifiedProfileCopy(friend.site_url)) continue;
+      let hostname = friend.site_url;
+      try {
+        hostname = new URL(friend.site_url).hostname;
+      } catch {
+        // keep the stored address as the name
+      }
+      reset.run(hostname, siteUrlToDidWeb(friend.site_url), friend.id);
+      count++;
+    }
+    if (count > 0) {
+      this.db
+        .prepare(
+          'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        )
+        .run(PROFILES_RESET_NOTICE_KEY, String(count));
+    }
+  }
+
+  /**
+   * The one-time notices left by upgrades, removed as they're read so each is shown once.
+   */
+  public takeUpgradeNotices(): string[] {
+    const row = this.db.prepare('SELECT value FROM local_settings WHERE key = ?').get(PROFILES_RESET_NOTICE_KEY) as
+      | { value: string }
+      | undefined;
+    if (!row) return [];
+    this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(PROFILES_RESET_NOTICE_KEY);
+    const n = Number(row.value) || 0;
+    return n > 0
+      ? [
+          `Studio reset ${n} friend profile${n === 1 ? '' : 's'} it couldn't verify. ` +
+            `${n === 1 ? 'It refreshes' : 'They refresh'} from ${n === 1 ? 'their' : 'their own'} verified site on the next sync.`,
+        ]
+      : [];
+  }
+
+  /** Clears the "re-crawl first" flag once a sync has verified a friend's profile again. */
+  public clearNeedsRecrawl(siteUrl: string): void {
+    this.db.prepare('UPDATE friends SET needs_recrawl = 0 WHERE site_url = ?').run(normalizeSiteUrl(siteUrl));
+  }
+
+  /** Friends flagged by an upgrade to be re-crawled before the others. */
+  public getNeedsRecrawlUrls(): Set<string> {
+    const rows = this.db.prepare('SELECT site_url FROM friends WHERE needs_recrawl = 1').all() as Array<{ site_url: string }>;
+    return new Set(rows.map((r) => r.site_url));
   }
 
   /**
@@ -2939,9 +3030,9 @@ export class StudioDatabase {
   }
 
   /**
-   * The rings published in connections.json: rings this persona is a confirmed member of
-   * (plus pre-redesign 'legacy' rows), and hosted rings the maintainer belongs to, built from
-   * local tables so the maintainer never has to fetch their own hub.
+   * The rings published in connections.json: only joined rings with status 'member' whose ring
+   * file verified (hubVerified), and hosted rings the maintainer belongs to, built from local
+   * tables so the maintainer never has to fetch their own hub.
    */
   public getWebrings(): WebringMembership[] {
     const joined: WebringMembership[] = this.getJoinedRings()

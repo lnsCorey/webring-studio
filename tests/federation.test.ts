@@ -6863,3 +6863,75 @@ describe('Security Phase 6: rollback protection for every document', () => {
     }
   });
 });
+
+describe('Security Phase 6: unverified friend profiles from before the upgrade', () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-reset-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  it('migration 2 resets a profile that never verified, flags it for a re-crawl, and leaves a one-time notice', async () => {
+    const dir = path.join(tempRoot, 'bob');
+    const db = new StudioDatabase(dir, 'bob.sqlite');
+    db.updateProfile({ siteUrl: 'https://bob.reset.test', displayName: 'Bob', publishSettings: { publishFriendsList: true } });
+    // Stored by an old build from a document that never verified
+    db.addOrUpdateFriend({
+      siteUrl: 'https://eve.reset.test',
+      displayName: 'Definitely Your Bank',
+      handle: 'bank',
+      bio: 'Send your password here',
+      avatarUrl: 'https://tracker.example/pixel.png',
+      did: 'did:web:someone.else',
+      visibility: 'public',
+    });
+    // A friend whose profile verified (pinned key, verified copy saved) is left alone
+    db.addOrUpdateFriend({
+      siteUrl: 'https://carol.reset.test',
+      displayName: 'Carol',
+      bio: 'Real bio',
+      pinnedPublicKeyPem: crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      keyStatus: 'pinned',
+    });
+    db.setFetchValidators(
+      'https://carol.reset.test/api/profile.json',
+      'https://carol.reset.test',
+      { etag: '"1"' },
+      JSON.stringify({ siteUrl: 'https://carol.reset.test', displayName: 'Carol' }),
+      'abc'
+    );
+    db.close();
+
+    // Back to version 1, as a database from before this upgrade
+    const raw = new DatabaseSync(path.join(dir, 'bob.sqlite'));
+    raw.exec('PRAGMA user_version = 1');
+    raw.close();
+
+    const upgraded = new StudioDatabase(dir, 'bob.sqlite');
+    try {
+      expect(upgraded.getSchemaVersion()).toBeGreaterThanOrEqual(2);
+      const eve = upgraded.getFriendBySiteUrl('https://eve.reset.test')!;
+      expect(eve).toMatchObject({ displayName: 'eve.reset.test', handle: '', bio: '', avatarUrl: '', did: 'did:web:eve.reset.test' });
+      expect(upgraded.getFriendBySiteUrl('https://carol.reset.test')).toMatchObject({ displayName: 'Carol', bio: 'Real bio' });
+      expect([...upgraded.getNeedsRecrawlUrls()]).toEqual(['https://eve.reset.test']);
+
+      const exported = upgraded.buildSignedSiteBundle({ publish: true }).connections.friends;
+      expect(exported.find((f) => f.siteUrl === 'https://eve.reset.test')).toMatchObject({ displayName: 'eve.reset.test', bio: '' });
+      expect(JSON.stringify(exported)).not.toMatch(/Bank|password|tracker/);
+
+      // Shown once
+      expect(upgraded.takeUpgradeNotices()).toEqual([expect.stringMatching(/reset 1 friend profile/)]);
+      expect(upgraded.takeUpgradeNotices()).toEqual([]);
+
+      // A verified sync clears the flag
+      upgraded.clearNeedsRecrawl('https://eve.reset.test');
+      expect(upgraded.getNeedsRecrawlUrls().size).toBe(0);
+    } finally {
+      upgraded.close();
+    }
+  });
+});

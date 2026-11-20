@@ -642,6 +642,7 @@ export class RingCrawler {
           keyStatus,
           lastCrawledAt: crawledAt,
         });
+        this.db.clearNeedsRecrawl(normalizedFriendUrl);
       } else if (existingFriend) {
         this.db.updateFriendVerificationState(normalizedFriendUrl, {
           keyStatus,
@@ -1028,20 +1029,26 @@ export class RingCrawler {
   /**
    * Crawls all friends in the user's friend ring, `concurrency` sites at a time, so slow or
    * unreachable sites don't hold up the rest. Results are in the same order as the friends.
+   * Friends an upgrade flagged for a re-crawl (their unverified profile was reset) are crawled first.
    */
   public async crawlAllFriends(
     options: { concurrency?: number; onProgress?: (progress: SyncProgress) => void } = {}
   ): Promise<CrawlSiteResult[]> {
     const concurrency = options.concurrency ?? SYNC_CONCURRENCY;
     const friends = this.db.getFriends();
+    const recrawlFirst = this.db.getNeedsRecrawlUrls();
+    // Indexes into `friends`, flagged ones first; results still go back in the friends' order
+    const order = friends
+      .map((_, index) => index)
+      .sort((a, b) => Number(recrawlFirst.has(friends[b].siteUrl)) - Number(recrawlFirst.has(friends[a].siteUrl)) || a - b);
     // Friends that recent syncs couldn't reach wait out their backoff (a single-friend sync still tries)
     const retryTimes = this.db.getSyncRetryTimes();
     const results: CrawlSiteResult[] = new Array(friends.length);
     let next = 0;
     let done = 0;
     const worker = async () => {
-      while (next < friends.length) {
-        const index = next++;
+      while (next < order.length) {
+        const index = order[next++];
         const siteUrl = normalizeSiteUrl(friends[index].siteUrl);
         const retryAfter = retryTimes.get(siteUrl);
         results[index] = retryAfter
