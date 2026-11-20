@@ -569,7 +569,7 @@ export class RingCrawler {
       if (fetchedPublicKeyPem) {
         if (pinStatus === 'changed') {
           // Domain key changed unexpectedly without a valid KeyRotationCertificate!
-          this.db.setCandidateSiteKey(normalizedFriendUrl, fetchedPublicKeyPem);
+          this.db.recordFriendCandidateKey(normalizedFriendUrl, fetchedPublicKeyPem);
           keyChangedWarning = true;
           keyStatus = 'changed';
           pinnedKeyToSave = existingPinnedKey;
@@ -578,6 +578,8 @@ export class RingCrawler {
           keyStatus = 'pinned';
           pinnedKeyToSave = fetchedPublicKeyPem;
           effectiveVerifyKeyPem = fetchedPublicKeyPem;
+          // Back on its pinned key (or a signed rotation): any candidate seen before is moot
+          this.db.clearFriendCandidateKey(normalizedFriendUrl);
         }
       }
 

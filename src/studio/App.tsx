@@ -29,6 +29,8 @@ import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { FriendAlbumView } from './FriendAlbumView';
 import { AddBackTarget, FriendNoticeReviewView, FriendNoticeView, FriendNoticesPanel } from './FriendNoticesPanel';
 import { FriendSyncNoticesPanel, FriendSyncNoticeView } from './FriendSyncNoticesPanel';
+import { KeyChangeDialog, KeyChangeFriend } from './KeyChangeDialog';
+import { formatFingerprint } from '../shared/fingerprint';
 import { MarkdownField } from './MarkdownField';
 import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
@@ -440,6 +442,7 @@ declare global {
         friendNotices?: FriendNoticeView[];
         friendSyncNotices?: FriendSyncNoticeView[];
         upgradeNotices?: string[];
+        ownKeyFingerprint?: string;
         mutualFriendUrls?: string[];
         proxySettings?: { enabled: boolean; proxyUrl: string };
         keyRotations?: KeyRotationCertificate[];
@@ -511,7 +514,7 @@ declare global {
         rotationCertificate: KeyRotationCertificate;
         rotationCount: number;
       }>;
-      trustFriendKey?: (friendId: string, newPublicKeyPem?: string) => Promise<FriendConnection>;
+      trustFriendKey?: (friendId: string, expectedFingerprint: string) => Promise<FriendConnection>;
       listWebringHubs?: WebringHubApi['listWebringHubs'];
       addWebringHub?: WebringHubApi['addWebringHub'];
       removeWebringHub?: WebringHubApi['removeWebringHub'];
@@ -716,6 +719,9 @@ export const App: React.FC = () => {
   const [feedRetentionDays, setFeedRetentionDays] = useState(90);
   const [friendNotices, setFriendNotices] = useState<FriendNoticeView[]>([]);
   const [friendSyncNotices, setFriendSyncNotices] = useState<FriendSyncNoticeView[]>([]);
+  const [ownKeyFingerprint, setOwnKeyFingerprint] = useState('');
+  // The friend whose changed key is being reviewed in KeyChangeDialog
+  const [keyChangeFriendId, setKeyChangeFriendId] = useState<string | null>(null);
   const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
   const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
@@ -1037,6 +1043,7 @@ export const App: React.FC = () => {
     if (typeof data.feedRetentionDays === 'number') setFeedRetentionDays(data.feedRetentionDays);
     setFriendNotices(data.friendNotices || []);
     setFriendSyncNotices(data.friendSyncNotices || []);
+    setOwnKeyFingerprint(data.ownKeyFingerprint || '');
     for (const message of data.upgradeNotices || []) notify(message);
     setMutualFriendUrls(data.mutualFriendUrls || []);
     setFeedExclusions(data.feedExclusions || { muted: 0, blocked: 0, unverified: 0 });
@@ -1920,27 +1927,25 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleTrustFriendKey = async (friend: FriendConnection) => {
-    if (!window.studioApi?.trustFriendKey) return;
-    if (
-      !window.confirm(
-        `Trust ${friend.displayName}'s new public key without a rotation certificate? Only do this if you confirmed out-of-band with ${friend.displayName} that they lost their previous signing key.`
-      )
-    ) {
-      return;
-    }
-    try {
-      await window.studioApi.trustFriendKey(friend.id);
-      const crawlRes = await window.studioApi.crawlFriend(friend.siteUrl);
-      await refreshStudioData();
-      if (crawlRes?.success) {
-        notify(`Re-pinned ${friend.displayName}'s new Ed25519 key and verified their site!`);
-      } else {
-        notify(`Cleared old pin for ${friend.displayName}. Sync again when their site is reachable.`);
-      }
-    } catch (err) {
-      notify(`Couldn't re-pin key: ${errorMessage(err)}`);
-    }
+  // Trusting a changed key happens only from KeyChangeDialog, with the fingerprint the user reviewed
+  const handleTrustFriendKey = async (friend: KeyChangeFriend, expectedFingerprint: string) => {
+    if (!window.studioApi?.trustFriendKey) throw new Error('Not available in this version.');
+    await window.studioApi.trustFriendKey(friend.id, expectedFingerprint);
+    setKeyChangeFriendId(null);
+    const crawlRes = await window.studioApi.crawlFriend(friend.siteUrl);
+    await refreshStudioData();
+    notify(
+      crawlRes?.success
+        ? `Pinned ${friend.displayName}'s new key and verified their site.`
+        : `Pinned ${friend.displayName}'s new key. Sync again when their site is reachable.`
+    );
+  };
+
+  // Re-checking a friend from the dialog records the key their site presents now
+  const handleRecheckFriendKey = async (friend: KeyChangeFriend) => {
+    const res = await window.studioApi?.crawlFriend(friend.siteUrl);
+    await refreshStudioData();
+    if (!res?.success) throw new Error(`Couldn't reach ${friend.siteUrl}: ${res?.error || 'site unreachable'}`);
   };
 
   const handleSaveProxySettings = async (next: { enabled?: boolean; proxyUrl?: string }) => {
@@ -2925,6 +2930,20 @@ export const App: React.FC = () => {
                       >
                         {keyRotations.length} rotation cert{keyRotations.length === 1 ? '' : 's'}
                       </span>
+                    )}
+                    {ownKeyFingerprint && (
+                      <details className="w-full">
+                        <summary className="cursor-pointer text-slate-300 hover:text-slate-100">
+                          Your key fingerprint (for friends to compare)
+                        </summary>
+                        <pre className="mt-1.5 text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 text-slate-200 whitespace-pre">
+                          {formatFingerprint(ownKeyFingerprint)}
+                        </pre>
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          If a friend's Studio says your key changed, read them the first and last 8 characters so they
+                          can check it before trusting the new key.
+                        </p>
+                      </details>
                     )}
                     <button
                       type="button"
@@ -4655,12 +4674,14 @@ export const App: React.FC = () => {
                                 </span>
                               )}
                               {friend.keyStatus === 'changed' && (
-                                <span
-                                  className="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap bg-rose-500/20 text-rose-300 border border-rose-500/40"
-                                  title="WARNING: Friend domain's Ed25519 key in did.json changed unexpectedly! Signatures rejected."
+                                <button
+                                  type="button"
+                                  onClick={() => setKeyChangeFriendId(friend.id)}
+                                  className="text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30"
+                                  title="Their signing key changed without a signed rotation. Click to review it."
                                 >
                                   🚨 Key Changed Warning!
-                                </span>
+                                </button>
                               )}
                               {friend.lastSyncError && (
                                 <button
@@ -4801,11 +4822,11 @@ export const App: React.FC = () => {
                           {friend.keyStatus === 'changed' && (
                             <button
                               type="button"
-                              onClick={() => handleTrustFriendKey(friend)}
+                              onClick={() => setKeyChangeFriendId(friend.id)}
                               className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-medium"
-                              title="Emergency TOFU recovery: re-pin their new key if they lost their previous private key without a KeyRotationCertificate"
+                              title="Review their new key and compare its fingerprint with them before trusting it"
                             >
-                              Trust New Key &amp; Re-sync
+                              Review New Key…
                             </button>
                           )}
                           {friend.keyStatus !== 'unverified' && (
@@ -9028,9 +9049,13 @@ git push -u origin main --force`}
                           certificate for the new one, published in <code>did.json</code> and{' '}
                           <code>manifest.json</code>, so after your next publish friends switch
                           over at their next sync with no warning. If a friend's key changes without
-                          one, their card offers <strong>Trust New Key &amp; Re-sync</strong>. Only
-                          use it after you've confirmed with them some other way that they really
-                          lost their key.
+                          one, their card shows <strong>Key Changed Warning</strong> and{' '}
+                          <strong>Review New Key…</strong>. The review shows the key you pinned and the
+                          new one as fingerprints. Ask your friend to read you the first and last 8
+                          characters of theirs (under <strong>Profile &amp; Identity</strong> →{' '}
+                          <em>Your key fingerprint</em>) by phone or another channel you already use,
+                          and trust it only if they match. If their site has shown more than one new
+                          key, Studio says so: that can mean someone is impersonating them.
                         </p>
                         <p className="text-xs text-slate-300 leading-relaxed">
                           Your SFTP/FTP password and GitHub token are encrypted the same way. Studio
@@ -9139,6 +9164,21 @@ git push -u origin main --force`}
       </main>
 
       {/* Guided setup: GitHub sign-in, site creation, first publish and live check */}
+      {(() => {
+        const reviewing = keyChangeFriendId ? allFriends.find((f) => f.id === keyChangeFriendId) : undefined;
+        return reviewing ? (
+          <KeyChangeDialog
+            friend={reviewing}
+            witness={
+              <KeyWitnessCheck api={webringHubApi} webringHubs={webringHubs} siteUrl={reviewing.siteUrl} emphasized />
+            }
+            onTrust={handleTrustFriendKey}
+            onRecheck={handleRecheckFriendKey}
+            onClose={() => setKeyChangeFriendId(null)}
+          />
+        ) : null;
+      })()}
+
       {showSetupWizard && setupApi && bundle && (
         <SetupWizard
           key={activePersonaId}

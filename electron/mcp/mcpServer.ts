@@ -1112,14 +1112,19 @@ export class WebringMcpServer {
       {
         name: 'webring_trust_friend_key',
         description:
-          'Emergency TOFU re-pinning: clear a friend’s "key changed" warning when they lost their previous private key without a KeyRotationCertificate, so the next crawl pins their new key.',
+          'Emergency key recovery: pin the new key a friend’s site presented after they lost their previous private key without a KeyRotationCertificate. Requires the candidate key’s fingerprint (candidateFingerprint from webring_list_friends), which the user must have confirmed with the friend through another channel; a different or missing fingerprint is refused.',
         inputSchema: {
           type: 'object',
           properties: {
             personaId: personaIdProp,
             friendId: { type: 'string', description: 'ID of the friend whose new key should be trusted.' },
+            expectedFingerprint: {
+              type: 'string',
+              description:
+                'SPKI SHA-256 fingerprint (hex; spaces and case ignored) of the candidate key the user reviewed. Must match the candidate Studio recorded.',
+            },
           },
-          required: ['friendId'],
+          required: ['friendId', 'expectedFingerprint'],
         },
       },
       {
@@ -2235,9 +2240,13 @@ export class WebringMcpServer {
           const ctx = this.resolveContext(args);
           const friendId = String(args.friendId || '').trim();
           if (!friendId) throw new Error('friendId is required');
-          const updated = ctx.db.trustNewFriendKey(friendId);
+          const expectedFingerprint = typeof args.expectedFingerprint === 'string' ? args.expectedFingerprint.trim() : '';
+          if (!expectedFingerprint) {
+            throw new Error('expectedFingerprint is required: the fingerprint of the new key, confirmed with the friend.');
+          }
+          const updated = ctx.db.trustNewFriendKey(friendId, expectedFingerprint);
           resultData = updated;
-          summary = `Cleared key-change warning for friend ${updated.displayName} (${updated.siteUrl})`;
+          summary = `Trusted the reviewed new key for friend ${updated.displayName} (${updated.siteUrl})`;
           break;
         }
 

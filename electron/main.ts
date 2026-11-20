@@ -24,6 +24,7 @@ import { LocalPreviewServer } from './services/localPreviewServer';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
 import { DEMO_PEER_FOLDER_NAME } from './db/legacyDemoContent';
+import { spkiFingerprint } from './db/database';
 import { isRingMemberFlagged } from './services/ringService';
 import {
   describePreset,
@@ -638,6 +639,8 @@ function registerIpcHandlers() {
       friendSyncNotices: ctx.db.getFriendSyncNotices(),
       // One-time messages left by database upgrades; reading them removes them
       upgradeNotices: ctx.db.takeUpgradeNotices(),
+      // This persona's own key fingerprint, for friends to compare when their Studio says it changed
+      ownKeyFingerprint: spkiFingerprint(ctx.db.getKeys().publicKeyPem),
       mutualFriendUrls: ctx.db.getMutualFriendUrls(),
       proxySettings: ctx.db.getProxySettings(),
       keyRotations: ctx.db.getKeyRotations(),
@@ -872,8 +875,9 @@ function registerIpcHandlers() {
     return personaManager.getActiveContext().db.rotateSigningKeys();
   });
 
-  ipcMain.handle('studio:trust-friend-key', (_e, friendId: string, newPublicKeyPem?: string) => {
-    return personaManager.getActiveContext().db.trustNewFriendKey(String(friendId), newPublicKeyPem);
+  // Pins only the candidate key whose fingerprint the user reviewed in the key-change dialog
+  ipcMain.handle('studio:trust-friend-key', (_e, friendId: string, expectedFingerprint: string) => {
+    return personaManager.getActiveContext().db.trustNewFriendKey(String(friendId), String(expectedFingerprint || ''));
   });
 
   ipcMain.handle('studio:set-proxy-settings', async (_e, input: { enabled?: boolean; proxyUrl?: string }) => {

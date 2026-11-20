@@ -40,7 +40,8 @@ import {
 import { parseProxyUrl } from '../electron/security/proxyAgent';
 import { planWindowProxy } from '../electron/security/windowProxy';
 import { encodeQrMatrix } from '../src/studio/QrCodeSvg';
-import { endorsementRowId, feedRowId, STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
+import { endorsementRowId, feedRowId, spkiFingerprint, STORED_SECRET_PLACEHOLDER, StudioDatabase } from '../electron/db/database';
+import { formatFingerprint } from '../src/shared/fingerprint';
 import { LEGACY_DEMO_PHOTOS, LEGACY_DEMO_PROFILE } from '../electron/db/legacyDemoContent';
 import { buildRingDirectoryHtml, StaticSiteGenerator } from '../electron/services/siteGenerator';
 import { renderTemplatePage } from '../electron/services/siteTemplates';
@@ -5137,11 +5138,15 @@ describe('Architectural Hardening: Key Rotation Certificates, Archive Hashes, Sy
     // Pinned key remains Alice's legitimate Key 4
     expect(bobDb.getSiteKey('https://alice.ring.test')?.publicKeyPem).toBe(rot3.publicKeyPem);
 
-    // 5. Emergency recovery: Bob explicitly trusts a new key after out-of-band verification
-    // Restore legitimate export with a brand-new uncertified keypair
-    const recoveredFriend = bobDb.trustNewFriendKey(friendRecord.id);
-    expect(recoveredFriend.keyStatus).toBe('unverified');
-    expect(bobDb.getSiteKey('https://alice.ring.test')).toBeUndefined();
+    // 5. Emergency recovery: Bob trusts the new key only after reviewing its fingerprint (phase 6:
+    // no more "clear the pin and take whatever comes next")
+    const changed = bobDb.getFriendBySiteUrl('https://alice.ring.test')!;
+    expect(changed.candidateFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(() => bobDb.trustNewFriendKey(friendRecord.id, 'deadbeef')).toThrow(/doesn't match/);
+    const recoveredFriend = bobDb.trustNewFriendKey(friendRecord.id, changed.candidateFingerprint!);
+    expect(recoveredFriend.keyStatus).toBe('pinned');
+    expect(recoveredFriend.candidateFingerprint).toBeUndefined();
+    expect(spkiFingerprint(bobDb.getSiteKey('https://alice.ring.test')!.publicKeyPem)).toBe(changed.candidateFingerprint);
 
     aliceDb.close();
     bobDb.close();
@@ -6500,9 +6505,9 @@ describe('Security Phase 4: Defense-in-Depth, Identity Binding, and Privacy', ()
       expect(db.pinSiteKey('https://peer.p4.test', 'did:web:peer.p4.test', rewrapped)).toBe('pinned');
 
       // Candidate key mismatch is refused when trusting
-      db.setCandidateSiteKey('https://peer.p4.test', keys2.publicKey);
-      expect(() => db.trustNewFriendKey(friend.id, keys1.publicKey)).toThrow(/candidate key/);
-      expect(db.trustNewFriendKey(friend.id, keys2.publicKey).keyStatus).toBe('pinned');
+      db.recordFriendCandidateKey('https://peer.p4.test', keys2.publicKey);
+      expect(() => db.trustNewFriendKey(friend.id, spkiFingerprint(keys1.publicKey))).toThrow(/candidate key/);
+      expect(db.trustNewFriendKey(friend.id, spkiFingerprint(keys2.publicKey)).keyStatus).toBe('pinned');
 
       // Exported connections.json omits lastCrawledAt
       db.updateProfile({
@@ -6933,5 +6938,123 @@ describe('Security Phase 6: unverified friend profiles from before the upgrade',
     } finally {
       upgraded.close();
     }
+  });
+});
+
+describe('Security Phase 6: reviewed key trust', () => {
+  let tempRoot: string;
+  const PEER = 'https://peer.keys.test';
+  const newKey = () =>
+    crypto.generateKeyPairSync('ed25519', {
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    }).publicKey;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'webring-p6-keys-'));
+  });
+
+  afterEach(() => {
+    removeTempDir(tempRoot);
+  });
+
+  const withChangedFriend = (fn: (db: StudioDatabase, friendId: string) => void) => {
+    const db = new StudioDatabase(tempRoot, 'keys.sqlite');
+    try {
+      const friend = db.addOrUpdateFriend({ siteUrl: PEER, displayName: 'Peer' });
+      expect(db.pinSiteKey(PEER, 'did:web:peer.keys.test', newKey())).toBe('pinned');
+      fn(db, friend.id);
+    } finally {
+      db.close();
+    }
+  };
+
+  it('stores the first candidate key; a different later key flags a conflict and does not replace it', () => {
+    withChangedFriend((db) => {
+      const first = newKey();
+      db.recordFriendCandidateKey(PEER, first);
+      const seen = db.getFriendBySiteUrl(PEER)!;
+      expect(seen.candidateFingerprint).toBe(spkiFingerprint(first));
+      expect(seen.candidateFirstSeenAt).toBeTruthy();
+      expect(seen.candidateConflict).toBe(false);
+
+      // The same key again (re-wrapped PEM) changes nothing
+      db.recordFriendCandidateKey(PEER, first.replace(/\n/g, '\r\n'));
+      expect(db.getFriendBySiteUrl(PEER)).toMatchObject({ candidateFingerprint: spkiFingerprint(first), candidateConflict: false });
+
+      db.recordFriendCandidateKey(PEER, newKey());
+      expect(db.getFriendBySiteUrl(PEER)).toMatchObject({ candidateFingerprint: spkiFingerprint(first), candidateConflict: true });
+    });
+  });
+
+  it('trusts only the reviewed candidate: a wrong fingerprint throws, the right one (any formatting) pins it', () => {
+    withChangedFriend((db, friendId) => {
+      const candidate = newKey();
+      db.recordFriendCandidateKey(PEER, candidate);
+      expect(() => db.trustNewFriendKey(friendId, spkiFingerprint(newKey()))).toThrow(/doesn't match/);
+      expect(() => db.trustNewFriendKey(friendId, '')).toThrow(/fingerprint you reviewed/);
+      const trusted = db.trustNewFriendKey(friendId, formatFingerprint(spkiFingerprint(candidate)));
+      expect(trusted.keyStatus).toBe('pinned');
+      expect(trusted.pinnedFingerprint).toBe(spkiFingerprint(candidate));
+      expect(trusted.candidateFingerprint).toBeUndefined();
+      expect(spkiFingerprint(db.getSiteKey(PEER)!.publicKeyPem)).toBe(spkiFingerprint(candidate));
+    });
+  });
+
+  it('cannot trust a friend flagged before the upgrade that has no candidate yet', () => {
+    withChangedFriend((db, friendId) => {
+      expect(() => db.trustNewFriendKey(friendId, 'a'.repeat(64))).toThrow(/hasn't recorded a new key/);
+    });
+  });
+
+  it('migration 3 moves candidate keys from local_settings into the friend row', () => {
+    const candidate = newKey();
+    const first = new StudioDatabase(tempRoot, 'keys.sqlite');
+    first.addOrUpdateFriend({ siteUrl: PEER, displayName: 'Peer' });
+    first.close();
+    const raw = new DatabaseSync(path.join(tempRoot, 'keys.sqlite'));
+    raw.prepare('INSERT INTO local_settings (key, value) VALUES (?, ?)').run(`candidate_key:${PEER}`, candidate);
+    raw.exec('PRAGMA user_version = 2');
+    raw.close();
+
+    const db = new StudioDatabase(tempRoot, 'keys.sqlite');
+    try {
+      expect(db.getSchemaVersion()).toBeGreaterThanOrEqual(3);
+      expect(db.getFriendBySiteUrl(PEER)?.candidateFingerprint).toBe(spkiFingerprint(candidate));
+      const left = new DatabaseSync(path.join(tempRoot, 'keys.sqlite'));
+      expect(left.prepare("SELECT COUNT(*) AS n FROM local_settings WHERE key LIKE 'candidate_key:%'").get()).toMatchObject({ n: 0 });
+      left.close();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('the MCP trust tool requires expectedFingerprint', async () => {
+    const studioDir = path.join(tempRoot, 'mcp-studio');
+    const manager = new PersonaManager(studioDir);
+    const mcp = new WebringMcpServer(manager, studioDir);
+    const ctx = manager.getActiveContext();
+    const friend = ctx.db.addOrUpdateFriend({ siteUrl: PEER, displayName: 'Peer' });
+    ctx.db.pinSiteKey(PEER, 'did:web:peer.keys.test', newKey());
+    const candidate = newKey();
+    ctx.db.recordFriendCandidateKey(PEER, candidate);
+
+    const missing = await mcp.executeToolCall('webring_trust_friend_key', { friendId: friend.id });
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0].text).toMatch(/expectedFingerprint is required/);
+    expect(ctx.db.getFriendBySiteUrl(PEER)?.candidateFingerprint).toBe(spkiFingerprint(candidate));
+
+    const ok = await mcp.executeToolCall('webring_trust_friend_key', {
+      friendId: friend.id,
+      expectedFingerprint: spkiFingerprint(candidate),
+    });
+    expect(ok.isError).toBeUndefined();
+    expect(ctx.db.getFriendBySiteUrl(PEER)?.keyStatus).toBe('pinned');
+  });
+
+  it('formats fingerprints in uppercase groups of four, eight groups per line', () => {
+    const hex = 'ab'.repeat(32);
+    expect(formatFingerprint(hex)).toBe('ABAB ABAB ABAB ABAB ABAB ABAB ABAB ABAB\nABAB ABAB ABAB ABAB ABAB ABAB ABAB ABAB');
+    expect(formatFingerprint('0123 4567 89ab')).toBe('0123 4567 89AB');
   });
 });

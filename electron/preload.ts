@@ -42,8 +42,8 @@ contextBridge.exposeInMainWorld('studioApi', {
   updateFriend: (friendId: string, updates: unknown) =>
     ipcRenderer.invoke('studio:update-friend', friendId, updates),
   rotateKeys: () => ipcRenderer.invoke('studio:rotate-keys'),
-  trustFriendKey: (friendId: string, newPublicKeyPem?: string) =>
-    ipcRenderer.invoke('studio:trust-friend-key', friendId, newPublicKeyPem),
+  trustFriendKey: (friendId: string, expectedFingerprint: string) =>
+    ipcRenderer.invoke('studio:trust-friend-key', friendId, expectedFingerprint),
   setProxySettings: (input: { enabled?: boolean; proxyUrl?: string }) =>
     ipcRenderer.invoke('studio:set-proxy-settings', input),
   setFriendVisibility: (friendId: string, visibility: 'private' | 'public') =>

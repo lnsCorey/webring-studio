@@ -536,6 +536,12 @@ export const FriendConnectionSchema = z.object({
   // Local only, never exported: why the last sync couldn't use one of this friend's documents
   lastSyncError: z.string().optional(),
   lastSyncErrorAt: z.string().optional(),
+  // Local only, never exported: fingerprints for reviewing a changed key (SPKI SHA-256, hex)
+  pinnedFingerprint: z.string().optional(),
+  candidateFingerprint: z.string().optional(),
+  candidateFirstSeenAt: z.string().optional(),
+  /** The site has served more than one new key since the candidate was recorded. */
+  candidateConflict: z.boolean().optional(),
 });
 export type FriendConnection = z.infer<typeof FriendConnectionSchema>;
 

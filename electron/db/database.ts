@@ -83,6 +83,24 @@ type SecretPublishField = (typeof SECRET_PUBLISH_FIELDS)[number];
  */
 export const STORED_SECRET_PLACEHOLDER = '••••••••';
 
+/**
+ * A public key's fingerprint: SHA-256 of its SPKI DER bytes, in lowercase hex. The same key in
+ * any PEM wrapping has the same fingerprint. An unreadable key falls back to its trimmed text.
+ */
+export function spkiFingerprint(publicKeyPem: string): string {
+  try {
+    const der = crypto.createPublicKey(publicKeyPem).export({ type: 'spki', format: 'der' });
+    return crypto.createHash('sha256').update(der).digest('hex');
+  } catch {
+    return publicKeyPem.trim();
+  }
+}
+
+/** A fingerprint as typed or shown (any case, spaces or colons) in the stored form. */
+function normalizeFingerprint(value: string): string {
+  return value.replace(/[\s:]/g, '').toLowerCase();
+}
+
 /** local_settings key: how many friend profiles migration 2 reset, for a one-time notice. */
 const PROFILES_RESET_NOTICE_KEY = 'notice:friend_profiles_reset';
 
@@ -1220,7 +1238,43 @@ export class StudioDatabase {
         name: 'reset_unverified_friend_profiles',
         up: () => this.resetUnverifiedFriendProfiles(),
       },
+      {
+        version: 3,
+        name: 'friend_candidate_keys',
+        up: () => this.moveCandidateKeysToFriends(),
+      },
     ];
+  }
+
+  /**
+   * Migration 3. A changed key seen while syncing (the "candidate") moves from local_settings into
+   * the friend's row, with its fingerprint and when it was first seen, so the one the user reviews
+   * is the one that gets trusted.
+   */
+  private moveCandidateKeysToFriends(): void {
+    const existing = this.db.prepare('PRAGMA table_info(friends)').all() as Array<{ name: string }>;
+    for (const [name, ddl] of [
+      ['candidate_key_pem', "TEXT NOT NULL DEFAULT ''"],
+      ['candidate_fingerprint', "TEXT NOT NULL DEFAULT ''"],
+      ['candidate_first_seen_at', "TEXT NOT NULL DEFAULT ''"],
+      ['candidate_conflict', 'INTEGER NOT NULL DEFAULT 0'],
+    ] as const) {
+      if (!existing.some((c) => c.name === name)) this.db.exec(`ALTER TABLE friends ADD COLUMN ${name} ${ddl}`);
+    }
+    const rows = this.db.prepare("SELECT key, value FROM local_settings WHERE key LIKE 'candidate_key:%'").all() as Array<{
+      key: string;
+      value: string;
+    }>;
+    const now = new Date().toISOString();
+    const update = this.db.prepare(
+      `UPDATE friends SET candidate_key_pem = ?, candidate_fingerprint = ?, candidate_first_seen_at = ?, candidate_conflict = 0
+       WHERE site_url = ?`
+    );
+    for (const row of rows) {
+      const pem = row.value.trim();
+      if (pem) update.run(pem, spkiFingerprint(pem), now, normalizeSiteUrl(row.key.slice('candidate_key:'.length)));
+    }
+    this.db.exec("DELETE FROM local_settings WHERE key LIKE 'candidate_key:%'");
   }
 
   /**
@@ -2421,6 +2475,15 @@ export class StudioDatabase {
       ...(r.last_sync_error
         ? { lastSyncError: String(r.last_sync_error), lastSyncErrorAt: String(r.last_sync_error_at || '') }
         : {}),
+      // Local only, for reviewing a changed key; the export copies its own list of fields
+      ...(r.pinned_public_key_pem ? { pinnedFingerprint: spkiFingerprint(String(r.pinned_public_key_pem)) } : {}),
+      ...(r.candidate_fingerprint
+        ? {
+            candidateFingerprint: String(r.candidate_fingerprint),
+            candidateFirstSeenAt: String(r.candidate_first_seen_at || ''),
+            candidateConflict: Boolean(r.candidate_conflict),
+          }
+        : {}),
     };
   }
 
@@ -3243,16 +3306,7 @@ export class StudioDatabase {
       return 'pinned';
     }
 
-    const spkiFp = (pem: string): string => {
-      try {
-        const der = crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' });
-        return crypto.createHash('sha256').update(der).digest('hex');
-      } catch {
-        return pem.trim();
-      }
-    };
-
-    if (spkiFp(priorPinnedPem) === spkiFp(publicKeyPem)) {
+    if (spkiFingerprint(priorPinnedPem) === spkiFingerprint(publicKeyPem)) {
       if (!existing) {
         this.db
           .prepare(
@@ -3310,80 +3364,85 @@ export class StudioDatabase {
   }
 
   /**
-   * Manually resets or replaces a friend's pinned Ed25519 key (for emergency key recovery when
-   * the friend lost their previous private key and could not sign a KeyRotationCertificate).
-   * If `newPublicKeyPem` is omitted, clears the pinned key so the next sync pins their live key.
+   * Records the key a friend's site now presents when it doesn't match the pinned one and no
+   * signed rotation explains it (the "candidate"). The first candidate is kept: seeing it again
+   * changes nothing, and a different key sets `candidate_conflict` without replacing it, so the key
+   * the user reviews can't be swapped underneath them.
    */
-  public getCandidateSiteKey(siteUrl: string): string | null {
-    const normalized = normalizeSiteUrl(siteUrl);
-    const row = this.db
-      .prepare('SELECT value FROM local_settings WHERE key = ?')
-      .get(`candidate_key:${normalized}`) as { value: string } | undefined;
-    return row?.value || null;
+  public recordFriendCandidateKey(friendUrl: string, publicKeyPem: string): void {
+    const siteUrl = normalizeSiteUrl(friendUrl);
+    const pem = publicKeyPem.trim();
+    if (!pem) return;
+    const fingerprint = spkiFingerprint(pem);
+    const row = this.db.prepare('SELECT candidate_fingerprint FROM friends WHERE site_url = ?').get(siteUrl) as
+      | { candidate_fingerprint: string }
+      | undefined;
+    if (!row) return;
+    if (!row.candidate_fingerprint) {
+      this.db
+        .prepare(
+          `UPDATE friends SET candidate_key_pem = ?, candidate_fingerprint = ?, candidate_first_seen_at = ?, candidate_conflict = 0
+           WHERE site_url = ?`
+        )
+        .run(pem, fingerprint, new Date().toISOString(), siteUrl);
+    } else if (row.candidate_fingerprint !== fingerprint) {
+      this.db.prepare('UPDATE friends SET candidate_conflict = 1 WHERE site_url = ?').run(siteUrl);
+    }
   }
 
-  public setCandidateSiteKey(siteUrl: string, publicKeyPem: string): void {
-    const normalized = normalizeSiteUrl(siteUrl);
+  /** Forgets a recorded candidate key, once the friend's site presents its pinned key again. */
+  public clearFriendCandidateKey(friendUrl: string): void {
     this.db
       .prepare(
-        'INSERT INTO local_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+        `UPDATE friends SET candidate_key_pem = '', candidate_fingerprint = '', candidate_first_seen_at = '', candidate_conflict = 0
+         WHERE site_url = ? AND candidate_fingerprint != ''`
       )
-      .run(`candidate_key:${normalized}`, publicKeyPem.trim());
+      .run(normalizeSiteUrl(friendUrl));
   }
 
-  public clearCandidateSiteKey(siteUrl: string): void {
-    const normalized = normalizeSiteUrl(siteUrl);
-    this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(`candidate_key:${normalized}`);
-  }
-
-  public trustNewFriendKey(friendId: string, newPublicKeyPem?: string): FriendConnection {
+  /**
+   * Pins the candidate key a friend's site presented, after the user reviewed it. Emergency
+   * recovery for a friend who lost their key and couldn't sign a rotation certificate.
+   * `expectedFingerprint` is the fingerprint the user was shown: it must match the stored
+   * candidate, so a key that changed after the review is never trusted. With no candidate (for
+   * example a friend flagged before this upgrade), trust is refused until a sync records one.
+   */
+  public trustNewFriendKey(friendId: string, expectedFingerprint: string): FriendConnection {
     const current = this.getFriendById(friendId);
-    if (!current) {
-      throw new Error(`Friend "${friendId}" not found.`);
+    if (!current) throw new Error(`Friend "${friendId}" not found.`);
+    if (typeof expectedFingerprint !== 'string' || !expectedFingerprint.trim()) {
+      throw new Error('Trusting a new key needs the fingerprint you reviewed.');
     }
     const normalized = normalizeSiteUrl(current.siteUrl);
-    const storedCandidate = this.getCandidateSiteKey(normalized);
-    const cleanKey = (newPublicKeyPem?.trim() || storedCandidate || '').trim();
-    if (storedCandidate && newPublicKeyPem?.trim()) {
-      const fp = (pem: string) => {
-        try {
-          return crypto
-            .createHash('sha256')
-            .update(crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' }))
-            .digest('hex');
-        } catch {
-          return pem.trim();
-        }
-      };
-      if (fp(storedCandidate) !== fp(newPublicKeyPem)) {
-        throw new Error('The key being trusted does not match the candidate key detected for this friend.');
-      }
+    const row = this.db
+      .prepare('SELECT candidate_key_pem, candidate_fingerprint FROM friends WHERE id = ?')
+      .get(friendId) as { candidate_key_pem: string; candidate_fingerprint: string } | undefined;
+    if (!row?.candidate_key_pem || !row.candidate_fingerprint) {
+      throw new Error(
+        `Studio hasn't recorded a new key for ${current.displayName} yet. Re-check their site, then review the key it shows.`
+      );
     }
+    if (normalizeFingerprint(expectedFingerprint) !== row.candidate_fingerprint) {
+      throw new Error("That fingerprint doesn't match the candidate key detected for this friend, so it wasn't trusted.");
+    }
+    const pem = row.candidate_key_pem;
     this.transaction(() => {
-      this.clearCandidateSiteKey(normalized);
       this.db.prepare('DELETE FROM fetch_cache WHERE site_url = ?').run(normalized);
-      if (cleanKey) {
-        const did = current.did || siteUrlToDidWeb(normalized);
-        this.db
-          .prepare(
-            `INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
-             VALUES (?, ?, ?, 'pinned', ?)
-             ON CONFLICT(site_url) DO UPDATE SET did = excluded.did, public_key_pem = excluded.public_key_pem, key_status = 'pinned'`
-          )
-          .run(normalized, did, cleanKey, new Date().toISOString());
-        this.db
-          .prepare(
-            "UPDATE friends SET pinned_public_key_pem = ?, key_status = 'pinned', sync_failures = 0, retry_after = NULL WHERE id = ?"
-          )
-          .run(cleanKey, friendId);
-      } else {
-        this.db.prepare('DELETE FROM site_keys WHERE site_url = ?').run(normalized);
-        this.db
-          .prepare(
-            "UPDATE friends SET pinned_public_key_pem = '', key_status = 'unverified', sync_failures = 0, retry_after = NULL WHERE id = ?"
-          )
-          .run(friendId);
-      }
+      const did = current.did || siteUrlToDidWeb(normalized);
+      this.db
+        .prepare(
+          `INSERT INTO site_keys (site_url, did, public_key_pem, key_status, first_seen_at)
+           VALUES (?, ?, ?, 'pinned', ?)
+           ON CONFLICT(site_url) DO UPDATE SET did = excluded.did, public_key_pem = excluded.public_key_pem, key_status = 'pinned'`
+        )
+        .run(normalized, did, pem, new Date().toISOString());
+      this.db
+        .prepare(
+          `UPDATE friends SET pinned_public_key_pem = ?, key_status = 'pinned', sync_failures = 0, retry_after = NULL,
+             candidate_key_pem = '', candidate_fingerprint = '', candidate_first_seen_at = '', candidate_conflict = 0
+           WHERE id = ?`
+        )
+        .run(pem, friendId);
     });
     return this.getFriendById(friendId)!;
   }
