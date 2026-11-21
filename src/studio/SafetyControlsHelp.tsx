@@ -179,6 +179,23 @@ export function SafetyControlsHelp() {
           }
         />
         <Entry
+          title="Image limits and image addresses"
+          tone="text-emerald-300"
+          protects={
+            <>
+              A crafted image address writing or deleting files outside your export folder, and an oversized image using up
+              all your computer&apos;s memory.
+            </>
+          }
+          todo={
+            <>
+              If Studio says <strong>This image address isn&apos;t valid</strong>, choose the image again from the Media
+              Library or use an https:// address. If it says an image is <strong>too large</strong> or is a 16-bit PNG, export
+              a copy of 64 megapixels or less, at 8 bits per channel.
+            </>
+          }
+        />
+        <Entry
           title="Your published page and the preview"
           tone="text-cyan-300"
           protects={<>Injected scripts running on your site, and a local preview server left open.</>}

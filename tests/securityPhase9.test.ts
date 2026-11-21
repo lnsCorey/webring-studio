@@ -10,6 +10,8 @@ import { finishLocalExport, isSafeSitePath, planSync } from '../electron/service
 import { PersonaManager } from '../electron/services/personaManager';
 import { WebringMcpServer } from '../electron/mcp/mcpServer';
 import { isAllowedMediaReference, isSafeLocalMediaUrl, parseWebringUri } from '../src/shared/schema';
+import { PNG } from 'pngjs';
+import { IMAGE_TOO_LARGE_MESSAGE, PNG_16_BIT_MESSAGE, processImage } from '../electron/services/imagePipeline';
 
 const GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
@@ -182,5 +184,42 @@ describe('Security Phase 9: export never writes or deletes outside its folder', 
     } finally {
       manager.closeAll();
     }
+  });
+});
+
+describe('Security Phase 9: image decoding has a real memory bound', () => {
+  /** A PNG whose header claims a size and bit depth; only the header matters to the pre-check. */
+  const pngHeader = (width: number, height: number, bitDepth = 8) => {
+    const png = PNG.sync.write(Object.assign(new PNG({ width: 1, height: 1 }), { data: Buffer.alloc(4) }));
+    png.writeUInt32BE(width, 16);
+    png.writeUInt32BE(height, 20);
+    png[24] = bitDepth;
+    return png;
+  };
+  const NO_WORKER = path.join(os.tmpdir(), 'webring-no-such-worker.js');
+
+  it('refuses a 16-bit PNG and anything over 64 megapixels before starting a worker', async () => {
+    const started = Date.now();
+    await expect(processImage(pngHeader(10900, 10900, 16), { kind: 'web' }, { workerPath: NO_WORKER })).rejects.toThrow(
+      // The size rule fires first for this one; a small 16-bit PNG gets the bit-depth message
+      IMAGE_TOO_LARGE_MESSAGE
+    );
+    await expect(processImage(pngHeader(2000, 2000, 16), { kind: 'web' }, { workerPath: NO_WORKER })).rejects.toThrow(PNG_16_BIT_MESSAGE);
+    await expect(processImage(pngHeader(8100, 8100), { kind: 'web' }, { workerPath: NO_WORKER })).rejects.toThrow(IMAGE_TOO_LARGE_MESSAGE);
+    expect(Date.now() - started).toBeLessThan(1000);
+    // 8-bit and within the limit passes the pre-check, so a worker is started (and fails here)
+    await expect(processImage(pngHeader(7000, 7000), { kind: 'web' }, { workerPath: NO_WORKER })).rejects.toThrow(
+      "This image couldn't be processed."
+    );
+  });
+
+  it('runs one image at a time', async () => {
+    const small = PNG.sync.write(Object.assign(new PNG({ width: 8, height: 8 }), { data: Buffer.alloc(8 * 8 * 4, 200) }));
+    const order: string[] = [];
+    const a = processImage(small, { kind: 'fit', maxSide: 4 }).then(() => order.push('a'));
+    const b = processImage(small, { kind: 'fit', maxSide: 4 }).then(() => order.push('b'));
+    const c = processImage(small, { kind: 'fit', maxSide: 4 }).then(() => order.push('c'));
+    await Promise.all([a, b, c]);
+    expect(order).toEqual(['a', 'b', 'c']);
   });
 });
