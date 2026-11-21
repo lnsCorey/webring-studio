@@ -44,6 +44,16 @@ export function listFilesRecursive(dir: string, prefix = ''): string[] {
   return out;
 }
 
+/**
+ * A site-relative path Studio may write or delete at a destination: plain segments only, no
+ * `..`, `.`, empty segments, backslashes, drive letters or `?`/`#`. Anything else in a ledger
+ * (for example left by a crafted address before this check existed) is never acted on.
+ */
+export function isSafeSitePath(filePath: string): boolean {
+  if (!filePath || filePath.startsWith('/') || /[\\:?#\u0000]/.test(filePath)) return false;
+  return filePath.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
 export function isStudioOwned(filePath: string): boolean {
   return STUDIO_OWNED_PREFIXES.some((prefix) => filePath.startsWith(prefix));
 }
@@ -74,7 +84,7 @@ export function planSync(
   }
   upload.sort((a, b) => uploadRank(a) - uploadRank(b) || a.localeCompare(b));
   const candidates = new Set([...ledger.keys(), ...remoteOwned.filter(isStudioOwned)]);
-  const remove = [...candidates].filter((p) => !files.has(p)).sort();
+  const remove = [...candidates].filter((p) => !files.has(p) && isSafeSitePath(p)).sort();
   return { files, upload, unchanged, remove };
 }
 
@@ -137,6 +147,10 @@ export function finishLocalExport(
   for (const relPath of plan.remove) {
     fs.rmSync(path.join(outDir, relPath), { force: true });
     db.setPublishLedgerEntry(destination, relPath, null);
+  }
+  // Forget ledger rows that name an unsafe path, without touching the file system
+  for (const relPath of ledger.keys()) {
+    if (!isSafeSitePath(relPath)) db.setPublishLedgerEntry(destination, relPath, null);
   }
   return { uploaded, unchanged: files.size - uploaded, removed: plan.remove.length };
 }

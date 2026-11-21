@@ -129,7 +129,7 @@ export class StaticSiteGenerator {
     fs.rmSync(path.join(outputDir, '.webring-studio'), { force: true });
 
     const writeJson = (relPath: string, data: unknown) => {
-      const fullPath = path.join(outputDir, relPath);
+      const fullPath = safeOutputPath(outputDir, relPath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, JSON.stringify(data, null, 2), 'utf8');
       filesWritten.push(relPath);
@@ -153,7 +153,7 @@ export class StaticSiteGenerator {
     const hubDocs = this.db.buildSignedHubDocuments();
     for (const { ring, doc } of hubDocs) {
       writeJson(ring.hubPath, doc);
-      const directoryFile = path.join(outputDir, ring.directoryPath);
+      const directoryFile = safeOutputPath(outputDir, ring.directoryPath);
       fs.mkdirSync(path.dirname(directoryFile), { recursive: true });
       fs.writeFileSync(directoryFile, buildRingDirectoryHtml(doc, ringPageStyleFor(bundle.profile)), 'utf8');
       filesWritten.push(ring.directoryPath);
@@ -169,14 +169,18 @@ export class StaticSiteGenerator {
     // being published), plus each album's signed manifest
     const missingMedia: string[] = [];
     for (const { url, file } of this.localMediaFiles()) {
-      if (!file || !fs.existsSync(file)) {
+      // An unsafe or missing library address is reported, never written (see isSafeLocalMediaUrl)
+      if (!file || !fs.existsSync(file) || !this.mediaStoreDir) {
         missingMedia.push(url);
         continue;
       }
-      const dest = path.join(outputDir, url);
+      // The published path comes from where the file really is in the library, not from the
+      // stored address, and must stay inside the export folder
+      const relPath = `media/${path.relative(this.mediaStoreDir, file).split(path.sep).join('/')}`;
+      const dest = safeOutputPath(outputDir, relPath);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.copyFileSync(file, dest);
-      filesWritten.push(url);
+      filesWritten.push(relPath);
     }
     for (const { path: manifestPath, doc } of this.db.buildSignedAlbumManifests()) {
       writeJson(manifestPath, doc);
@@ -192,7 +196,7 @@ export class StaticSiteGenerator {
     for (const album of bundle.albums.albums) {
       if (!album.slug) continue;
       const relPath = albumPagePath(album.slug);
-      const fullPath = path.join(outputDir, relPath);
+      const fullPath = safeOutputPath(outputDir, relPath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id }), 'utf8');
       filesWritten.push(relPath);
@@ -1309,6 +1313,19 @@ function withInlineScriptHashes(page: string): string {
   const html = page.replace(/\r\n?/g, '\n');
   if (html.split(INLINE_SCRIPT_HASHES).length !== 2) throw new Error('Page CSP is missing its script-hash placeholder.');
   return html.replace(INLINE_SCRIPT_HASHES, inlineScriptHashes(html).join(' '));
+}
+
+/**
+ * The full path for a file the generator writes, refusing anything that would land outside the
+ * export folder (an absolute path, `..`, or a crafted address).
+ */
+export function safeOutputPath(outputDir: string, relPath: string): string {
+  const root = path.resolve(outputDir);
+  const full = path.resolve(root, relPath);
+  if (!relPath || path.isAbsolute(relPath) || !full.startsWith(root + path.sep)) {
+    throw new Error(`Refusing to write outside the export folder: ${relPath}`);
+  }
+  return full;
 }
 
 /** JSON that's safe inside a <script> element. */
