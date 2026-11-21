@@ -34,7 +34,25 @@ export const THUMB_MAX_SIDE = 480;
 const JPEG_QUALITY = 85;
 const THUMB_JPEG_QUALITY = 80;
 /** Refuse absurdly large inputs instead of exhausting memory while decoding. */
-const MAX_INPUT_MEGAPIXELS = 120;
+/**
+ * Images are decoded fully in memory (jpeg-js and pngjs can't shrink while decoding), so the
+ * pixel limit is what bounds memory: 64 MP is about 256 MB as RGBA, and covers nearly every
+ * phone and camera photo. 16-bit PNGs are refused (they decode to twice the bytes per pixel).
+ */
+const MAX_INPUT_MEGAPIXELS = 64;
+export const IMAGE_TOO_LARGE_MESSAGE = 'This image is too large to process. Export a smaller copy (64 megapixels or less).';
+export const PNG_16_BIT_MESSAGE = "16-bit PNGs aren't supported. Export an 8-bit copy (most editors call it 8 bits per channel).";
+
+/** Refuses a PNG whose header declares a size or bit depth Studio won't decode. */
+function assertPngHeaderWithinLimits(buffer: Buffer): void {
+  if (buffer.length < 26 || buffer.toString('ascii', 12, 16) !== 'IHDR') return;
+  const width = buffer.readUInt32BE(16);
+  const height = buffer.readUInt32BE(20);
+  if (width === 0 || height === 0 || width * height > MAX_INPUT_MEGAPIXELS * 1_000_000) {
+    throw new UnsupportedImageError(IMAGE_TOO_LARGE_MESSAGE);
+  }
+  if (buffer[24] === 16) throw new UnsupportedImageError(PNG_16_BIT_MESSAGE);
+}
 
 export class UnsupportedImageError extends Error {
   constructor(message: string) {
@@ -90,7 +108,7 @@ export function decodeImage(buffer: Buffer): { image: RawImage; format: ImageFor
       useTArray: true,
       formatAsRGBA: true,
       maxResolutionInMP: MAX_INPUT_MEGAPIXELS,
-      maxMemoryUsageInMB: 1024,
+      maxMemoryUsageInMB: 384,
     });
     const upright = applyOrientation(
       { width: decoded.width, height: decoded.height, data: decoded.data },
@@ -99,17 +117,11 @@ export function decodeImage(buffer: Buffer): { image: RawImage; format: ImageFor
     return { image: upright, format };
   }
   if (format === 'png') {
-    // Check PNG IHDR dimensions (bytes 16..24) before allocating a decoded RGBA buffer
-    if (buffer.length >= 24 && buffer.toString('ascii', 12, 16) === 'IHDR') {
-      const width = buffer.readUInt32BE(16);
-      const height = buffer.readUInt32BE(20);
-      if (width === 0 || height === 0 || width * height > MAX_INPUT_MEGAPIXELS * 1_000_000) {
-        throw new UnsupportedImageError('This image is too large to process.');
-      }
-    }
+    // Check the PNG header (size and bit depth) before allocating a decoded RGBA buffer
+    assertPngHeaderWithinLimits(buffer);
     const decoded = PNG.sync.read(buffer);
     if (decoded.width * decoded.height > MAX_INPUT_MEGAPIXELS * 1_000_000) {
-      throw new UnsupportedImageError('This image is too large to process.');
+      throw new UnsupportedImageError(IMAGE_TOO_LARGE_MESSAGE);
     }
     return { image: { width: decoded.width, height: decoded.height, data: decoded.data }, format };
   }
@@ -258,14 +270,13 @@ export function assertProcessableImage(buffer: Buffer): ImageFormat {
       'Only JPEG and PNG photos are supported. Convert HEIC, WebP or other formats to JPEG first.'
     );
   }
-  const size =
-    format === 'png'
-      ? buffer.length >= 24 && buffer.toString('ascii', 12, 16) === 'IHDR'
-        ? { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
-        : null
-      : readJpegDimensions(buffer);
+  if (format === 'png') {
+    assertPngHeaderWithinLimits(buffer);
+    return format;
+  }
+  const size = readJpegDimensions(buffer);
   if (size && (size.width === 0 || size.height === 0 || size.width * size.height > MAX_INPUT_MEGAPIXELS * 1_000_000)) {
-    throw new UnsupportedImageError('This image is too large to process.');
+    throw new UnsupportedImageError(IMAGE_TOO_LARGE_MESSAGE);
   }
   return format;
 }
@@ -307,6 +318,20 @@ export async function processImage<T extends ImageTask>(
   options: { timeoutMs?: number; workerPath?: string } = {}
 ): Promise<ImageTaskResult<T>> {
   assertProcessableImage(buffer);
+  // One image at a time: several saves or imports at once can't stack full decodes in memory
+  const run = imageQueue.then(() => runImageInWorker(buffer, task, options));
+  imageQueue = run.catch(() => undefined);
+  return run;
+}
+
+/** The tail of the one-at-a-time image queue. */
+let imageQueue: Promise<unknown> = Promise.resolve();
+
+function runImageInWorker<T extends ImageTask>(
+  buffer: Buffer,
+  task: T,
+  options: { timeoutMs?: number; workerPath?: string }
+): Promise<ImageTaskResult<T>> {
   return new Promise((resolve, reject) => {
     let worker: Worker;
     try {
@@ -355,7 +380,7 @@ export async function processImage<T extends ImageTask>(
         reject(
           new UnsupportedImageError(
             err.code === 'ERR_WORKER_OUT_OF_MEMORY'
-              ? 'This image is too large to process.'
+              ? IMAGE_TOO_LARGE_MESSAGE
               : "This image couldn't be processed."
           )
         )

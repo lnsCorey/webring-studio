@@ -14,7 +14,9 @@ import {
   albumDisplay,
   slugifyAlbumTitle,
   AnalyticsAddon,
+  assertAllowedMediaReference,
   buildCanonicalUrl,
+  isAllowedMediaReference,
   buildDidDocument,
   canonicalizeJson,
   CompleteSiteBundle,
@@ -1323,7 +1325,39 @@ export class StudioDatabase {
         name: 'reseal_proxy',
         up: () => this.sealProxyAtRest(),
       },
+      {
+        // Security phase 9: an image field holding an unsafe media/ address (for example with
+        // `?/../`) could make export write outside its folder. Such values are cleared.
+        version: 5,
+        name: 'clear_unsafe_media_addresses',
+        up: () => this.clearUnsafeMediaAddresses(),
+      },
     ];
+  }
+
+  /** Migration 5. Clears image fields whose media/ address isn't a safe Media Library path. */
+  private clearUnsafeMediaAddresses(): void {
+    const targets: Array<[table: string, column: string, label: string]> = [
+      ['items', 'media_url', 'title'],
+      ['albums', 'cover_url', 'title'],
+      ['profile', 'avatar_url', 'display_name'],
+      ['profile', 'banner_url', 'display_name'],
+      ['hosted_rings', 'banner_url', 'name'],
+    ];
+    const tables = new Set(
+      (this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name)
+    );
+    for (const [table, column, label] of targets) {
+      if (!tables.has(table)) continue;
+      const rows = this.db
+        .prepare(`SELECT rowid AS rid, ${column} AS value, ${label} AS label FROM ${table} WHERE ${column} LIKE 'media/%'`)
+        .all() as Array<{ rid: number; value: string; label: string }>;
+      for (const row of rows) {
+        if (isAllowedMediaReference(row.value)) continue;
+        this.db.prepare(`UPDATE ${table} SET ${column} = '' WHERE rowid = ?`).run(row.rid);
+        console.warn(`[webring-studio] Cleared an invalid image address in ${table} "${row.label}".`);
+      }
+    }
   }
 
   /**
@@ -1890,6 +1924,8 @@ export class StudioDatabase {
     updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> },
     options: { allowPlaintext?: boolean } = {}
   ): ProfileDocument {
+    assertAllowedMediaReference(updates.avatarUrl, 'profile picture');
+    assertAllowedMediaReference(updates.bannerUrl, 'banner');
     for (const field of SECRET_PUBLISH_FIELDS) {
       const incoming = updates.publishSettings?.[field];
       if (incoming !== STORED_SECRET_PLACEHOLDER) this.assertSecretCanBeStored(incoming, options);
@@ -2041,6 +2077,7 @@ export class StudioDatabase {
     postToFeed?: boolean;
     display?: AlbumDisplay;
   }): AlbumItem {
+    assertAllowedMediaReference(input.coverUrl, 'album cover');
     const id = `album-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     this.db
@@ -2226,6 +2263,7 @@ export class StudioDatabase {
   ): AlbumItem {
     const current = this.getAlbums().find((a) => a.id === albumId);
     if (!current) throw new Error(`Album "${albumId}" not found.`);
+    assertAllowedMediaReference(updates.coverUrl, 'album cover');
     const storedCover = (this.db.prepare('SELECT cover_url FROM albums WHERE id = ?').get(albumId) as {
       cover_url: string;
     }).cover_url;
@@ -2425,6 +2463,7 @@ export class StudioDatabase {
     rating?: number;
     tags?: string[];
   }): SharedItem {
+    assertAllowedMediaReference(input.mediaUrl);
     const id = `item-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     const profile = this.getProfile();
@@ -2481,6 +2520,7 @@ export class StudioDatabase {
   ): SharedItem {
     const current = this.getItems().find((i) => i.id === itemId);
     if (!current) throw new Error(`Item "${itemId}" not found.`);
+    assertAllowedMediaReference(updates.mediaUrl);
     const text = (value: string | undefined, fallback: string) => (value === undefined ? fallback : value.trim());
     const commentary = text(updates.commentary, current.commentary);
     const targetAuthorName = text(updates.targetAuthorName, current.targetAuthorName || '');
@@ -4053,6 +4093,7 @@ export class StudioDatabase {
     if (bannerUrl && !bannerUrl.startsWith('media/') && !/^https:\/\//i.test(bannerUrl)) {
       throw new Error('The banner must be a Media Library image or an https:// address.');
     }
+    assertAllowedMediaReference(bannerUrl, 'banner');
     this.db
       .prepare(
         `UPDATE hosted_rings SET name = ?, description = ?, maintainer_is_member = ?, status = ?,
