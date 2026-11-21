@@ -1529,10 +1529,12 @@ export const App: React.FC = () => {
   }, []);
 
   const handleIncomingDeepLink = (action: WebringDeepLinkAction) => {
+    // A link or a feed entry only ever pre-fills a web image, never a local media/ address
+    const webImage = /^https:\/\//i.test(action.mediaUrl || '') ? action.mediaUrl || '' : '';
     if (action.action === 'friend') {
       setFriendSiteUrl(action.targetUrl);
       setFriendName(action.title || action.authorName || 'New Ring Friend');
-      setFriendAvatar(action.mediaUrl || '');
+      setFriendAvatar(webImage);
       setActiveTab('friends');
       notify(`Deep Link: Pre-filled friend "${action.title || action.targetUrl}"`);
     } else if (action.action === 'join-ring') {
@@ -1556,7 +1558,7 @@ export const App: React.FC = () => {
       );
       setItemAuthorUrl(action.authorUrl || '');
       setItemAuthorName(action.authorName || '');
-      setItemMediaUrl(action.action === 'comment' ? '' : action.mediaUrl || '');
+      setItemMediaUrl(action.action === 'comment' ? '' : webImage);
       setItemCategory(action.action === 'comment' ? 'comment' : action.category || 'general');
       setActiveTab('items');
       notify(

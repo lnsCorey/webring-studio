@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as jpegJs from 'jpeg-js';
 import { PNG } from 'pngjs';
-import { processImage, readJpegDimensions, UnsupportedImageError } from '../electron/services/imagePipeline';
+import { IMAGE_TOO_LARGE_MESSAGE, processImage, readJpegDimensions, UnsupportedImageError } from '../electron/services/imagePipeline';
 
 /** A PNG whose header claims a huge size; only the first bytes matter to the pre-check. */
 function pngClaiming(width: number, height: number): Buffer {
@@ -24,7 +24,7 @@ const NO_WORKER = path.join(os.tmpdir(), 'webring-no-such-worker.js');
 describe('Security Phase 6: image decoding off the main thread', () => {
   it('refuses an oversized PNG or JPEG before starting a worker', async () => {
     await expect(processImage(pngClaiming(20000, 20000), { kind: 'web' }, { workerPath: NO_WORKER })).rejects.toThrow(
-      new UnsupportedImageError('This image is too large to process.')
+      new UnsupportedImageError(IMAGE_TOO_LARGE_MESSAGE)
     );
     const big = jpeg(16, 16);
     const dims = readJpegDimensions(big)!;

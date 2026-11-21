@@ -2,6 +2,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { detectImageFormat, processImage, WEB_MAX_SIDE } from './imagePipeline';
+import { isSafeLocalMediaUrl } from '../../src/shared/schema';
+
+/** What a kept (not re-encoded) saved image must start with, by its declared type. */
+const KEPT_IMAGE_SIGNATURES: Record<string, (b: Buffer) => boolean> = {
+  gif: (b) => b.length >= 6 && /^GIF8[79]a$/.test(b.toString('ascii', 0, 6)),
+  webp: (b) => b.length >= 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP',
+  avif: (b) => b.length >= 12 && b.toString('ascii', 4, 8) === 'ftyp' && /^avi[fs]$/.test(b.toString('ascii', 8, 12)),
+};
 
 /**
  * The persona's local photo library (its media store folder):
@@ -129,6 +137,8 @@ export class MediaLibrary {
       const type = contentType.split(';')[0].trim().toLowerCase();
       if (!kept[type]) throw new Error(`Unsupported image type: ${type || 'unknown'}`);
       extension = kept[type];
+      // Stored byte for byte, so it must really be that kind of image
+      if (!KEPT_IMAGE_SIGNATURES[extension](buffer)) throw new Error('Not a valid image.');
     }
     const dir = path.join(this.mediaStoreDir, 'saved');
     fs.mkdirSync(dir, { recursive: true });
@@ -143,12 +153,13 @@ export class MediaLibrary {
   }
 
   /**
-   * The file on disk for a published `media/...` URL, or null if it isn't one or would escape
-   * the library folder.
+   * The file on disk for a published `media/...` URL, or null if it isn't a safe library address
+   * (see isSafeLocalMediaUrl) or would escape the library folder. The whole URL is checked: a
+   * `?` or `#` is never cut off, so the path checked is the path used.
    */
   public resolveLocalUrl(url: string): string | null {
-    if (!MediaLibrary.isLocalUrl(url)) return null;
-    const relative = url.slice(PUBLISHED_PREFIX.length).split(/[?#]/)[0];
+    if (!MediaLibrary.isLocalUrl(url) || !isSafeLocalMediaUrl(url)) return null;
+    const relative = url.slice(PUBLISHED_PREFIX.length);
     const full = path.resolve(this.mediaStoreDir, relative);
     const root = path.resolve(this.mediaStoreDir) + path.sep;
     return full.startsWith(root) ? full : null;

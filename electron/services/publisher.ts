@@ -106,7 +106,7 @@ export function gitBlobSha(content: Buffer): string {
 
 function missingNote(missing: string[]): string {
   return missing.length
-    ? ` ${missing.length} photo file(s) are missing from the Media Library and weren't published.`
+    ? ` ${missing.length} image(s) are missing from the Media Library or have an invalid address, and weren't published. Choose those images again.`
     : '';
 }
 

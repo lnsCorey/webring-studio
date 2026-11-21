@@ -920,6 +920,29 @@ export function albumPagePath(slug: string): string {
 }
 
 /**
+ * A Media Library address that is safe to use as a file path: `media/` then plain path segments
+ * (letters, digits, `_`, `-`, `.`), none empty or starting with a dot. No `?`, `#`, `%`, `\` or
+ * `..`, so it can never point outside the library or the export folder.
+ */
+export function isSafeLocalMediaUrl(url: string): boolean {
+  if (!/^media\/[A-Za-z0-9][A-Za-z0-9/_.-]*$/.test(url)) return false;
+  return url.split('/').every((segment) => segment !== '' && !segment.startsWith('.'));
+}
+
+/** An image field's value: '' or a web address are fine; a `media/` address must be a safe one. */
+export function isAllowedMediaReference(value: string | undefined | null): boolean {
+  const v = (value || '').trim();
+  return !/^media\//i.test(v) || isSafeLocalMediaUrl(v);
+}
+
+/** Throws a readable error for an image field naming an unsafe `media/` address. */
+export function assertAllowedMediaReference(value: string | undefined | null, field = 'image'): void {
+  if (!isAllowedMediaReference(value)) {
+    throw new Error(`This ${field} address isn't valid. Choose the image from the Media Library again.`);
+  }
+}
+
+/**
  * Builds a canonical item URL indexed to the user's hosted website structure.
  */
 export function buildCanonicalUrl(
@@ -1163,7 +1186,8 @@ export function parseWebringUri(uri: string): WebringDeepLinkAction | null {
       title: parsed.searchParams.get('title') || undefined,
       authorUrl: parsed.searchParams.get('authorUrl') || undefined,
       authorName: parsed.searchParams.get('authorName') || undefined,
-      mediaUrl: parsed.searchParams.get('mediaUrl') || undefined,
+      // Only a web image (a link can't name a file on this computer, or a crafted media/ path)
+      mediaUrl: /^https:\/\//i.test(parsed.searchParams.get('mediaUrl') || '') ? parsed.searchParams.get('mediaUrl')! : undefined,
       category: parsed.searchParams.get('category') || undefined,
     };
   } catch {
