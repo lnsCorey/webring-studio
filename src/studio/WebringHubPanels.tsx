@@ -64,6 +64,13 @@ export interface WebringHubSearchResultView {
   relation: 'self' | 'friend' | 'muted' | 'none';
 }
 
+export interface HubAuthRequestView {
+  hubUrl: string;
+  challengeId: string;
+  nonce: string;
+  requestedExt?: string;
+}
+
 export interface WebringHubApi {
   listWebringHubs: () => Promise<WebringHubView[]>;
   addWebringHub: (url: string) => Promise<WebringHubView>;
@@ -75,6 +82,9 @@ export interface WebringHubApi {
   ) => Promise<{ webringHubUrl: string; total: number; results: WebringHubSearchResultView[] }>;
   setWebringHubListed: (url: string, listed: boolean) => Promise<WebringHubView>;
   checkKeyWithWebringHubs?: (siteUrl: string) => Promise<WebringHubKeyCheckView>;
+  approveWebringHubAuth?: (req: HubAuthRequestView, optInExtensions?: string[]) => Promise<{ ok: boolean; did: string; hubUrl: string }>;
+  launchWebringHub?: (url: string, targetPath?: string, optInExtensions?: string[]) => Promise<{ ok: boolean }>;
+  optOutWebringHubExtension?: (url: string, extensionId: string) => Promise<{ extensionId: string; optedIn: boolean }>;
 }
 
 /** A ring this persona is in, with the member sites Studio knows, for tagging hub search results. */
@@ -344,6 +354,62 @@ export function WebringHubListingsPanel(props: {
                   {d.lastPingAt && <span>Last re-read {formatTime(d.lastPingAt)}</span>}
                   {d.listMe && d.pendingPingFor && <span>Waiting for your live site to show the last publish</span>}
                 </div>
+                {d.state === 'listed' && api?.launchWebringHub && (
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      disabled={busy !== null}
+                      onClick={() => {
+                        void run(`launch:${d.url}`, async () => {
+                          await api.launchWebringHub!(d.url, '/');
+                          notify(`Opened ${d.title} signed in with your DID.`);
+                        });
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 text-[11px] font-medium disabled:opacity-40"
+                    >
+                      Open Hub (Signed In)
+                    </button>
+                    {d.extensions?.some((ext) => ext.id === 'arcade') && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={busy !== null}
+                          onClick={() => {
+                            void run(`launch-arcade:${d.url}`, async () => {
+                              await api.launchWebringHub!(d.url, '/ext/arcade/');
+                              notify(`Opened ${d.title} Arcade signed in with your DID.`);
+                            });
+                          }}
+                          className="px-2.5 py-1 rounded-lg bg-fuchsia-500/20 hover:bg-fuchsia-500/30 text-fuchsia-200 text-[11px] font-medium disabled:opacity-40"
+                        >
+                          Open Arcade
+                        </button>
+                        {api.optOutWebringHubExtension && (
+                          <button
+                            type="button"
+                            disabled={busy !== null}
+                            onClick={() => {
+                              if (
+                                !window.confirm(
+                                  `Opt out of Arcade on ${d.title} and permanently delete all your high scores and play history there?`
+                                )
+                              ) {
+                                return;
+                              }
+                              void run(`optout:${d.url}`, async () => {
+                                await api.optOutWebringHubExtension!(d.url, 'arcade');
+                                notify(`Opted out of Arcade on ${d.title} and deleted your scores.`);
+                              });
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 text-[11px] font-medium disabled:opacity-40"
+                          >
+                            Opt out &amp; Delete Arcade Data
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
                 {d.state === 'key-changed' && (
                   <p className="text-[11px] text-amber-300">
                     This Webring Hub pinned a different signing key for your site. If you rotated your key with
@@ -705,6 +771,125 @@ export function KeyWitnessCheck(props: {
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+
+/**
+ * Approval modal shown when a Webring Hub opens `webring://hub-auth?...`.
+ * Studio never auto-signs: the user confirms the hub URL, persona DID, and any optional
+ * extension opt-in (unchecked by default).
+ */
+export function HubAuthApprovalModal(props: {
+  request: HubAuthRequestView;
+  personaName: string;
+  personaDid: string;
+  onApprove: (optInExtensions: string[]) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const { request, personaName, personaDid, onApprove, onCancel } = props;
+  const [optInExt, setOptInExt] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleConfirm = async () => {
+    setSubmitting(true);
+    setError('');
+    try {
+      const optIns = request.requestedExt && optInExt ? [request.requestedExt] : [];
+      await onApprove(optIns);
+    } catch (err) {
+      setError(errorText(err));
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="hub-auth-modal-title"
+        className="w-full max-w-md rounded-2xl bg-slate-900 border border-slate-700 p-5 shadow-2xl space-y-4"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="w-5 h-5 text-indigo-400 shrink-0" />
+            <h2 id="hub-auth-modal-title" className="text-base font-bold text-slate-100">
+              Sign in to Webring Hub
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            className="p-1 rounded-lg text-slate-400 hover:bg-slate-800"
+            aria-label="Cancel"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <p className="text-xs text-slate-300 leading-relaxed">
+          A browser session is asking to sign in to the Webring Hub below using your persona&apos;s
+          Ed25519 key. Your private key never leaves Webring Studio.
+        </p>
+
+        <div className="rounded-xl bg-slate-950 border border-slate-800 p-3 space-y-1.5 text-xs">
+          <div>
+            <span className="text-slate-500">Hub: </span>
+            <span className="font-mono text-indigo-300 break-all">{request.hubUrl}</span>
+          </div>
+          <div>
+            <span className="text-slate-500">Persona: </span>
+            <span className="font-semibold text-slate-100">{personaName}</span>
+          </div>
+          <div>
+            <span className="text-slate-500">DID: </span>
+            <span className="font-mono text-slate-300 break-all">{personaDid}</span>
+          </div>
+        </div>
+
+        {request.requestedExt && (
+          <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-950/80 border border-slate-800 text-xs text-slate-200 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={optInExt}
+              onChange={(e) => setOptInExt(e.target.checked)}
+              disabled={submitting}
+              className="mt-0.5 accent-indigo-500"
+            />
+            <span>
+              <strong>Opt in to &ldquo;{request.requestedExt}&rdquo;</strong> — allow this extension
+              to record public user-specific data (such as high scores) under my DID. You can opt
+              out and delete this data anytime.
+            </span>
+          </label>
+        )}
+
+        {error && <p className="text-xs text-rose-300">{error}</p>}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleConfirm()}
+            disabled={submitting}
+            className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+          >
+            {submitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+            Approve &amp; Sign In
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

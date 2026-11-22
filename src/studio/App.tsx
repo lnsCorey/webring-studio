@@ -47,6 +47,8 @@ import { renderMarkdown } from '../shared/markdown';
 import { ProfileImagePicker } from './ProfileImagePicker';
 import { HostedRingPageEditor } from './HostedRingPageEditor';
 import {
+  HubAuthApprovalModal,
+  HubAuthRequestView,
   WebringHubApi,
   WebringHubListingsPanel,
   WebringHubSearchPanel,
@@ -628,6 +630,10 @@ declare global {
       dismissFriendNotice?: (siteUrl: string) => Promise<unknown>;
       dismissFriendSyncNotice?: (siteUrl: string, doc: string) => Promise<unknown>;
       onFriendNoticeLink?: (cb: (link: string) => void) => () => void;
+      onHubAuthRequest?: (cb: (req: HubAuthRequestView) => void) => () => void;
+      approveWebringHubAuth?: (req: HubAuthRequestView, optInExtensions?: string[]) => Promise<{ ok: boolean; did: string; hubUrl: string }>;
+      launchWebringHub?: (url: string, targetPath?: string, optInExtensions?: string[]) => Promise<{ ok: boolean }>;
+      optOutWebringHubExtension?: (url: string, extensionId: string) => Promise<{ extensionId: string; optedIn: boolean }>;
       getSchedule: () => Promise<ScheduleOverview>;
       setSchedule: (
         change:
@@ -798,6 +804,7 @@ export const App: React.FC = () => {
   const [keyChangeFriendId, setKeyChangeFriendId] = useState<string | null>(null);
   const [mutualFriendUrls, setMutualFriendUrls] = useState<string[]>([]);
   const [incomingFriendNotice, setIncomingFriendNotice] = useState<{ link: string; at: number } | null>(null);
+  const [pendingHubAuth, setPendingHubAuth] = useState<HubAuthRequestView | null>(null);
   const [feedScope, setFeedScopeState] = useState<FeedScope>(loadFeedScope);
   useEffect(() => {
     setOpenFeedAlbum(null);
@@ -1511,6 +1518,13 @@ export const App: React.FC = () => {
             // Opens the review only; nothing is added until the user clicks
             setActiveTab('friends');
             setIncomingFriendNotice({ link, at: Date.now() });
+          })
+        );
+      }
+      if (window.studioApi.onHubAuthRequest) {
+        cleanups.push(
+          window.studioApi.onHubAuthRequest((req) => {
+            setPendingHubAuth(req);
           })
         );
       }
@@ -9647,6 +9661,20 @@ git push -u origin main --force`}
             setApprovalModalOpen(false);
             setApprovalFocusId(null);
           }}
+        />
+      )}
+
+      {pendingHubAuth && window.studioApi?.approveWebringHubAuth && (
+        <HubAuthApprovalModal
+          request={pendingHubAuth}
+          personaName={bundle?.profile.displayName || 'Active Persona'}
+          personaDid={bundle?.profile.siteUrl ? siteUrlToDidWeb(bundle.profile.siteUrl) : ''}
+          onApprove={async (optIns) => {
+            await window.studioApi?.approveWebringHubAuth?.(pendingHubAuth, optIns);
+            setPendingHubAuth(null);
+            notify(`Signed in to ${pendingHubAuth.hubUrl}. Return to your browser.`);
+          }}
+          onCancel={() => setPendingHubAuth(null)}
         />
       )}
 
