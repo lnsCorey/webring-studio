@@ -97,6 +97,14 @@ contextBridge.exposeInMainWorld('studioApi', {
   setWebringHubListed: (url: string, listed: boolean) =>
     ipcRenderer.invoke('studio:webring-hub-set-listed', url, listed),
   checkKeyWithWebringHubs: (siteUrl: string) => ipcRenderer.invoke('studio:webring-hub-check-key', siteUrl),
+  approveWebringHubAuth: (
+    req: { hubUrl: string; challengeId: string; nonce: string; requestedExt?: string },
+    optInExtensions?: string[]
+  ) => ipcRenderer.invoke('studio:webring-hub-approve-auth', req, optInExtensions),
+  launchWebringHub: (url: string, targetPath?: string, optInExtensions?: string[]) =>
+    ipcRenderer.invoke('studio:webring-hub-launch', url, targetPath, optInExtensions),
+  optOutWebringHubExtension: (url: string, extensionId: string) =>
+    ipcRenderer.invoke('studio:webring-hub-opt-out', url, extensionId),
   createFriendNotice: (friendSiteUrl: string) => ipcRenderer.invoke('studio:friend-notice-create', friendSiteUrl),
   reviewFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-review', link),
   acceptFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-accept', link),
@@ -184,6 +192,16 @@ contextBridge.exposeInMainWorld('studioApi', {
     const listener = (_event: unknown, link: string) => callback(link);
     ipcRenderer.on('webring:friend-notice', listener);
     return () => ipcRenderer.removeListener('webring:friend-notice', listener);
+  },
+  onHubAuthRequest: (
+    callback: (req: { hubUrl: string; challengeId: string; nonce: string; requestedExt?: string }) => void
+  ) => {
+    const listener = (
+      _event: unknown,
+      req: { hubUrl: string; challengeId: string; nonce: string; requestedExt?: string }
+    ) => callback(req);
+    ipcRenderer.on('webring:hub-auth', listener);
+    return () => ipcRenderer.removeListener('webring:hub-auth', listener);
   },
   onDeepLink: (callback: (action: WebringDeepLinkAction) => void) => {
     const listener = (_event: unknown, action: WebringDeepLinkAction) => callback(action);

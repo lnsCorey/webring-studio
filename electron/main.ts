@@ -21,6 +21,7 @@ import { pathToFileURL } from 'url';
 import { ActivePersonaContext, PersonaManager } from './services/personaManager';
 import { buildEditContextMenu } from './editContextMenu';
 import { isAllowedPreviewFrameUrl, LocalPreviewServer } from './services/localPreviewServer';
+import { parseHubAuthUri, HubAuthChallengeRequest } from './services/webringHubService';
 import { WebringMcpServer } from './mcp/mcpServer';
 import { McpHttpServer } from './mcp/mcpHttpServer';
 import { DEMO_PEER_FOLDER_NAME } from './db/legacyDemoContent';
@@ -632,6 +633,16 @@ function createWindow(show = true) {
 }
 
 function handleDeepLinkUrl(rawUri: string) {
+  // Hub DID sign-in requests only open the approval modal; Studio never auto-signs
+  if (rawUri.startsWith('webring://hub-auth')) {
+    const authReq = parseHubAuthUri(rawUri);
+    if (authReq && mainWindow) {
+      mainWindow.webContents.send('webring:hub-auth', authReq);
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+    return;
+  }
   // Ring requests only open the review screen; nothing is approved without the maintainer
   if (rawUri.startsWith('webring://ring-request') && parseRingRequestUri(rawUri) && mainWindow) {
     mainWindow.webContents.send('webring:ring-request', rawUri);
@@ -1153,6 +1164,32 @@ function registerIpcHandlers() {
   );
   ipcMain.handle('studio:webring-hub-check-key', (_e, siteUrl: string) =>
     personaManager.getActiveContext().webringHubService.checkKeyWithWebringHubs(String(siteUrl || ''))
+  );
+  ipcMain.handle(
+    'studio:webring-hub-approve-auth',
+    (_e, req: HubAuthChallengeRequest, optInExtensions?: string[]) =>
+      personaManager
+        .getActiveContext()
+        .webringHubService.approveAuthChallenge(req, Array.isArray(optInExtensions) ? optInExtensions : [])
+  );
+  ipcMain.handle(
+    'studio:webring-hub-launch',
+    async (_e, url: string, targetPath?: string, optInExtensions?: string[]) => {
+      const launchUrl = await personaManager
+        .getActiveContext()
+        .webringHubService.createSignedLaunchUrl(
+          String(url || ''),
+          typeof targetPath === 'string' ? targetPath : '/',
+          Array.isArray(optInExtensions) ? optInExtensions : []
+        );
+      await shell.openExternal(launchUrl);
+      return { ok: true };
+    }
+  );
+  ipcMain.handle('studio:webring-hub-opt-out', (_e, url: string, extensionId: string) =>
+    personaManager
+      .getActiveContext()
+      .webringHubService.optOutExtension(String(url || ''), String(extensionId || ''))
   );
 
   ipcMain.handle('studio:ring-request-join', async (_e, hubUrl: string) => {

@@ -113,6 +113,40 @@ export interface WebringHubPingResult {
   message?: string;
 }
 
+export interface HubAuthChallengeRequest {
+  hubUrl: string;
+  challengeId: string;
+  nonce: string;
+  requestedExt?: string;
+}
+
+/**
+ * Parses and validates a `webring://hub-auth?hub=...&challenge=...&nonce=...(&ext=...)` deep link.
+ * Returns null if the URI is malformed, missing fields, or targets a disallowed URL.
+ */
+export function parseHubAuthUri(rawUri: string): HubAuthChallengeRequest | null {
+  try {
+    const parsed = new URL(String(rawUri || '').trim());
+    if (parsed.protocol !== 'webring:') return null;
+    const host = (parsed.hostname || parsed.pathname.replace(/^\/+/, '')).toLowerCase();
+    if (host !== 'hub-auth') return null;
+
+    const rawHub = parsed.searchParams.get('hub') || '';
+    const challengeId = (parsed.searchParams.get('challenge') || '').trim();
+    const nonce = (parsed.searchParams.get('nonce') || '').trim();
+    const rawExt = (parsed.searchParams.get('ext') || '').trim();
+
+    const hubUrl = normalizeWebringHubUrl(rawHub);
+    if (!/^[a-f0-9]{16,64}$/i.test(challengeId) || !/^[a-f0-9]{16,64}$/i.test(nonce)) {
+      return null;
+    }
+    const requestedExt = rawExt && /^[a-z][a-z0-9-]{1,40}$/.test(rawExt) ? rawExt : undefined;
+    return { hubUrl, challengeId, nonce, requestedExt };
+  } catch {
+    return null;
+  }
+}
+
 function str(value: unknown, max: number): string {
   return typeof value === 'string' ? value.trim().slice(0, max) : '';
 }
@@ -482,6 +516,140 @@ export class WebringHubService {
     const message = errorMessage(res, `${record.title} didn't remove your listing`);
     this.update(record.url, { lastError: message });
     throw new Error(message);
+  }
+
+  /**
+   * Signs and submits a `hub_auth` approval for a browser-initiated sign-in challenge.
+   * Always called only after explicit user confirmation in the approval dialog.
+   */
+  public async approveAuthChallenge(
+    req: HubAuthChallengeRequest,
+    optInExtensions: string[] = []
+  ): Promise<{ ok: boolean; did: string; hubUrl: string; optInExtensions: string[] }> {
+    const hubUrl = normalizeWebringHubUrl(req.hubUrl);
+    const { siteUrl } = this.ownSite();
+    const did = siteUrlToDidWeb(siteUrl);
+    const createdAt = this.now().toISOString();
+    const normalizedOptIns = Array.from(
+      new Set(optInExtensions.filter((e) => typeof e === 'string' && /^[a-z][a-z0-9-]{1,40}$/.test(e)))
+    ).sort();
+
+    const payload = {
+      action: 'hub_auth',
+      hubUrl: normalizeSiteUrl(hubUrl),
+      did,
+      siteUrl,
+      nonce: req.nonce,
+      challengeId: req.challengeId,
+      optInExtensions: normalizedOptIns,
+      createdAt,
+    };
+    const signature = signWebringHubPayload(payload, this.db.getKeys().privateKeyPem);
+    const res = await this.request(`${hubUrl}/api/auth/verify`, {
+      method: 'POST',
+      body: { ...payload, signature },
+    });
+    if (res.status !== 200) {
+      throw new Error(errorMessage(res, 'The Webring Hub refused the sign-in approval'));
+    }
+    return { ok: true, did, hubUrl, optInExtensions: normalizedOptIns };
+  }
+
+  /**
+   * Pre-signs a one-time direct-launch handoff code so the user can open a listed Hub
+   * (or one of its public extensions such as `/ext/arcade/`) already signed in.
+   */
+  public async createSignedLaunchUrl(
+    rawUrl: string,
+    targetPath = '/',
+    optInExtensions: string[] = []
+  ): Promise<string> {
+    const record = this.find(rawUrl);
+    const { siteUrl } = this.ownSite();
+    const did = siteUrlToDidWeb(siteUrl);
+    const safeNext =
+      typeof targetPath === 'string' && targetPath.startsWith('/') && !targetPath.startsWith('//')
+        ? targetPath
+        : '/';
+
+    const nonceRes = await this.request(`${record.url}/api/nonce`, { method: 'GET' });
+    const nonce = str((nonceRes.json as { nonce?: unknown } | undefined)?.nonce, 128);
+    if (nonceRes.status !== 200 || !nonce) {
+      throw new Error(errorMessage(nonceRes, `${record.title} didn't hand out a sign-in nonce`));
+    }
+
+    const createdAt = this.now().toISOString();
+    const normalizedOptIns = Array.from(
+      new Set(optInExtensions.filter((e) => typeof e === 'string' && /^[a-z][a-z0-9-]{1,40}$/.test(e)))
+    ).sort();
+    const payload = {
+      action: 'hub_auth',
+      hubUrl: normalizeSiteUrl(record.url),
+      did,
+      siteUrl,
+      nonce,
+      challengeId: '',
+      optInExtensions: normalizedOptIns,
+      createdAt,
+    };
+    const signature = signWebringHubPayload(payload, this.db.getKeys().privateKeyPem);
+    const res = await this.request(`${record.url}/api/auth/verify`, {
+      method: 'POST',
+      body: { ...payload, signature },
+    });
+    const body = res.json as { code?: unknown; secret?: unknown } | undefined;
+    const code = str(body?.code, 128);
+    const secret = str(body?.secret, 128);
+    if (res.status !== 200 || !code || !secret) {
+      throw new Error(errorMessage(res, `${record.title} couldn't start a signed-in session`));
+    }
+    const params = new URLSearchParams({ code, secret, next: safeNext });
+    return `${record.url}/auth/claim?${params.toString()}`;
+  }
+
+  /**
+   * Sends a stateless Ed25519-signed opt-out request for one extension on a hub,
+   * revoking consent and deleting all user-specific data held by that extension.
+   */
+  public async optOutExtension(
+    rawUrl: string,
+    extensionId: string
+  ): Promise<{ extensionId: string; optedIn: boolean }> {
+    const record = this.find(rawUrl);
+    const cleanExt = String(extensionId || '').trim();
+    if (!/^[a-z][a-z0-9-]{1,40}$/.test(cleanExt)) {
+      throw new Error('Invalid extension id.');
+    }
+    const { siteUrl } = this.ownSite();
+    const did = siteUrlToDidWeb(siteUrl);
+
+    const nonceRes = await this.request(`${record.url}/api/nonce`, { method: 'GET' });
+    const nonce = str((nonceRes.json as { nonce?: unknown } | undefined)?.nonce, 128);
+    if (nonceRes.status !== 200 || !nonce) {
+      throw new Error(errorMessage(nonceRes, `${record.title} didn't hand out a nonce`));
+    }
+    const createdAt = this.now().toISOString();
+    const payload = {
+      action: 'ext_opt_out',
+      hubUrl: normalizeSiteUrl(record.url),
+      did,
+      siteUrl,
+      extensionId: cleanExt,
+      nonce,
+      createdAt,
+    };
+    const signature = signWebringHubPayload(payload, this.db.getKeys().privateKeyPem);
+    const res = await this.request(
+      `${record.url}/api/auth/extensions/${encodeURIComponent(cleanExt)}/opt-out`,
+      {
+        method: 'POST',
+        body: { siteUrl, did, hubUrl: payload.hubUrl, nonce, createdAt, signature },
+      }
+    );
+    if (res.status !== 200) {
+      throw new Error(errorMessage(res, `${record.title} couldn't opt out of ${cleanExt}`));
+    }
+    return { extensionId: cleanExt, optedIn: false };
   }
 
   /**
