@@ -24,6 +24,9 @@ import {
 } from '../shared/schema';
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
+import { HorizontalTabs } from './HorizontalTabs';
+import { MediaLibraryView } from './MediaLibraryView';
+import { PostsLibraryView } from './PostsLibraryView';
 import { FriendEdit, FriendEditor } from './FriendEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { FriendAlbumView } from './FriendAlbumView';
@@ -777,7 +780,20 @@ type StudioTab =
   | 'help';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<StudioTab>('profile');
+  const [activeTab, setActiveTab] = useState<StudioTab>('feed');
+  const [friendsSubTab, setFriendsSubTab] = useState<'friends' | 'notices' | 'webrings' | 'hosted' | 'discover'>('friends');
+  const [publishSubTab, setPublishSubTab] = useState<
+    | 'deploy'
+    | 'schedule'
+    | 'hubs'
+    | 'preflight'
+    | 'local'
+    | 'sftp'
+    | 'github'
+    | 'comments'
+    | 'analytics'
+    | 'adsense'
+  >('deploy');
   const [helpSection, setHelpSection] = useState<
     | 'quickstart'
     | 'github-pages'
@@ -1365,12 +1381,7 @@ export const App: React.FC = () => {
         ...p.publishSettings,
       });
     }
-    if (data.bundle.albums.albums.length > 0) {
-      const currentExists = data.bundle.albums.albums.some((a) => a.id === selectedAlbumId);
-      if (!currentExists) {
-        setSelectedAlbumId(data.bundle.albums.albums[0].id);
-      }
-    } else {
+    if (selectedAlbumId && !data.bundle.albums.albums.some((a) => a.id === selectedAlbumId)) {
       setSelectedAlbumId('');
     }
   };
@@ -1517,6 +1528,7 @@ export const App: React.FC = () => {
           window.studioApi.onFriendNoticeLink((link) => {
             // Opens the review only; nothing is added until the user clicks
             setActiveTab('friends');
+            setFriendsSubTab('notices');
             setIncomingFriendNotice({ link, at: Date.now() });
           })
         );
@@ -2793,6 +2805,12 @@ export const App: React.FC = () => {
   };
 
   const navItems: Array<{ id: StudioTab; label: string; icon: React.ReactNode; badge?: number; alert?: string }> = [
+    {
+      id: 'feed',
+      label: 'Neighborhood Feed',
+      icon: <Radio className="w-4 h-4" />,
+      badge: networkFeed.length,
+    },
     { id: 'profile', label: 'Profile & Identity', icon: <UserCheck className="w-4 h-4" /> },
     {
       id: 'albums',
@@ -2812,12 +2830,6 @@ export const App: React.FC = () => {
       icon: <Users className="w-4 h-4" />,
       badge: allFriends.length,
       alert: friendNotices.length ? `${friendNotices.length} added you` : undefined,
-    },
-    {
-      id: 'feed',
-      label: 'Neighborhood Feed',
-      icon: <Radio className="w-4 h-4" />,
-      badge: networkFeed.length,
     },
     { id: 'preview', label: 'Site Design', icon: <Compass className="w-4 h-4" /> },
     { id: 'schemas', label: 'JSON Schema Output', icon: <Code2 className="w-4 h-4" /> },
@@ -3379,794 +3391,98 @@ export const App: React.FC = () => {
             </div>
           )}
 
-          {/* TAB 2: PHOTO ALBUMS */}
-          {activeTab === 'albums' && (() => {
-            const albums = bundle.albums.albums;
-            const album = albums.find((a) => a.id === selectedAlbumId);
-            const draft = album
-              ? albumDraft || {
-                  title: album.title,
-                  description: album.description,
-                  tags: album.tags.join(', '),
-                  postToFeed: albumIsPosted(album),
-                  display: albumDisplay(album),
-                }
-              : null;
-            return (
-            <div className="max-w-6xl mx-auto space-y-6">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <h2 className="text-2xl font-bold">Media Library</h2>
-                  <p className="text-sm text-slate-400 mt-1">
-                    Albums of your own photos, kept on this computer and published with your site, by
-                    folder, SFTP/FTP or GitHub Pages. Each album gets a signed manifest listing every
-                    photo and its exact file.
-                  </p>
-                </div>
-                {mediaUsage && (
-                  <span className="text-xs text-slate-400 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800">
-                    Library: {mediaUsage.files} files · {formatBytes(mediaUsage.bytes)}
-                  </span>
-                )}
-              </div>
+          {/* TAB 2: PHOTO ALBUMS (Master-Detail + Card/List Toggles) */}
+          {activeTab === 'albums' && (
+            <MediaLibraryView
+              albums={bundle.albums.albums}
+              siteUrl={bundle.profile.siteUrl}
+              lastPublishedAt={publishSettings.lastPublishedAt}
+              endorsements={allEndorsements}
+              mediaUsage={mediaUsage}
+              selectedAlbumId={selectedAlbumId || null}
+              setSelectedAlbumId={(id) => setSelectedAlbumId(id ?? '')}
+              albumDraft={albumDraft}
+              setAlbumDraft={setAlbumDraft}
+              newAlbumTitle={newAlbumTitle}
+              setNewAlbumTitle={setNewAlbumTitle}
+              newAlbumDesc={newAlbumDesc}
+              setNewAlbumDesc={setNewAlbumDesc}
+              newAlbumPostToFeed={newAlbumPostToFeed}
+              setNewAlbumPostToFeed={setNewAlbumPostToFeed}
+              newAlbumDisplay={newAlbumDisplay}
+              setNewAlbumDisplay={setNewAlbumDisplay}
+              handleCreateAlbum={handleCreateAlbum}
+              handleSaveAlbum={handleSaveAlbum}
+              handleDeleteAlbum={handleDeleteAlbum}
+              isImportingPhotos={isImportingPhotos}
+              isDraggingPhotos={isDraggingPhotos}
+              setIsDraggingPhotos={setIsDraggingPhotos}
+              handleImportPhotos={handleImportPhotos}
+              handleDropPhotos={handleDropPhotos}
+              photoDrafts={photoDrafts}
+              setPhotoDrafts={setPhotoDrafts}
+              handleSavePhotoDetails={handleSavePhotoDetails}
+              handlePhotoAction={handlePhotoAction}
+              newPhotoUrl={newPhotoUrl}
+              setNewPhotoUrl={setNewPhotoUrl}
+              newPhotoCaption={newPhotoCaption}
+              setNewPhotoCaption={setNewPhotoCaption}
+              handleAddPhoto={handleAddPhoto}
+              handleForgetPublishHistory={handleForgetPublishHistory}
+              refreshMediaUsage={refreshMediaUsage}
+              mediaSrc={mediaSrc}
+              formatBytes={formatBytes}
+              formatRelativeTime={formatRelativeTime}
+            />
+          )}
 
-              <div className="grid grid-cols-1 lg:grid-cols-[18rem_1fr] gap-6">
-                {/* Album list */}
-                <div className="space-y-3">
-                  <form
-                    onSubmit={handleCreateAlbum}
-                    className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2"
-                  >
-                    <h3 className="font-bold text-sm flex items-center gap-2">
-                      <Plus className="w-4 h-4 text-indigo-400" /> New Album
-                    </h3>
-                    <input
-                      type="text"
-                      required
-                      value={newAlbumTitle}
-                      onChange={(e) => setNewAlbumTitle(e.target.value)}
-                      placeholder="Album title"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                    <input
-                      type="text"
-                      value={newAlbumDesc}
-                      onChange={(e) => setNewAlbumDesc(e.target.value)}
-                      placeholder="Description (optional)"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                    <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={newAlbumPostToFeed}
-                        onChange={(e) => setNewAlbumPostToFeed(e.target.checked)}
-                        className="mt-0.5"
-                      />
-                      <span>
-                        Post to feed
-                        <span className="block text-[11px] text-slate-500">Announce this album in your posts timeline</span>
-                      </span>
-                    </label>
-                    <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
-                      <span>Show in Photos as:</span>
-                      {(['card', 'expanded'] as AlbumDisplay[]).map((mode) => (
-                        <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="new-album-display"
-                            checked={newAlbumDisplay === mode}
-                            onChange={() => setNewAlbumDisplay(mode)}
-                          />
-                          {mode === 'card' ? 'Card' : 'Expanded'}
-                        </label>
-                      ))}
-                    </div>
-                    <button
-                      type="submit"
-                      className="w-full px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs"
-                    >
-                      Create Album
-                    </button>
-                  </form>
-                  {albums.length === 0 && (
-                    <p className="text-xs text-slate-500 px-1">No albums yet.</p>
-                  )}
-                  {albums.map((a) => (
-                    <button
-                      key={a.id}
-                      type="button"
-                      onClick={() => {
-                        setSelectedAlbumId(a.id);
-                        setAlbumDraft(null);
-                        refreshMediaUsage();
-                      }}
-                      className={`w-full flex items-center gap-3 p-2.5 rounded-xl border text-left transition ${
-                        a.id === selectedAlbumId
-                          ? 'bg-indigo-950/40 border-indigo-500/50'
-                          : 'bg-slate-900 border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      {a.coverUrl ? (
-                        <img src={mediaSrc(a.coverUrl)} alt="" className="w-12 h-12 rounded-lg object-cover bg-slate-800" />
-                      ) : (
-                        <div className="w-12 h-12 rounded-lg bg-slate-800 flex items-center justify-center">
-                          <Camera className="w-5 h-5 text-slate-500" />
-                        </div>
-                      )}
-                      <div className="min-w-0">
-                        <div className="font-semibold text-sm truncate">{a.title}</div>
-                        <div className="text-[11px] text-slate-400">
-                          {a.photos.length} photo{a.photos.length === 1 ? '' : 's'} · updated {formatRelativeTime(a.updatedAt)}
-                        </div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-
-                {/* Selected album */}
-                {!album || !draft ? (
-                  <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center text-sm text-slate-400">
-                    Create an album, or pick one on the left, to add photos.
-                  </div>
-                ) : (
-                  <div
-                    className={`bg-slate-900 border rounded-2xl p-5 space-y-5 transition ${
-                      isDraggingPhotos ? 'border-indigo-400 bg-indigo-950/20' : 'border-slate-800'
-                    }`}
-                    onDragOver={(e) => {
-                      e.preventDefault();
-                      setIsDraggingPhotos(true);
-                    }}
-                    onDragLeave={() => setIsDraggingPhotos(false)}
-                    onDrop={handleDropPhotos}
-                  >
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <input
-                        type="text"
-                        value={draft.title}
-                        onChange={(e) => setAlbumDraft({ ...draft, title: e.target.value })}
-                        className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-semibold"
-                      />
-                      <input
-                        type="text"
-                        value={draft.tags}
-                        onChange={(e) => setAlbumDraft({ ...draft, tags: e.target.value })}
-                        placeholder="Tags, comma separated"
-                        className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                      <MarkdownField
-                        value={draft.description}
-                        onChange={(description) => setAlbumDraft({ ...draft, description })}
-                        placeholder="Description (Markdown: headings, links, lists, tables)"
-                        className="md:col-span-2"
-                      />
-                    </div>
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
-                      <span>Page address:</span>
-                      <code className="text-slate-300">{album.pageUrl}</code>
-                      {publishSettings.lastPublishedAt && !isPlaceholderSiteUrl(bundle.profile.siteUrl) && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            window.studioApi?.openExternal(
-                              `${bundle.profile.siteUrl.replace(/\/+$/, '')}/${album.pageUrl}`,
-                            )
-                          }
-                          className="text-indigo-400 hover:text-indigo-300"
-                        >
-                          View page ↗
-                        </button>
-                      )}
-                    </div>
-                    <div className="space-y-2">
-                      <label className="flex items-start gap-2 text-xs text-slate-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={draft.postToFeed}
-                          onChange={(e) => setAlbumDraft({ ...draft, postToFeed: e.target.checked })}
-                          className="mt-0.5"
-                        />
-                        <span>
-                          Post to feed
-                          <span className="block text-[11px] text-slate-500">Announce this album in your posts timeline</span>
-                        </span>
-                      </label>
-                      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
-                        <span>Show in Photos as:</span>
-                        {(['card', 'expanded'] as AlbumDisplay[]).map((mode) => (
-                          <label key={mode} className="flex items-center gap-1.5 cursor-pointer">
-                            <input
-                              type="radio"
-                              name="album-display"
-                              checked={draft.display === mode}
-                              onChange={() => setAlbumDraft({ ...draft, display: mode })}
-                            />
-                            {mode === 'card' ? 'Card' : 'Expanded'}
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      {albumDraft && (
-                        <button
-                          type="button"
-                          onClick={handleSaveAlbum}
-                          className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold"
-                        >
-                          Save Album
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        disabled={isImportingPhotos}
-                        onClick={() => handleImportPhotos()}
-                        className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white text-xs font-semibold flex items-center gap-1.5"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                        {isImportingPhotos ? 'Importing...' : 'Add Photos'}
-                      </button>
-                      <span className="text-xs text-slate-500">or drop JPEG/PNG files here</span>
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteAlbum(album)}
-                        className="ml-auto px-3 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 text-xs"
-                      >
-                        Delete Album
-                      </button>
-                    </div>
-
-                    {album.photos.length === 0 ? (
-                      <p className="text-sm text-slate-500 py-8 text-center">No photos yet.</p>
-                    ) : (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-                        {album.photos.map((photo, idx) => {
-                          const photoDraft = photoDrafts[photo.id] || { caption: photo.caption, altText: photo.altText };
-                          const isCover = album.coverUrl === photo.thumbUrl;
-                          return (
-                            <div key={photo.id} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
-                              <img
-                                src={mediaSrc(photo.thumbUrl || photo.url)}
-                                alt={photo.altText}
-                                className="w-full aspect-[4/3] object-cover bg-slate-800"
-                              />
-                              <div className="p-2.5 space-y-1.5">
-                                <input
-                                  type="text"
-                                  value={photoDraft.caption}
-                                  placeholder="Caption"
-                                  onChange={(e) =>
-                                    setPhotoDrafts((prev) => ({ ...prev, [photo.id]: { ...photoDraft, caption: e.target.value } }))
-                                  }
-                                  onBlur={() => handleSavePhotoDetails(photo.id)}
-                                  className="w-full px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs"
-                                />
-                                <input
-                                  type="text"
-                                  value={photoDraft.altText}
-                                  placeholder="Alt text (describe the photo)"
-                                  onChange={(e) =>
-                                    setPhotoDrafts((prev) => ({ ...prev, [photo.id]: { ...photoDraft, altText: e.target.value } }))
-                                  }
-                                  onBlur={() => handleSavePhotoDetails(photo.id)}
-                                  className="w-full px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-xs"
-                                />
-                                <div className="text-[10px] text-slate-500">
-                                  {photo.width && photo.height ? `${photo.width}×${photo.height}` : 'External image'}
-                                  {photo.bytes ? ` · ${formatBytes(photo.bytes)}` : ''}
-                                  {isCover ? ' · Cover' : ''}
-                                </div>
-                                <div className="flex flex-wrap gap-1 text-[11px]">
-                                  <button type="button" disabled={idx === 0} onClick={() => handlePhotoAction(photo, 'up')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40" title="Move earlier">←</button>
-                                  <button type="button" disabled={idx === album.photos.length - 1} onClick={() => handlePhotoAction(photo, 'down')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40" title="Move later">→</button>
-                                  {!isCover && (
-                                    <button type="button" onClick={() => handlePhotoAction(photo, 'cover')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Cover</button>
-                                  )}
-                                  {photo.sha256 && (
-                                    <button type="button" onClick={() => handlePhotoAction(photo, 'replace')} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Replace</button>
-                                  )}
-                                  <button type="button" onClick={() => handlePhotoAction(photo, 'delete')} className="px-2 py-1 rounded bg-rose-950/40 hover:bg-rose-900/50 text-rose-300">Delete</button>
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {/* External image by URL (not stored in the library) */}
-                    <form onSubmit={handleAddPhoto} className="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
-                      <input
-                        type="url"
-                        value={newPhotoUrl}
-                        onChange={(e) => setNewPhotoUrl(e.target.value)}
-                        placeholder="Or link an image hosted elsewhere: https://..."
-                        className="flex-1 min-w-[14rem] px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs"
-                      />
-                      <input
-                        type="text"
-                        value={newPhotoCaption}
-                        onChange={(e) => setNewPhotoCaption(e.target.value)}
-                        placeholder="Caption"
-                        className="w-40 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs"
-                      />
-                      <button type="submit" className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs">
-                        Add Link
-                      </button>
-                    </form>
-                  </div>
-                )}
-              </div>
-
-              <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 text-xs text-slate-400 space-y-2">
-                <p>
-                  <strong className="text-slate-200">What gets published:</strong> a web copy of each
-                  photo (up to 2048 px) and a thumbnail, with camera details and GPS location removed.
-                  Your originals stay on this computer. Replacing a photo publishes it under a new file
-                  name, so nobody sees a stale copy.
-                </p>
-                <p>
-                  Publishing only uploads what changed, and removes photos you deleted from your folder,
-                  server or GitHub repo. It only ever removes files Studio published there; anything
-                  else is left alone.
-                </p>
-                <button
-                  type="button"
-                  onClick={handleForgetPublishHistory}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200"
-                >
-                  Re-upload everything at next publish
-                </button>
-              </div>
-            </div>
-            );
-          })()}
-
-          {/* TAB 3: WALL POSTS, LIKES & SHARES */}
+          {/* TAB 3: WALL POSTS, LIKES & SHARES (Chronological List + Engage Modal) */}
           {activeTab === 'items' && (
-            <div className="max-w-5xl mx-auto space-y-6">
-              <div>
-                <h2 className="text-2xl font-bold">Wall Posts, Likes, Shares & Comments</h2>
-                <p className="text-sm text-slate-400 mt-1">
-                  Publish Facebook-style status updates and wall posts, curate articles/music/gear you
-                  love, or post signed comments on friends' posts. Everything is cryptographically
-                  signed into <code>/api/items.json</code> so your friend ring can pull and thread it!
-                </p>
-              </div>
-
-              <form
-                onSubmit={handleCreateItem}
-                className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <h3 className="font-bold text-base flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-amber-400" />
-                    {itemType === 'post'
-                      ? 'Compose a Wall Post / Status Update'
-                      : itemType === 'comment'
-                      ? 'Write a Signed Comment on a Friend’s Post'
-                      : 'Log a Like, Share, or Recommendation'}
-                  </h3>
-
-                  {/* Quick Mode Selector Pills */}
-                  <div className="flex flex-wrap gap-1.5 text-xs">
-                    {(
-                      [
-                        { id: 'post', label: '📝 Wall Post' },
-                        { id: 'like', label: '♥ Like' },
-                        { id: 'share', label: '↻ Share' },
-                        { id: 'recommendation', label: '★ Recommend' },
-                        { id: 'comment', label: '💬 Comment' },
-                      ] as const
-                    ).map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => {
-                          setItemType(m.id);
-                          if (m.id === 'post') setItemCategory('status');
-                          if (m.id === 'comment') setItemCategory('comment');
-                        }}
-                        className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-                          itemType === m.id
-                            ? 'bg-indigo-600 text-white shadow'
-                            : 'bg-slate-950 text-slate-400 hover:text-white border border-slate-800'
-                        }`}
-                      >
-                        {m.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {itemType === 'post' ? (
-                  <>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div className="md:col-span-2">
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Headline / Post Title (Optional — auto-generated from text if blank)
-                        </label>
-                        <input
-                          type="text"
-                          value={itemTitle}
-                          onChange={(e) => setItemTitle(e.target.value)}
-                          placeholder="e.g., Weekend Darkroom Notes & New Prints"
-                          className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">Topic / Category</label>
-                        <select
-                          value={itemCategory}
-                          onChange={(e) => setItemCategory(e.target.value)}
-                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        >
-                          <option value="status">Status Update / Wall Post</option>
-                          <option value="article">Essay / Micro-Blog</option>
-                          <option value="photo">Photo Post</option>
-                          <option value="music">Music / Audio Note</option>
-                          <option value="general">General</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">
-                        Post Body (what's on your mind?) *
-                      </label>
-                      <MarkdownField
-                        value={itemCommentary}
-                        onChange={setItemCommentary}
-                        rows={5}
-                        placeholder={'Write your status update, thoughts, or story here.\n\nMarkdown works: **bold**, *italic*, [a link](https://…), lists, quotes and tables.'}
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div className="md:col-span-2">
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Attach Photo or Media URL (Optional)
-                        </label>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            value={itemMediaUrl}
-                            onChange={(e) => setItemMediaUrl(e.target.value)}
-                            placeholder="https://... or import a local image"
-                            className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                          />
-                          <button
-                            type="button"
-                            onClick={handlePickLocalPostImage}
-                            className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium flex items-center gap-1.5 shrink-0"
-                          >
-                            <ImagePlus className="w-4 h-4 text-indigo-400" />
-                            Import Image
-                          </button>
-                        </div>
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Tags (comma-separated)
-                        </label>
-                        <input
-                          type="text"
-                          value={itemTags}
-                          onChange={(e) => setItemTags(e.target.value)}
-                          placeholder="status, update, photography"
-                          className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">Interaction Type</label>
-                        <select
-                          value={itemType}
-                          onChange={(e) => setItemType(e.target.value as SharedItemType)}
-                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        >
-                          <option value="post">📝 Wall Post (Status Update)</option>
-                          <option value="like">♥ Like (Thing I Like)</option>
-                          <option value="share">↻ Share (Syndicated Item)</option>
-                          <option value="recommendation">★ Recommendation (Gear / Book / Place)</option>
-                          <option value="comment">💬 Comment (Reply to a Friend's Post)</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">Category</label>
-                        <select
-                          value={itemCategory}
-                          onChange={(e) => setItemCategory(e.target.value)}
-                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        >
-                          <option value="comment">Comment / Reply</option>
-                          <option value="article">Article / Essay</option>
-                          <option value="photo">Photo / Visual Art</option>
-                          <option value="music">Music / Audio</option>
-                          <option value="book">Book / Zine</option>
-                          <option value="gear">Tool / Hardware / Gear</option>
-                          <option value="general">General Web Item</option>
-                        </select>
-                      </div>
-
-                      {itemType !== 'comment' && (
-                        <div>
-                          <label className="block text-xs text-slate-400 mb-1">
-                            Rating (1 - 5 Stars)
-                          </label>
-                          <select
-                            value={itemRating}
-                            onChange={(e) => setItemRating(Number(e.target.value))}
-                            className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                          >
-                            <option value={5}>★★★★★ (5/5 Essential)</option>
-                            <option value={4}>★★★★☆ (4/5 Great)</option>
-                            <option value={3}>★★★☆☆ (3/5 Good)</option>
-                            <option value={2}>★★☆☆☆ (2/5 Meh)</option>
-                            <option value={1}>★☆☆☆☆ (1/5 Skip)</option>
-                          </select>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          {itemType === 'comment' ? 'Subject / Replying To' : 'Item Title *'}
-                        </label>
-                        <input
-                          type="text"
-                          required={itemType !== 'comment'}
-                          value={itemTitle}
-                          onChange={(e) => setItemTitle(e.target.value)}
-                          placeholder={
-                            itemType === 'comment'
-                              ? 'Re: Friend’s post title'
-                              : 'Title of the photo, post, album, or thing you like'
-                          }
-                          className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          {itemType === 'comment'
-                            ? "Target Post Canonical URI (Friend's Post or Photo URL) *"
-                            : "Target URL (Indexed Website or Friend's Canonical Item URI) *"}
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={itemTargetUrl}
-                          onChange={(e) => setItemTargetUrl(e.target.value)}
-                          placeholder="https://friend.example/api/items.json#item-123"
-                          className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Original Author Name
-                        </label>
-                        <input
-                          type="text"
-                          value={itemAuthorName}
-                          onChange={(e) => setItemAuthorName(e.target.value)}
-                          placeholder="e.g., Sam Okafor"
-                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Original Author Site URL
-                        </label>
-                        <input
-                          type="text"
-                          value={itemAuthorUrl}
-                          onChange={(e) => setItemAuthorUrl(e.target.value)}
-                          placeholder="https://author.example"
-                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Preview Image URL (Optional)
-                        </label>
-                        <input
-                          type="text"
-                          value={itemMediaUrl}
-                          onChange={(e) => setItemMediaUrl(e.target.value)}
-                          placeholder="https://..."
-                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div className="md:col-span-2">
-                        <label className="block text-xs text-slate-400 mb-1">
-                          {itemType === 'comment'
-                            ? 'Your Comment / Reply *'
-                            : 'Your Commentary / Notes'}
-                        </label>
-                        <textarea
-                          rows={itemType === 'comment' ? 3 : 2}
-                          required={itemType === 'comment'}
-                          value={itemCommentary}
-                          onChange={(e) => setItemCommentary(e.target.value)}
-                          placeholder={
-                            itemType === 'comment'
-                              ? 'Write your reply to this post...'
-                              : 'Why do you like or recommend this item?'
-                          }
-                          className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-400 mb-1">
-                          Tags (comma-separated)
-                        </label>
-                        <input
-                          type="text"
-                          value={itemTags}
-                          onChange={(e) => setItemTags(e.target.value)}
-                          placeholder="indieweb, music, synth"
-                          className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                        />
-                      </div>
-                    </div>
-                  </>
-                )}
-
-                <button
-                  type="submit"
-                  className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow"
-                >
-                  {itemType === 'post'
-                    ? '+ Publish Wall Post to My Profile'
-                    : itemType === 'comment'
-                    ? '+ Publish Signed Comment to My Feed'
-                    : '+ Publish Item to My Schema'}
-                </button>
-              </form>
-
-              {/* Existing Items & Wall Posts Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {bundle.items.items.map((item) => {
-                  const postComments = allEndorsements.filter(
-                    (e) => e.targetCanonicalUrl === item.canonicalUrl && e.type === 'comment'
-                  );
-                  return (
-                    <div
-                      key={item.id}
-                      className={`bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between ${
-                        item.type === 'post' ? 'md:col-span-2' : ''
-                      }`}
-                    >
-                      <div>
-                        <div className="flex items-center justify-between mb-2">
-                          <span
-                            className={`text-[11px] uppercase font-bold px-2.5 py-0.5 rounded-full ${
-                              item.type === 'post'
-                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                : item.type === 'like'
-                                ? 'bg-pink-500/20 text-pink-400'
-                                : item.type === 'recommendation'
-                                ? 'bg-amber-500/20 text-amber-400'
-                                : item.type === 'comment'
-                                ? 'bg-purple-500/20 text-purple-300'
-                                : 'bg-sky-500/20 text-sky-400'
-                            }`}
-                          >
-                            {item.type === 'post' ? '📝 Wall Post' : item.type}
-                          </span>
-                          <div className="flex items-center gap-2">
-                            {item.updatedAt && (
-                              <span className="text-[10px] text-slate-500" title={`Edited ${new Date(item.updatedAt).toLocaleString()}`}>
-                                edited
-                              </span>
-                            )}
-                            {editingItemId !== item.id && (
-                              <button
-                                type="button"
-                                onClick={() => setEditingItemId(item.id)}
-                                className="text-slate-500 hover:text-indigo-300"
-                                title="Edit"
-                                aria-label={`Edit ${item.title}`}
-                              >
-                                <Pencil className="w-4 h-4" />
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteItem(item)}
-                              className="text-slate-500 hover:text-rose-400"
-                              title="Delete"
-                              aria-label={`Delete ${item.title}`}
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </div>
-                        {editingItemId === item.id ? (
-                          <ItemEditor
-                            item={item}
-                            mediaSrc={mediaSrc}
-                            onPickImage={async () => {
-                              try {
-                                const imported = await window.studioApi?.importImage();
-                                return imported ? imported.url : null;
-                              } catch (err) {
-                                notify(`Couldn't use that image: ${imageErrorText(err)}`);
-                                return null;
-                              }
-                            }}
-                            onSave={(edit) => handleSaveItemEdit(item, edit)}
-                            onCancel={() => setEditingItemId(null)}
-                          />
-                        ) : (
-                        <>
-                        {item.mediaUrl && (
-                          <img
-                            src={mediaSrc(item.mediaUrl)}
-                            alt={item.title}
-                            className="w-full max-h-60 object-cover rounded-xl mb-3"
-                          />
-                        )}
-                        <h4 className="font-bold text-base">{item.title}</h4>
-                        {item.targetUrl !== item.canonicalUrl && (
-                          <p className="text-xs text-indigo-400 font-mono truncate mt-0.5">
-                            Target: {item.targetUrl}
-                          </p>
-                        )}
-                        {item.type === 'post' ? (
-                          <div
-                            className="studio-prose text-sm text-slate-300 mt-2"
-                            dangerouslySetInnerHTML={{ __html: renderMarkdown(item.commentary) }}
-                          />
-                        ) : (
-                          <p className="text-sm text-slate-300 mt-2 whitespace-pre-line">{item.commentary}</p>
-                        )}
-                        </>
-                        )}
-
-                        {postComments.length > 0 && (
-                          <div className="mt-3 pt-2.5 border-t border-slate-800 space-y-1.5">
-                            <p className="text-xs font-bold text-emerald-400">
-                              💬 Discovered Ring Comments ({postComments.length})
-                            </p>
-                            {postComments.map((c) => (
-                              <div
-                                key={c.id}
-                                className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-xs"
-                              >
-                                <span className="font-bold text-indigo-300">{c.authorName}: </span>
-                                <span className="text-slate-300">{c.commentary}</span>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="mt-3 pt-2.5 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-500 font-mono">
-                        <span className="truncate">{item.canonicalUrl}</span>
-                        <span>{item.category}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            <PostsLibraryView
+              items={bundle.items.items}
+              endorsements={allEndorsements}
+              itemType={itemType}
+              setItemType={setItemType}
+              itemCategory={itemCategory}
+              setItemCategory={setItemCategory}
+              itemRating={itemRating}
+              setItemRating={setItemRating}
+              itemTitle={itemTitle}
+              setItemTitle={setItemTitle}
+              itemTargetUrl={itemTargetUrl}
+              setItemTargetUrl={setItemTargetUrl}
+              itemAuthorName={itemAuthorName}
+              setItemAuthorName={setItemAuthorName}
+              itemAuthorUrl={itemAuthorUrl}
+              setItemAuthorUrl={setItemAuthorUrl}
+              itemMediaUrl={itemMediaUrl}
+              setItemMediaUrl={setItemMediaUrl}
+              itemCommentary={itemCommentary}
+              setItemCommentary={setItemCommentary}
+              itemTags={itemTags}
+              setItemTags={setItemTags}
+              handlePickLocalPostImage={handlePickLocalPostImage}
+              handleCreateItem={handleCreateItem}
+              editingItemId={editingItemId}
+              setEditingItemId={setEditingItemId}
+              handleSaveItemEdit={handleSaveItemEdit}
+              handleDeleteItem={handleDeleteItem}
+              mediaSrc={mediaSrc}
+              onPickEditImage={async () => {
+                try {
+                  const imported = await window.studioApi?.importImage();
+                  return imported ? imported.url : null;
+                } catch (err) {
+                  notify(`Couldn't use that image: ${imageErrorText(err)}`);
+                  return null;
+                }
+              }}
+            />
           )}
 
           {/* TAB 4: FRIENDS & WEBRINGS */}
           {activeTab === 'friends' && (
-            <div className="max-w-5xl mx-auto space-y-8">
+            <div className="max-w-5xl mx-auto space-y-6">
               <div>
                 <h2 className="text-2xl font-bold">Friend Connections & Webrings</h2>
                 <p className="text-sm text-slate-400 mt-1">
@@ -4177,6 +3493,26 @@ export const App: React.FC = () => {
                 </p>
               </div>
 
+              <HorizontalTabs
+                ariaLabel="Friends and Webrings sections"
+                activeId={friendsSubTab}
+                onChange={setFriendsSubTab}
+                tabs={[
+                  { id: 'friends', label: 'Friends', badge: allFriends.length },
+                  {
+                    id: 'notices',
+                    label: 'Notices & Sync',
+                    badge: friendNotices.length + friendSyncNotices.length,
+                    alert: friendNotices.length > 0,
+                  },
+                  { id: 'webrings', label: 'Webrings', badge: joinedRings.length },
+                  { id: 'hosted', label: 'Rings You Host', badge: hostedRings.length },
+                  { id: 'discover', label: 'Discover & Privacy' },
+                ]}
+              />
+
+              {friendsSubTab === 'notices' && (
+                <div className="space-y-4">
               <FriendNoticesPanel
                 notices={friendNotices}
                 incomingLink={incomingFriendNotice}
@@ -4216,7 +3552,16 @@ export const App: React.FC = () => {
                   );
                 }}
               />
+                  {friendNotices.length === 0 && friendSyncNotices.length === 0 && (
+                    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center text-sm text-slate-400">
+                      No pending friend notices or sync alerts.
+                    </div>
+                  )}
+                </div>
+              )}
 
+              {friendsSubTab === 'discover' && (
+                <div className="space-y-6">
               {/* Social Graph Privacy & Anti-Scraping Shield Panel */}
               <div className="bg-slate-900 border border-emerald-500/30 rounded-2xl p-5 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -4334,7 +3679,10 @@ export const App: React.FC = () => {
                 api={webringHubApi}
                 webringHubs={webringHubs}
                 webrings={ringsForHubSearch(joinedRings, hostedRings, bundle?.profile.siteUrl || '')}
-                onManage={() => setActiveTab('publish')}
+                onManage={() => {
+                  setPublishSubTab('hubs');
+                  setActiveTab('publish');
+                }}
                 onUse={(result) => {
                   // Only the address and a name to edit: the avatar and bio come from the site itself
                   // once it's crawled and verified, never from the hub
@@ -4342,11 +3690,17 @@ export const App: React.FC = () => {
                   setFriendName(result.displayName);
                   setFriendAvatar('');
                   setFriendBio('');
-                  document.getElementById('add-friend-form')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  setFriendsSubTab('friends');
+                  setTimeout(() => {
+                    document.getElementById('add-friend-form')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  }, 50);
                 }}
               />
+                </div>
+              )}
 
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {friendsSubTab === 'friends' && (
+                <div>
                 {/* Add Friend Form */}
                 <form
                   id="add-friend-form"
@@ -4436,7 +3790,11 @@ export const App: React.FC = () => {
                     + Add Friend to Local Ring
                   </button>
                 </form>
+                </div>
+              )}
 
+              {friendsSubTab === 'webrings' && (
+                <div className="space-y-6">
                 {/* Join a Webring (curated: verify the ring file, then send the maintainer a signed request) */}
                 <form
                   onSubmit={handleRequestToJoinRing}
@@ -4488,7 +3846,6 @@ export const App: React.FC = () => {
                     </div>
                   )}
                 </form>
-              </div>
 
               {/* Joined Webrings List (edit the banner text shown on your site) */}
               {joinedRings.length > 0 && (
@@ -4694,8 +4051,11 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               )}
+                </div>
+              )}
 
               {/* Rings this persona maintains */}
+              {friendsSubTab === 'hosted' && (
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-bold text-lg">Rings You Host ({hostedRings.length})</h3>
@@ -4974,8 +4334,10 @@ export const App: React.FC = () => {
                   </div>
                 ))}
               </div>
+              )}
 
               {/* Friends List */}
+              {friendsSubTab === 'friends' && (
               <div>
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                   <h3 className="font-bold text-lg">
@@ -5318,6 +4680,7 @@ export const App: React.FC = () => {
                   })}
                 </div>
               </div>
+              )}
             </div>
           )}
 
@@ -6063,6 +5426,26 @@ export const App: React.FC = () => {
                 </button>
               </div>
 
+              <HorizontalTabs
+                ariaLabel="Publish and deployment sections"
+                activeId={publishSubTab}
+                onChange={setPublishSubTab}
+                tabs={[
+                  { id: 'deploy', label: 'Step-by-Step Deploy' },
+                  { id: 'schedule', label: 'Schedule' },
+                  { id: 'hubs', label: 'Webring Hubs', badge: webringHubs.length },
+                  { id: 'preflight', label: 'Preflight Setup' },
+                  { id: 'local', label: 'Local Folder Export' },
+                  { id: 'sftp', label: 'SFTP / FTP Web Host' },
+                  { id: 'github', label: 'GitHub Pages Deploy' },
+                  { id: 'comments', label: 'Real-Time Comments' },
+                  { id: 'analytics', label: 'Google Analytics' },
+                  { id: 'adsense', label: 'Google AdSense' },
+                ]}
+              />
+
+              {publishSubTab === 'deploy' && (
+                <div className="space-y-4">
               {setupApi && (
                 <SetupHealthCard
                   status={setupStatus}
@@ -6116,9 +5499,11 @@ export const App: React.FC = () => {
                   </button>
                 )}
               </div>
+                </div>
+              )}
 
               {/* Scheduled sync & publish */}
-              {scheduleOverview && activeSchedule && (
+              {publishSubTab === 'schedule' && scheduleOverview && activeSchedule && (
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-5">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
@@ -6404,6 +5789,7 @@ export const App: React.FC = () => {
                 </div>
               )}
 
+              {publishSubTab === 'hubs' && (
               <WebringHubListingsPanel
                 api={webringHubApi}
                 webringHubs={webringHubs}
@@ -6411,8 +5797,10 @@ export const App: React.FC = () => {
                 hasPublished={Boolean(publishSettings.lastPublishedAt)}
                 notify={notify}
               />
+              )}
 
               {/* Pre-Publish Test Export & Local Browser Preview */}
+              {publishSubTab === 'preflight' && (
               <div className="bg-indigo-950/25 border border-indigo-500/30 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="space-y-1">
@@ -6486,8 +5874,10 @@ export const App: React.FC = () => {
                   </div>
                 )}
               </div>
+              )}
 
               {/* Option 1: Local Directory Export */}
+              {publishSubTab === 'local' && (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <h3 className="font-bold text-lg flex items-center gap-2">
                   <FolderOutput className="w-5 h-5 text-emerald-400" />
@@ -6541,8 +5931,10 @@ export const App: React.FC = () => {
                   )}
                 </div>
               </div>
+              )}
 
               {/* Option 2: Built-in SFTP / FTP Uploader */}
+              {publishSubTab === 'sftp' && (
               <form
                 onSubmit={handlePublishRemote}
                 className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
@@ -6696,8 +6088,10 @@ export const App: React.FC = () => {
                   )}
                 </div>
               </form>
+              )}
 
               {/* Option 3: GitHub Pages Deploy */}
+              {publishSubTab === 'github' && (
               <form
                 onSubmit={handlePublishGithub}
                 className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
@@ -6861,8 +6255,10 @@ export const App: React.FC = () => {
                   )}
                 </div>
               </form>
+              )}
 
               {/* Option 4: Real-Time Static Site Comments (Optional Third-Party Provider) */}
+              {publishSubTab === 'comments' && (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
@@ -6992,8 +6388,10 @@ export const App: React.FC = () => {
                   </div>
                 )}
               </div>
+              )}
 
               {/* Option 5: Optional Add-On 1 — Google Analytics (GA4) */}
+              {publishSubTab === 'analytics' && (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
@@ -7132,8 +6530,10 @@ export const App: React.FC = () => {
                   )}
                 </div>
               </div>
+              )}
 
               {/* Option 6: Optional Add-On 2 — Google AdSense / Ads Monetization */}
+              {publishSubTab === 'adsense' && (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
@@ -7319,6 +6719,7 @@ export const App: React.FC = () => {
                   )}
                 </div>
               </div>
+              )}
             </div>
           )}
 
