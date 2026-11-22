@@ -379,6 +379,12 @@ export class StaticSiteGenerator {
       path.join(__dirname, '../../electron/assets/site.css'),
     ];
     const compiledSiteCss = loadSiteCss(cssCandidates);
+    const logoCandidates = [
+      path.join(__dirname, '../assets/webring-logo-thumb.png'),
+      path.join(__dirname, '../../../electron/assets/webring-logo-thumb.png'),
+      path.join(__dirname, '../../electron/assets/webring-logo-thumb.png'),
+    ];
+    const webringLogoDataUri = loadWebringLogoDataUri(logoCandidates);
 
     return withInlineScriptHashes(`<!DOCTYPE html>
 <html lang="en">
@@ -1106,9 +1112,10 @@ ${AVATAR_PAGE_SCRIPT}
         : '';
       const archiveView = { renderItem: renderItem, wrapClass: 'grid grid-cols-1 md:grid-cols-2 gap-4' };
 
+      const webringLogoUrl = ${JSON.stringify(webringLogoDataUri)};
       const footerHtml = \`
         <footer class="text-center text-xs opacity-60 pt-8 border-t border-white/10">
-          <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
+          <p class="inline-flex items-center justify-center gap-2">\${webringLogoUrl ? \`<img class="wr-site-logo wr-site-logo-sm" src="\${esc(webringLogoUrl)}" alt="Webring" title="Webring Social Media Site" />\` : ''}<code>\${esc(profile.did)}</code></p>
         </footer>\`;
 
       // An album's own page: just the album, no profile layout
@@ -1135,7 +1142,7 @@ ${AVATAR_PAGE_SCRIPT}
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
           blockRenderers, section, emptyNote, albumHref, albumCover, albumShownExpanded, albumPhotoTotal, albumPhotosLabel, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
-          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView
+          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView, webringLogoUrl
         });
       } else root.innerHTML = \`
         \${webringBars}
@@ -1146,6 +1153,7 @@ ${AVATAR_PAGE_SCRIPT}
               \${profile.avatarUrl ? \`<img src="\${safeUrl(profile.avatarUrl)}" class="profile-avatar w-28 h-28 rounded-2xl object-cover border-4 border-slate-900 shadow-lg bg-slate-800" />\` : ''}
               <div>
                 <div class="flex flex-wrap items-center gap-2">
+                  \${webringLogoUrl ? \`<img class="wr-site-logo" src="\${esc(webringLogoUrl)}" alt="Webring" title="Webring Social Media Site" />\` : ''}
                   <h1 class="text-2xl sm:text-3xl font-extrabold">\${esc(profile.displayName)}</h1>
                   <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono" title="Verified Ed25519 DID Identity">\${esc(profile.did)}</span>
                 </div>
@@ -1289,6 +1297,16 @@ export function loadSiteCss(candidates: string[]): string {
     if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf8');
   }
   throw new Error(SITE_CSS_MISSING_MESSAGE);
+}
+
+/** Small Webring logo thumbnail as a data URI so standalone/exported pages work without extra image requests. */
+export function loadWebringLogoDataUri(candidates: string[]): string {
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return `data:image/png;base64,${fs.readFileSync(candidate).toString('base64')}`;
+    }
+  }
+  return '';
 }
 
 /** Stands in for the inline scripts' hashes in a page's CSP until the page is complete. */
