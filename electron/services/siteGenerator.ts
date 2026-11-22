@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
+import { makeFaviconImages } from './imagePipeline';
 import { markdownToPlainText, renderMarkdown } from '../../src/shared/markdown';
 import { AVATAR_PAGE_SCRIPT } from '../../src/shared/avatar';
 import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
@@ -186,8 +187,31 @@ export class StaticSiteGenerator {
       writeJson(manifestPath, doc);
     }
 
+    // 3b. Favicon generated from the local Profile Photo (overwritten whenever the profile photo changes)
+    const faviconPngPath = path.join(outputDir, 'favicon.png');
+    const faviconIcoPath = path.join(outputDir, 'favicon.ico');
+    let faviconHash = '';
+    if (this.mediaStoreDir && bundle.profile.avatarUrl && MediaLibrary.isLocalUrl(bundle.profile.avatarUrl)) {
+      const avatarFile = new MediaLibrary(this.mediaStoreDir).resolveLocalUrl(bundle.profile.avatarUrl);
+      if (avatarFile && fs.existsSync(avatarFile)) {
+        try {
+          const { png, ico } = makeFaviconImages(fs.readFileSync(avatarFile));
+          fs.writeFileSync(faviconPngPath, png.buffer);
+          fs.writeFileSync(faviconIcoPath, ico);
+          filesWritten.push('favicon.png', 'favicon.ico');
+          faviconHash = crypto.createHash('sha256').update(png.buffer).digest('hex').slice(0, 12);
+        } catch {
+          // Unsupported or unreadable image: skip favicon rather than failing site export
+        }
+      }
+    }
+    if (!faviconHash) {
+      if (fs.existsSync(faviconPngPath)) fs.rmSync(faviconPngPath, { force: true });
+      if (fs.existsSync(faviconIcoPath)) fs.rmSync(faviconIcoPath, { force: true });
+    }
+
     // 4. Write standalone index.html for the hosted Profile Website
-    const indexHtml = this.buildStandaloneProfileHtml(bundle);
+    const indexHtml = this.buildStandaloneProfileHtml(bundle, { faviconHash });
 
     fs.writeFileSync(path.join(outputDir, 'index.html'), indexHtml, 'utf8');
     filesWritten.push('index.html');
@@ -198,7 +222,7 @@ export class StaticSiteGenerator {
       const relPath = albumPagePath(album.slug);
       const fullPath = safeOutputPath(outputDir, relPath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id }), 'utf8');
+      fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id, faviconHash }), 'utf8');
       filesWritten.push(relPath);
     }
 
@@ -215,6 +239,9 @@ export class StaticSiteGenerator {
       '    Header set Access-Control-Allow-Origin "*"',
       '  </FilesMatch>',
       '  <FilesMatch "\\.(html|json)$">',
+      '    Header set Cache-Control "no-cache"',
+      '  </FilesMatch>',
+      '  <FilesMatch "^favicon\\.(ico|png)$">',
       '    Header set Cache-Control "no-cache"',
       '  </FilesMatch>',
       '</IfModule>',
@@ -274,7 +301,10 @@ export class StaticSiteGenerator {
    * same page plus a base URL for local Media Library images and a bridge that sends link clicks
    * to Studio. Preview extras are never part of a published file.
    */
-  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean; albumId?: string } = {}): string {
+  public buildStandaloneProfileHtml(
+    bundle: CompleteSiteBundle,
+    options: { preview?: boolean; albumId?: string; faviconHash?: string } = {}
+  ): string {
     const preview = options.preview === true;
     const album = options.albumId ? bundle.albums.albums.find((a) => a.id === options.albumId) : undefined;
     const albumId = album ? album.id : '';
@@ -386,13 +416,22 @@ export class StaticSiteGenerator {
     ];
     const webringLogoDataUri = loadWebringLogoDataUri(logoCandidates);
 
+    const httpsAvatar = bundle.profile.avatarUrl ? safeExternalUrl(bundle.profile.avatarUrl) : null;
+    const faviconHead = options.faviconHash
+      ? `\n  <link rel="icon" type="image/png" sizes="64x64" href="./favicon.png?v=${options.faviconHash}" />` +
+        `\n  <link rel="icon" type="image/x-icon" href="./favicon.ico?v=${options.faviconHash}" />` +
+        `\n  <link rel="apple-touch-icon" href="./favicon.png?v=${options.faviconHash}" />`
+      : httpsAvatar && httpsAvatar.startsWith('https://')
+        ? `\n  <link rel="icon" href="${this.escapeHtml(httpsAvatar)}" />`
+        : '';
+
     return withInlineScriptHashes(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' ${INLINE_SCRIPT_HASHES}${commentHost}${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''};${frameSrcClause} connect-src 'self' https: http:;" />
-  <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
+  <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${faviconHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />${analyticsHeadSnippet}${adsHeadSnippet}
   <script>window.__WEBRING_BUNDLE__ = ${safeJson};${albumId ? `\n  window.__WEBRING_ALBUM_ID__ = ${embedJson(albumId)};` : ''}${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
