@@ -11,7 +11,7 @@
   "scripts": {
     "dev:vite": "vite",
     "build:vite": "vite build",
-    "build:site-css": "tailwindcss -i src/index.css -o electron/assets/site.css --content \"electron/services/*.ts\" --minify && node -e \"const fs=require('fs');fs.mkdirSync('dist-electron/electron/assets',{recursive:true});fs.copyFileSync('electron/assets/site.css','dist-electron/electron/assets/site.css')\"",
+    "build:site-css": "tailwindcss -i src/index.css -o electron/assets/site.css --content \"electron/services/*.ts\" --minify && node -e \"const fs=require('fs');fs.mkdirSync('dist-electron/electron/assets',{recursive:true});fs.copyFileSync('electron/assets/site.css','dist-electron/electron/assets/site.css');if(fs.existsSync('electron/assets/webring-logo-thumb.png'))fs.copyFileSync('electron/assets/webring-logo-thumb.png','dist-electron/electron/assets/webring-logo-thumb.png')\"",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "npm run build:vite && npm run build:site-css && npm run build:electron",
     "pack:dir": "npm run build && electron-builder --dir",

@@ -67,6 +67,8 @@ import {
   Camera,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Code2,
   Compass,
   Copy,
@@ -781,6 +783,23 @@ type StudioTab =
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<StudioTab>('feed');
+  type SidebarSectionId = 'social' | 'site' | 'help';
+  const [openSidebarSections, setOpenSidebarSections] = useState<Record<SidebarSectionId, boolean>>({
+    social: true,
+    site: false,
+    help: false,
+  });
+  const toggleSidebarSection = (section: SidebarSectionId) =>
+    setOpenSidebarSections((prev) => ({ ...prev, [section]: !prev[section] }));
+  useEffect(() => {
+    const section: SidebarSectionId =
+      activeTab === 'feed' || activeTab === 'profile' || activeTab === 'albums' || activeTab === 'items' || activeTab === 'friends'
+        ? 'social'
+        : activeTab === 'help'
+          ? 'help'
+          : 'site';
+    setOpenSidebarSections((prev) => (prev[section] ? prev : { ...prev, [section]: true }));
+  }, [activeTab]);
   const [friendsSubTab, setFriendsSubTab] = useState<'friends' | 'notices' | 'webrings' | 'hosted' | 'discover'>('friends');
   const [publishSubTab, setPublishSubTab] = useState<
     | 'deploy'
@@ -2804,45 +2823,93 @@ export const App: React.FC = () => {
     await refreshStudioData();
   };
 
-  const navItems: Array<{ id: StudioTab; label: string; icon: React.ReactNode; badge?: number; alert?: string }> = [
+  type NavItem = { id: StudioTab; label: string; icon: React.ReactNode; badge?: number; alert?: string };
+  const socialNavItems: NavItem[] = [
     {
       id: 'feed',
       label: 'Neighborhood Feed',
-      icon: <Radio className="w-4 h-4" />,
+      icon: <Radio className="w-4 h-4 shrink-0" />,
       badge: networkFeed.length,
     },
-    { id: 'profile', label: 'Profile & Identity', icon: <UserCheck className="w-4 h-4" /> },
+    { id: 'profile', label: 'Profile & Identity', icon: <UserCheck className="w-4 h-4 shrink-0" /> },
     {
       id: 'albums',
       label: 'Media Library',
-      icon: <Camera className="w-4 h-4" />,
+      icon: <Camera className="w-4 h-4 shrink-0" />,
       badge: bundle.manifest.stats.photoCount,
     },
     {
       id: 'items',
       label: 'Posts, Likes & Shares',
-      icon: <MessageSquare className="w-4 h-4" />,
+      icon: <MessageSquare className="w-4 h-4 shrink-0" />,
       badge: bundle.manifest.stats.itemCount,
     },
     {
       id: 'friends',
       label: 'Friends & Webrings',
-      icon: <Users className="w-4 h-4" />,
+      icon: <Users className="w-4 h-4 shrink-0" />,
       badge: allFriends.length,
       alert: friendNotices.length ? `${friendNotices.length} added you` : undefined,
     },
-    { id: 'preview', label: 'Site Design', icon: <Compass className="w-4 h-4" /> },
-    { id: 'schemas', label: 'JSON Schema Output', icon: <Code2 className="w-4 h-4" /> },
-    { id: 'publish', label: 'Publish & SFTP', icon: <UploadCloud className="w-4 h-4" /> },
+  ];
+  const siteNavItems: NavItem[] = [
+    { id: 'preview', label: 'Site Design', icon: <Compass className="w-4 h-4 shrink-0" /> },
+    { id: 'schemas', label: 'JSON Schema Output', icon: <Code2 className="w-4 h-4 shrink-0" /> },
+    { id: 'publish', label: 'Publish & SFTP', icon: <UploadCloud className="w-4 h-4 shrink-0" /> },
     {
       id: 'mcp',
       label: 'AI Agent (MCP)',
-      icon: <Sparkles className="w-4 h-4" />,
+      icon: <Sparkles className="w-4 h-4 shrink-0" />,
       badge: mcpInfo?.status.toolCount || 24,
       alert: mcpInfo?.pendingApprovals?.length ? `${mcpInfo.pendingApprovals.length} waiting for approval` : undefined,
     },
-    { id: 'help', label: 'Help & Deploy Guide', icon: <BookOpen className="w-4 h-4" /> },
   ];
+  const helpNavItem: NavItem = {
+    id: 'help',
+    label: 'Help & Deploy Guide',
+    icon: <BookOpen className="w-4 h-4 shrink-0" />,
+  };
+
+  const renderNavButton = (item: NavItem) => (
+    <button
+      key={item.id}
+      type="button"
+      onClick={() => setActiveTab(item.id)}
+      className={`w-full flex items-center justify-between px-3 py-1.5 rounded-lg text-[13px] font-medium transition ${
+        activeTab === item.id
+          ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/20'
+          : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+      }`}
+    >
+      <span className="flex items-center gap-2 min-w-0">
+        {item.icon}
+        <span className="truncate">{item.label}</span>
+      </span>
+      <span className="flex items-center gap-1.5 shrink-0 ml-1">
+        {item.alert && (
+          <span
+            className="w-2 h-2 rounded-full bg-amber-400"
+            title={item.alert}
+            aria-label={item.alert}
+          />
+        )}
+        {item.badge !== undefined && (
+          <span
+            className={`text-[11px] px-1.5 py-0.5 rounded-full leading-none ${
+              activeTab === item.id
+                ? 'bg-indigo-800 text-indigo-100'
+                : 'bg-slate-800 text-slate-400'
+            }`}
+          >
+            {item.badge}
+          </span>
+        )}
+      </span>
+    </button>
+  );
+
+  const socialHasAlert = socialNavItems.some((i) => Boolean(i.alert));
+  const siteHasAlert = siteNavItems.some((i) => Boolean(i.alert));
 
   const getSelectedSchemaJson = () => {
     switch (selectedSchemaFile) {
@@ -2864,146 +2931,187 @@ export const App: React.FC = () => {
   return (
     <div className="h-screen flex bg-slate-950 text-slate-100 overflow-hidden">
       {/* Left Sidebar Navigation */}
-      <aside className="w-64 bg-slate-900/90 border-r border-slate-800 flex flex-col justify-between shrink-0">
-        <div>
-          <div className="p-5 border-b border-slate-800">
-            <div className="flex items-center gap-2.5">
-              <img src="./logo-mark.png" alt="" className="w-10 h-10 shrink-0" />
-              <div>
-                <h1 className="font-extrabold text-base tracking-tight">Webring Studio</h1>
-                <p className="text-[11px] text-slate-400">Local SQLite • Static JSON v{WEBRING_SCHEMA_VERSION}</p>
-              </div>
+      <aside className="w-64 h-full bg-slate-900/90 border-r border-slate-800 flex flex-col shrink-0 overflow-hidden">
+        {/* Compact Brand Header */}
+        <div className="px-4 py-3 border-b border-slate-800 shrink-0">
+          <div className="flex items-center gap-2.5">
+            <img src="./logo-mark.png" alt="" className="w-8 h-8 shrink-0" />
+            <div className="min-w-0">
+              <h1 className="font-extrabold text-sm tracking-tight leading-tight">Webring Studio</h1>
+              <p className="text-[10px] text-slate-400 truncate">Local SQLite • Static JSON v{WEBRING_SCHEMA_VERSION}</p>
             </div>
           </div>
+        </div>
 
-          {/* Active Persona Switcher (Strict Compartmentalization) */}
-          <div className="p-3 border-b border-slate-800 bg-slate-950/60 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-400 flex items-center gap-1">
-                <Layers className="w-3 h-3" />
-                Active Persona ({personas.length || 1})
-              </span>
-              <button
-                type="button"
-                onClick={() => setShowPersonaModal(true)}
-                className="text-[11px] px-2 py-0.5 rounded-md bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 font-semibold transition flex items-center gap-1"
-                title="Create or manage compartmentalized online personas"
-              >
-                <Plus className="w-3 h-3" />
-                Personas
-              </button>
-            </div>
-
-            {personas.length > 1 ? (
-              <select
-                aria-label="Switch Active Persona"
-                value={activePersonaId}
-                onChange={(e) => handleSwitchPersona(e.target.value)}
-                className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs font-semibold text-white focus:outline-none focus:border-indigo-500"
-              >
-                {personas.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label} — {p.displayName}
-                  </option>
-                ))}
-              </select>
-            ) : null}
-
-            <div
+        {/* Active Persona Switcher (Strict Compartmentalization) */}
+        <div className="p-2.5 border-b border-slate-800 bg-slate-950/60 space-y-1.5 shrink-0">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-400 flex items-center gap-1">
+              <Layers className="w-3 h-3" />
+              Active Persona ({personas.length || 1})
+            </span>
+            <button
+              type="button"
               onClick={() => setShowPersonaModal(true)}
-              className="p-2 rounded-xl bg-slate-900/90 border border-slate-800 hover:border-indigo-500/40 cursor-pointer transition flex items-center gap-2.5"
-              title="Click to switch or create another compartmentalized persona"
+              className="text-[11px] px-2 py-0.5 rounded-md bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 font-semibold transition flex items-center gap-1"
+              title="Create or manage compartmentalized online personas"
             >
-              <img
-                src={
-                  bundle.profile.avatarUrl || localAvatarDataUri(bundle.profile.siteUrl || bundle.profile.displayName)
-                }
-                alt={bundle.profile.displayName}
-                className="w-8 h-8 rounded-lg object-cover border border-slate-700 shrink-0"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs font-bold text-white truncate">
-                    {bundle.profile.displayName}
-                  </span>
-                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-medium truncate">
-                    {personas.find((p) => p.id === activePersonaId)?.label || 'Primary'}
-                  </span>
-                </div>
-                <p className="text-[10px] text-slate-400 font-mono truncate">{bundle.profile.did}</p>
-              </div>
-            </div>
+              <Plus className="w-3 h-3" />
+              Personas
+            </button>
           </div>
 
-          <nav className="p-3 space-y-1">
-            {navItems.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => setActiveTab(item.id)}
-                className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition ${
-                  activeTab === item.id
-                    ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/20'
-                    : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
-                }`}
-              >
-                <span className="flex items-center gap-2.5">
-                  {item.icon}
-                  {item.label}
+          {personas.length > 1 ? (
+            <select
+              aria-label="Switch Active Persona"
+              value={activePersonaId}
+              onChange={(e) => handleSwitchPersona(e.target.value)}
+              className="w-full px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-semibold text-white focus:outline-none focus:border-indigo-500"
+            >
+              {personas.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label} — {p.displayName}
+                </option>
+              ))}
+            </select>
+          ) : null}
+
+          <div
+            onClick={() => setShowPersonaModal(true)}
+            className="p-1.5 rounded-lg bg-slate-900/90 border border-slate-800 hover:border-indigo-500/40 cursor-pointer transition flex items-center gap-2"
+            title="Click to switch or create another compartmentalized persona"
+          >
+            <img
+              src={
+                bundle.profile.avatarUrl || localAvatarDataUri(bundle.profile.siteUrl || bundle.profile.displayName)
+              }
+              alt={bundle.profile.displayName}
+              className="w-7 h-7 rounded-md object-cover border border-slate-700 shrink-0"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-white truncate">
+                  {bundle.profile.displayName}
                 </span>
-                {item.alert && (
-                  <span
-                    className="ml-auto mr-1.5 w-2 h-2 rounded-full bg-amber-400"
-                    title={item.alert}
-                    aria-label={item.alert}
-                  />
-                )}
-                {item.badge !== undefined && (
-                  <span
-                    className={`text-xs px-2 py-0.5 rounded-full ${
-                      activeTab === item.id
-                        ? 'bg-indigo-800 text-indigo-100'
-                        : 'bg-slate-800 text-slate-400'
-                    }`}
-                  >
-                    {item.badge}
-                  </span>
-                )}
-              </button>
-            ))}
-          </nav>
+                <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-medium truncate">
+                  {personas.find((p) => p.id === activePersonaId)?.label || 'Primary'}
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-400 font-mono truncate">{bundle.profile.did}</p>
+            </div>
+          </div>
         </div>
 
-        {/* Bottom Identity & Quick Export Card */}
-        <div className="p-4 border-t border-slate-800 space-y-2.5 bg-slate-900/50">
-          {renderAutoPublishPill()}
-          <div className="text-xs space-y-1">
-            <div className="flex items-center gap-1.5 text-emerald-400 font-semibold">
-              <ShieldCheck className="w-4 h-4" />
-              <span>Signed DID Ready</span>
-            </div>
-            <p className="font-mono text-[11px] text-slate-400 truncate" title={bundle.profile.did}>
-              {bundle.profile.did}
-            </p>
+        {/* Scrollable Accordion Navigation */}
+        <nav aria-label="Studio navigation" className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-2">
+          {/* Section 1: Social Site Management */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/35 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => toggleSidebarSection('social')}
+              aria-expanded={openSidebarSections.social}
+              className="w-full flex items-center justify-between px-2.5 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-300 hover:text-white hover:bg-slate-800/60 transition"
+            >
+              <span className="truncate">Social Site Management</span>
+              <span className="flex items-center gap-1.5 shrink-0">
+                {!openSidebarSections.social && socialHasAlert && (
+                  <span className="w-2 h-2 rounded-full bg-amber-400" title="New activity in Social Site Management" />
+                )}
+                {openSidebarSections.social ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                )}
+              </span>
+            </button>
+            {openSidebarSections.social && (
+              <div className="px-1.5 pb-1.5 space-y-0.5">
+                {socialNavItems.map(renderNavButton)}
+              </div>
+            )}
           </div>
-          <button
-            onClick={async () => {
-              await handleRunTestExportPreview(false);
-              setActiveTab('preview');
-            }}
-            className="w-full py-2 px-3 rounded-xl bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 font-semibold text-xs flex items-center justify-center gap-1.5 transition"
-            title="Build a local test export and preview it over a local HTTP server before publishing"
-          >
-            <Compass className="w-4 h-4 text-indigo-400" />
-            Test Export & Preview
-          </button>
-          <button
-            onClick={handleExportLocalSite}
-            className="w-full py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow transition"
-          >
-            <FolderOutput className="w-4 h-4" />
-            Quick Export Static Site
-          </button>
-        </div>
+
+          {/* Section 2: Site Design & Publishing */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/35 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => toggleSidebarSection('site')}
+              aria-expanded={openSidebarSections.site}
+              className="w-full flex items-center justify-between px-2.5 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-300 hover:text-white hover:bg-slate-800/60 transition"
+            >
+              <span className="truncate">Site &amp; Publishing</span>
+              <span className="flex items-center gap-1.5 shrink-0">
+                {!openSidebarSections.site && siteHasAlert && (
+                  <span className="w-2 h-2 rounded-full bg-amber-400" title="Pending approval in AI Agent (MCP)" />
+                )}
+                {openSidebarSections.site ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                )}
+              </span>
+            </button>
+            {openSidebarSections.site && (
+              <div className="px-1.5 pb-1.5 space-y-0.5">
+                {siteNavItems.map(renderNavButton)}
+              </div>
+            )}
+          </div>
+
+          {/* Section 3: Help, Identity & Quick Export */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/35 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => toggleSidebarSection('help')}
+              aria-expanded={openSidebarSections.help}
+              className="w-full flex items-center justify-between px-2.5 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-300 hover:text-white hover:bg-slate-800/60 transition"
+            >
+              <span className="truncate">Help &amp; Quick Export</span>
+              {openSidebarSections.help ? (
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              )}
+            </button>
+            {openSidebarSections.help && (
+              <div className="px-2 pb-2.5 space-y-2">
+                {renderNavButton(helpNavItem)}
+                <div className="pt-2 border-t border-slate-800 space-y-2">
+                  {renderAutoPublishPill()}
+                  <div className="text-xs space-y-0.5 px-1">
+                    <div className="flex items-center gap-1.5 text-emerald-400 font-semibold">
+                      <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                      <span>Signed DID Ready</span>
+                    </div>
+                    <p className="font-mono text-[10px] text-slate-400 truncate" title={bundle.profile.did}>
+                      {bundle.profile.did}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await handleRunTestExportPreview(false);
+                      setActiveTab('preview');
+                    }}
+                    className="w-full py-1.5 px-2.5 rounded-lg bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 font-semibold text-xs flex items-center justify-center gap-1.5 transition"
+                    title="Build a local test export and preview it over a local HTTP server before publishing"
+                  >
+                    <Compass className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                    Test Export &amp; Preview
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExportLocalSite}
+                    className="w-full py-1.5 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center justify-center gap-1.5 shadow transition"
+                  >
+                    <FolderOutput className="w-3.5 h-3.5 shrink-0" />
+                    Quick Export Static Site
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </nav>
       </aside>
 
       {/* Main Content Area */}

@@ -90,12 +90,16 @@ export const TEMPLATE_CSS = String.raw`
     .tpl-album-head > a { flex-shrink: 0; }
     .tpl-stats { display: flex; flex-wrap: wrap; gap: 1.25rem; font-size: 0.9rem; }
     .tpl-stats b { font-weight: 800; }
+    .wr-site-logo { width: 1.75rem; height: 1.75rem; border-radius: 0.45rem; object-fit: contain; display: inline-block; flex-shrink: 0; }
+    .wr-site-logo-lg { width: 2.15rem; height: 2.15rem; }
+    .wr-site-logo-sm { width: 1.25rem; height: 1.25rem; border-radius: 0.3rem; }
+    .wr-site-brand { display: inline-flex; align-items: center; gap: 0.5rem; }
 
     /* Facepace: cover, intro sidebar and post cards */
     body.theme-facepace { --tpl-accent: #3460d4; --tpl-line: #dfe3ea; background: #eef1f6; color: #1c2433; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
     body.theme-facepace .card-surface { background: #ffffff; border: 1px solid #dfe3ea; color: #1c2433; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06); }
     .fp-topbar { display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 1rem; margin-bottom: 1rem; border-radius: 0.75rem; background: linear-gradient(90deg, var(--accent, var(--tpl-accent)), color-mix(in srgb, var(--accent, var(--tpl-accent)) 70%, #0b1020)); color: var(--accent-ink, #fff); font-weight: 800; }
-    .fp-topbar span { width: 2rem; height: 2rem; border-radius: 9999px; display: flex; align-items: center; justify-content: center; background: rgba(255, 255, 255, 0.2); }
+    .fp-topbar .wr-site-logo { width: 1.85rem; height: 1.85rem; border-radius: 0.45rem; }
     .fp-cover { height: 15rem; background: linear-gradient(120deg, color-mix(in srgb, var(--accent, var(--tpl-accent)) 55%, #fff), #c9d3e6); }
     .fp-cover img { width: 100%; height: 100%; object-fit: cover; }
     .fp-id { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; padding: 0 1.5rem 1rem; margin-top: -3.5rem; }
@@ -148,7 +152,7 @@ export const TEMPLATE_CSS = String.raw`
     @media (min-width: 1000px) { .xs-left { position: sticky; top: 1rem; flex-direction: column; align-items: stretch; } }
     .xs-left a.xs-nav { padding: 0.6rem 1rem; border-radius: 9999px; font-size: 1.05rem; font-weight: 600; }
     .xs-left a.xs-nav:hover { background: #16181c; }
-    .xs-mark { font-size: 1.8rem; font-weight: 900; padding: 0 1rem; }
+    .xs-mark { display: inline-flex; align-items: center; padding: 0.25rem 0.75rem; }
     .xs-center { border-left: 1px solid var(--tpl-line); border-right: 1px solid var(--tpl-line); min-width: 0; }
     .xs-center section { margin: 0 !important; border-bottom: 1px solid var(--tpl-line); }
     .xs-center section > h2 { font-size: 1.15rem !important; margin: 0 !important; padding: 0.8rem 1rem; }
@@ -454,6 +458,10 @@ export function renderTemplatePage(ctx: any): string {
       ? '<nav class="tpl-tabs ' + cls + '">' + list.map((r: any) => '<a href="#' + r.id + '">' + esc(typeof r.block.title === 'string' && r.block.title ? r.block.title : BLOCK_TABS[r.block.type] || r.block.type) + '</a>').join('') + '</nav>'
       : '';
   const wrap = (body: string) => '<div data-shell="' + esc(shell) + '">' + body + '</div>';
+  const logoImg = (cls: string) =>
+    ctx.webringLogoUrl
+      ? '<img class="wr-site-logo' + (cls ? ' ' + cls : '') + '" src="' + esc(ctx.webringLogoUrl) + '" alt="Webring" title="Webring Social Media Site" />'
+      : '';
 
   if (shell === 'sidebar') {
     const header =
@@ -464,7 +472,7 @@ export function renderTemplatePage(ctx: any): string {
       '<section class="card-surface fp-intro mb-4"><h2 class="text-lg font-bold mb-2">Intro</h2>' +
       (profile.bio ? '<p class="text-sm text-center mb-2">' + esc(profile.bio) + '</p>' : '') + meta() + interests + '<p class="mt-3">' + didChip + '</p></section>';
     return wrap(
-      '<div class="fp-topbar"><span>' + esc(String(profile.displayName || '?').charAt(0)) + '</span>' + name + '</div>' +
+      '<div class="fp-topbar">' + logoImg('') + name + '</div>' +
       ctx.webringBars + header + ctx.headerAdHtml +
       '<div class="fp-layout"><aside data-region="aside">' + intro + asideHtml + '</aside><main data-region="main">' + mainHtml + ctx.footerAdHtml + '</main></div>' + ctx.footerHtml
     );
@@ -473,7 +481,7 @@ export function renderTemplatePage(ctx: any): string {
   if (shell === 'deck') {
     const profileColumn =
       '<div class="td-col td-profile" data-region="profile">' + banner('td-banner') + avatar('') +
-      '<div class="td-body"><h1 class="text-xl font-extrabold">' + name + '</h1><p class="text-sm tpl-muted">' + esc(handle) + '</p>' +
+      '<div class="td-body"><div class="wr-site-brand">' + logoImg('') + '<h1 class="text-xl font-extrabold">' + name + '</h1></div><p class="text-sm tpl-muted">' + esc(handle) + '</p>' +
       (profile.tagline ? '<p class="text-sm font-semibold mt-1">' + esc(profile.tagline) + '</p>' : '') +
       (profile.bio ? '<p class="text-sm mt-2">' + esc(profile.bio) + '</p>' : '') + meta() + interests +
       '<div class="mt-3">' + stats([[postCount, 'Posts'], [photoCount, 'Photos'], [friendCount, 'Friends']]) + '</div>' +
@@ -488,7 +496,7 @@ export function renderTemplatePage(ctx: any): string {
 
   if (shell === 'rails') {
     const left =
-      '<nav class="xs-left" data-region="nav"><span class="xs-mark tpl-accent">✦</span>' +
+      '<nav class="xs-left" data-region="nav"><span class="xs-mark">' + logoImg('wr-site-logo-lg') + '</span>' +
       rendered.map((r: any) => '<a class="xs-nav" href="#' + r.id + '">' + esc(typeof r.block.title === 'string' && r.block.title ? r.block.title : BLOCK_TABS[r.block.type] || r.block.type) + '</a>').join('') +
       addFriend('tpl-btn-solid justify-center') + '</nav>';
     const header =
@@ -506,7 +514,7 @@ export function renderTemplatePage(ctx: any): string {
   if (shell === 'grid') {
     const header =
       '<div class="ip-head"><div class="ip-ring">' + avatar('') + '</div><div class="min-w-0">' +
-      '<div class="flex flex-wrap items-center gap-3"><h1 class="text-xl">' + esc(handle || profile.displayName) + '</h1>' + addFriend('tpl-btn-solid') + jsonLink + '</div>' +
+      '<div class="flex flex-wrap items-center gap-3">' + logoImg('') + '<h1 class="text-xl">' + esc(handle || profile.displayName) + '</h1>' + addFriend('tpl-btn-solid') + jsonLink + '</div>' +
       '<div class="mt-3">' + stats([[postCount, 'posts'], [photoCount, 'photos'], [friendCount, 'friends']]) + '</div>' +
       '<p class="font-bold mt-3">' + name + '</p>' + (profile.tagline ? '<p class="text-sm tpl-muted">' + esc(profile.tagline) + '</p>' : '') +
       (profile.bio ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(profile.bio) + '</p>' : '') + meta() + '</div></div>';
@@ -525,7 +533,7 @@ export function renderTemplatePage(ctx: any): string {
   // reel
   const likeCount = ctx.endorsementCount;
   const header =
-    '<div class="tt-head">' + avatar('') + '<h1>' + esc(handle || profile.displayName) + '</h1><p class="text-sm tpl-muted">' + name + '</p>' +
+    '<div class="tt-head">' + logoImg('') + avatar('') + '<h1>' + esc(handle || profile.displayName) + '</h1><p class="text-sm tpl-muted">' + name + '</p>' +
     stats([[friendCount, 'Friends'], [likeCount, 'Likes'], [postCount, 'Posts']]) +
     '<div class="flex flex-wrap justify-center gap-2">' + addFriend('tpl-btn-solid') + jsonLink + '</div>' +
     (profile.bio ? '<p class="text-sm max-w-md">' + esc(profile.bio) + '</p>' : '') + meta() + '</div>';
