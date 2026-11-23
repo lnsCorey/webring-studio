@@ -1,0 +1,90 @@
+appId: org.webring.studio
+productName: Webring Studio
+copyright: Copyright © Webring Studio contributors (GPL-3.0-or-later)
+# All runtime dependencies work in pure JS (ssh2's optional cpu-features native addon is not needed),
+# so skipping native rebuilds avoids requiring Visual Studio / Xcode / build-essential just to package.
+npmRebuild: false
+
+directories:
+  buildResources: build
+  output: release
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - electron/assets/**/*
+  - package.json
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+
+# Unpack worker_threads entry + image pipeline and tray/app assets so packaged builds
+# can spawn the image worker and load tray icons reliably across Windows, macOS, and Linux.
+asarUnpack:
+  - dist-electron/electron/services/imageWorker.js
+  - dist-electron/electron/services/imagePipeline.js
+  - electron/assets/**/*
+
+protocols:
+  - name: Webring Studio
+    schemes:
+      - webring
+
+# Unsigned by default so anyone can build local executables without certificates.
+# To sign a build, pass CSC_LINK / CSC_KEY_PASSWORD (and Apple notarization env vars)
+# as documented in BUILDING.md.
+win:
+  icon: build/icon.ico
+  signExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Webring Studio
+
+portable:
+  artifactName: "${productName}-${version}-portable.${ext}"
+
+mac:
+  icon: build/icon.icns
+  category: public.app-category.social-networking
+  identity: null
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+
+linux:
+  icon: build/icons
+  category: Network
+  synopsis: Decentralized personal profile & webring studio
+  maintainer: Webring Studio <https://github.com/lnsCorey/webring-studio>
+  desktop:
+    entry:
+      Name: Webring Studio
+      Comment: Self-contained federated personal profile & webring studio
+      Categories: Network;Utility;
+      MimeType: x-scheme-handler/webring;
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+    - target: pacman
+      arch:
+        - x64

@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import { Worker } from 'worker_threads';
 import * as jpeg from 'jpeg-js';
@@ -297,9 +298,16 @@ export function runImageTask(buffer: Buffer, task: ImageTask): { web: EncodedIma
 const WORKER_TIMEOUT_MS = 20_000;
 const WORKER_HEAP_MB = 512;
 
-/** Where the compiled worker is: beside this file, or WEBRING_IMAGE_WORKER (the tests build one). */
+/** Where the compiled worker is: beside this file (unpacked when inside app.asar), or WEBRING_IMAGE_WORKER. */
 function imageWorkerPath(): string {
-  return process.env.WEBRING_IMAGE_WORKER || path.join(__dirname, 'imageWorker.js');
+  if (process.env.WEBRING_IMAGE_WORKER) return process.env.WEBRING_IMAGE_WORKER;
+  const workerFile = path.join(__dirname, 'imageWorker.js');
+  // Node worker_threads cannot load scripts directly from inside an Electron app.asar archive
+  if (workerFile.includes(`${path.sep}app.asar${path.sep}`)) {
+    const unpacked = workerFile.replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+    if (fs.existsSync(unpacked)) return unpacked;
+  }
+  return workerFile;
 }
 
 const reviveEncoded = (e: EncodedImage & { buffer: Uint8Array }): EncodedImage => ({

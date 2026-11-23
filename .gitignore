@@ -1,6 +1,7 @@
 node_modules
 dist
 dist-electron
+release
 
 # Personal agent instructions and local settings
 CLAUDE.local.md
