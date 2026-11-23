@@ -62,6 +62,7 @@ import {
 } from './services/mediaLibrary';
 import { showSplash } from './splash';
 import { savePost, unsavePost } from './services/savedPosts';
+import { DataManagementService } from './services/dataManagement';
 
 // Lets the Studio window show Media Library images: studio-media://local/<path> maps to the
 // active persona's library file for media/<path>. Must be registered before the app is ready.
@@ -83,6 +84,7 @@ let webringMcpServer: WebringMcpServer;
 let mcpHttpServer: McpHttpServer;
 let scheduler: Scheduler;
 let autoPublisher: AutoPublisher;
+let dataManagement: DataManagementService;
 let tray: Tray | null = null;
 let isQuitting = false;
 let startupComplete = false;
@@ -448,6 +450,12 @@ async function initServices() {
   });
   applyLoginItem(scheduler.loadConfig());
 
+  dataManagement = new DataManagementService(personaManager, (result) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('studio:data-backup-completed', result);
+    }
+  });
+
   autoPublisher = new AutoPublisher({
     scheduler,
     listPersonaIds: () => personaManager.listPersonaRecords().map((p) => p.id),
@@ -728,11 +736,18 @@ if (!gotTheLock) {
     }
     createTray();
     scheduler.start();
+    dataManagement.startScheduler();
     // Changes left unpublished when the app last quit get their auto-publish back
     void autoPublisher.refresh();
     // Catch up after sleep; the 60-second tick handles everything else
-    powerMonitor.on('resume', () => void scheduler.tick());
-    powerMonitor.on('unlock-screen', () => void scheduler.tick());
+    powerMonitor.on('resume', () => {
+      void scheduler.tick();
+      void dataManagement.tick();
+    });
+    powerMonitor.on('unlock-screen', () => {
+      void scheduler.tick();
+      void dataManagement.tick();
+    });
     startupComplete = true;
 
     // Check if launched with a webring:// URI
@@ -762,6 +777,7 @@ app.on('activate', () => {
 app.on('before-quit', () => {
   isQuitting = true;
   scheduler?.stop();
+  dataManagement?.stopScheduler();
   autoPublisher?.dispose();
   void localPreviewServer?.stop();
 });
@@ -1581,5 +1597,61 @@ function registerIpcHandlers() {
       })
     );
   }
+
+  // Settings -> Data (Dashboard, Database diagnostics/maintenance, Backup & Restore)
+  ipcMain.handle('studio:data-get-dashboard', () => dataManagement.getDashboardSummary());
+  ipcMain.handle('studio:data-get-db-status', () => dataManagement.getDatabaseStatus());
+  ipcMain.handle('studio:data-get-settings', () => dataManagement.loadSettings());
+  ipcMain.handle('studio:data-save-settings', (_e, patch) => dataManagement.saveSettings(patch || {}));
+  ipcMain.handle('studio:data-choose-backup-folder', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Choose Backup Destination Folder',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle('studio:data-pick-restore-file', async () => {
+    const settings = dataManagement.loadSettings();
+    const result = await dialog.showOpenDialog({
+      title: 'Select SQLite Database Backup to Restore',
+      defaultPath: settings.backupDir && fs.existsSync(settings.backupDir) ? settings.backupDir : undefined,
+      filters: [{ name: 'SQLite Database', extensions: ['sqlite', 'db'] }],
+      properties: ['openFile'],
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle('studio:data-list-backups', () => dataManagement.listBackups());
+  ipcMain.handle('studio:data-run-backup', (_e, options) => dataManagement.runBackup(options || {}));
+  ipcMain.handle('studio:data-delete-backup', (_e, filePath: string) => {
+    dataManagement.deleteBackup(String(filePath));
+    return { ok: true };
+  });
+  ipcMain.handle('studio:data-restore-backup', (_e, filePath: string, personaId?: string) =>
+    dataManagement.restoreBackup(String(filePath), personaId ? String(personaId) : undefined)
+  );
+  ipcMain.handle('studio:data-compact-db', () => dataManagement.compactActiveDatabase());
+  ipcMain.handle('studio:data-check-integrity', () => dataManagement.checkActiveDatabaseIntegrity());
+  ipcMain.handle('studio:data-clean-unused-media', () => dataManagement.cleanUnusedMedia());
+  ipcMain.handle('studio:data-reveal-path', (_e, targetPath: string) => {
+    if (typeof targetPath !== 'string' || !targetPath.trim()) return { ok: false };
+    const resolved = path.resolve(targetPath);
+    const ctx = personaManager.getActiveContext();
+    const settings = dataManagement.loadSettings();
+    const allowedRoots = [
+      path.resolve(ctx.db.dbPath),
+      settings.backupDir ? path.resolve(settings.backupDir) : '',
+      path.resolve(path.join(app.getPath('userData'), 'pre-restore-backups')),
+    ].filter(Boolean);
+    const isAllowed = allowedRoots.some(
+      (root) => resolved === root || resolved.startsWith(root + path.sep)
+    );
+    if (!isAllowed) {
+      throw new Error('Studio only reveals its database or configured backup files.');
+    }
+    shell.showItemInFolder(resolved);
+    return { ok: true };
+  });
 }
 

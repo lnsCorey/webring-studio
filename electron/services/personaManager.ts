@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { KeyCipher } from '../security/keyVault';
-import { StudioDatabase } from '../db/database';
+import { checkSqliteFileIntegrity, StudioDatabase } from '../db/database';
 import { MediaLibrary, optimizeLegacyPhotos } from './mediaLibrary';
 import { StaticSiteGenerator } from './siteGenerator';
 import { SitePublisher } from './publisher';
@@ -208,8 +208,76 @@ export class PersonaManager {
   }
 
   /** Persona ids and labels without opening any database. */
-  public listPersonaRecords(): Array<{ id: string; label: string }> {
-    return this.registry.personas.map((p) => ({ id: p.id, label: p.label }));
+  public listPersonaRecords(): Array<{ id: string; label: string; dbFileName: string; mediaDirName: string; createdAt: string }> {
+    return this.registry.personas.map((p) => ({
+      id: p.id,
+      label: p.label,
+      dbFileName: p.dbFileName,
+      mediaDirName: p.mediaDirName,
+      createdAt: p.createdAt,
+    }));
+  }
+
+  public getUserDataDir(): string {
+    return this.userDataDir;
+  }
+
+  /**
+   * Safely restores a persona's SQLite database from a verified backup file:
+   * 1. Verifies backup integrity with PRAGMA integrity_check.
+   * 2. Saves an automatic pre-restore safety snapshot of the current DB.
+   * 3. Closes the live connection, replaces the .sqlite (clearing stale WAL/SHM), and reopens.
+   */
+  public restorePersonaDatabase(
+    personaId: string,
+    backupFilePath: string
+  ): { safetySnapshotPath: string; personaId: string; personaLabel: string } {
+    const record = this.registry.personas.find((p) => p.id === personaId);
+    if (!record) throw new Error(`Persona "${personaId}" not found.`);
+
+    const check = checkSqliteFileIntegrity(backupFilePath);
+    if (!check.ok) {
+      throw new Error(`Backup file failed SQLite integrity check: ${check.messages.join('; ')}`);
+    }
+
+    const safetyDir = path.join(this.userDataDir, 'pre-restore-backups');
+    fs.mkdirSync(safetyDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeSlug = record.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    const safetySnapshotPath = path.join(safetyDir, `pre-restore-${safeSlug}-${stamp}.sqlite`);
+
+    const wasActive = this.activeContext?.persona.id === personaId;
+    if (wasActive && this.activeContext) {
+      this.activeContext.db.vacuumInto(safetySnapshotPath);
+      this.activeContext.db.close();
+      this.activeContext = null;
+    } else {
+      const tempDb = new StudioDatabase(this.userDataDir, record.dbFileName, {
+        keyCipher: this.options.keyCipher,
+      });
+      try {
+        tempDb.vacuumInto(safetySnapshotPath);
+      } finally {
+        tempDb.close();
+      }
+    }
+
+    const targetDbPath = path.join(this.userDataDir, record.dbFileName);
+    for (const ext of ['-wal', '-shm']) {
+      const sidecar = `${targetDbPath}${ext}`;
+      if (fs.existsSync(sidecar)) fs.rmSync(sidecar, { force: true });
+    }
+    fs.copyFileSync(backupFilePath, targetDbPath);
+
+    if (wasActive) {
+      this.activatePersona(personaId);
+    }
+
+    return {
+      safetySnapshotPath,
+      personaId: record.id,
+      personaLabel: record.label,
+    };
   }
 
   /** How many calls are using each context that was active when they started (withActiveContext). */

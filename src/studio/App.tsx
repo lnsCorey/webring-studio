@@ -25,6 +25,7 @@ import {
 import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
 import { HorizontalTabs } from './HorizontalTabs';
+import { DataSettingsApi, DataSettingsView } from './DataSettingsView';
 import { MediaLibraryView } from './MediaLibraryView';
 import { PostsLibraryView } from './PostsLibraryView';
 import { FriendEdit, FriendEditor } from './FriendEditor';
@@ -72,6 +73,7 @@ import {
   Code2,
   Compass,
   Copy,
+  Database,
   ExternalLink,
   FolderOutput,
   Globe,
@@ -765,6 +767,21 @@ declare global {
       }>;
       onMcpActivity?: (cb: (entry: unknown) => void) => () => void;
       onDeepLink: (cb: (action: WebringDeepLinkAction) => void) => () => void;
+      getDataDashboard: DataSettingsApi['getDataDashboard'];
+      getDatabaseStatus: DataSettingsApi['getDatabaseStatus'];
+      getDataSettings: DataSettingsApi['getDataSettings'];
+      saveDataSettings: DataSettingsApi['saveDataSettings'];
+      chooseBackupFolder: DataSettingsApi['chooseBackupFolder'];
+      pickRestoreFile: DataSettingsApi['pickRestoreFile'];
+      listBackups: DataSettingsApi['listBackups'];
+      runBackup: DataSettingsApi['runBackup'];
+      deleteBackup: DataSettingsApi['deleteBackup'];
+      restoreBackup: DataSettingsApi['restoreBackup'];
+      compactDatabase: DataSettingsApi['compactDatabase'];
+      checkDatabaseIntegrity: DataSettingsApi['checkDatabaseIntegrity'];
+      cleanUnusedMedia: DataSettingsApi['cleanUnusedMedia'];
+      revealDataPath: DataSettingsApi['revealDataPath'];
+      onDataBackupCompleted?: DataSettingsApi['onDataBackupCompleted'];
     };
   }
 }
@@ -779,16 +796,19 @@ type StudioTab =
   | 'schemas'
   | 'publish'
   | 'mcp'
-  | 'help';
+  | 'help'
+  | 'data';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<StudioTab>('feed');
-  type SidebarSectionId = 'social' | 'site' | 'help';
+  type SidebarSectionId = 'social' | 'site' | 'help' | 'settings';
   const [openSidebarSections, setOpenSidebarSections] = useState<Record<SidebarSectionId, boolean>>({
     social: true,
     site: false,
     help: false,
+    settings: false,
   });
+  const [dbLimitLevel, setDbLimitLevel] = useState<'ok' | 'warning' | 'critical'>('ok');
   const toggleSidebarSection = (section: SidebarSectionId) =>
     setOpenSidebarSections((prev) => ({ ...prev, [section]: !prev[section] }));
   useEffect(() => {
@@ -797,7 +817,9 @@ export const App: React.FC = () => {
         ? 'social'
         : activeTab === 'help'
           ? 'help'
-          : 'site';
+          : activeTab === 'data'
+            ? 'settings'
+            : 'site';
     setOpenSidebarSections((prev) => (prev[section] ? prev : { ...prev, [section]: true }));
   }, [activeTab]);
   const [friendsSubTab, setFriendsSubTab] = useState<'friends' | 'notices' | 'webrings' | 'hosted' | 'discover'>('friends');
@@ -864,6 +886,9 @@ export const App: React.FC = () => {
 
   // Multi-Persona compartmentalization state
   const [activePersonaId, setActivePersonaId] = useState<string>('default');
+  useEffect(() => {
+    window.studioApi?.getDatabaseStatus?.().then((s) => setDbLimitLevel(s.limitLevel)).catch(() => undefined);
+  }, [activePersonaId]);
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [showSetupWizard, setShowSetupWizard] = useState(false);
   /** Personas the wizard has already opened for by itself this session */
@@ -2869,6 +2894,15 @@ export const App: React.FC = () => {
     label: 'Help & Deploy Guide',
     icon: <BookOpen className="w-4 h-4 shrink-0" />,
   };
+  const settingsNavItems: NavItem[] = [
+    {
+      id: 'data',
+      label: 'Data',
+      icon: <Database className="w-4 h-4 shrink-0" />,
+      alert: dbLimitLevel !== 'ok' ? 'Database size is approaching or over its configured limit' : undefined,
+    },
+  ];
+  const settingsHasAlert = settingsNavItems.some((i) => Boolean(i.alert));
 
   const renderNavButton = (item: NavItem) => (
     <button
@@ -3108,6 +3142,33 @@ export const App: React.FC = () => {
                     Quick Export Static Site
                   </button>
                 </div>
+              </div>
+            )}
+          </div>
+
+          {/* Section 4: Settings */}
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/35 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => toggleSidebarSection('settings')}
+              aria-expanded={openSidebarSections.settings}
+              className="w-full flex items-center justify-between px-2.5 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-300 hover:text-white hover:bg-slate-800/60 transition"
+            >
+              <span className="truncate">Settings</span>
+              <span className="flex items-center gap-1.5 shrink-0">
+                {!openSidebarSections.settings && settingsHasAlert && (
+                  <span className="w-2 h-2 rounded-full bg-amber-400" title="Database size limit warning" />
+                )}
+                {openSidebarSections.settings ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                )}
+              </span>
+            </button>
+            {openSidebarSections.settings && (
+              <div className="px-1.5 pb-1.5 space-y-0.5">
+                {settingsNavItems.map(renderNavButton)}
               </div>
             )}
           </div>
@@ -7351,6 +7412,16 @@ export const App: React.FC = () => {
                 </div>
               </div>
             </div>
+          )}
+
+          {/* TAB 11: SETTINGS -> DATA */}
+          {activeTab === 'data' && window.studioApi && (
+            <DataSettingsView
+              api={window.studioApi}
+              activePersonaId={activePersonaId}
+              onDatabaseRestored={refreshStudioData}
+              onLimitStatusChange={setDbLimitLevel}
+            />
           )}
 
           {/* TAB 10: HELP & DEPLOYMENT GUIDE */}
