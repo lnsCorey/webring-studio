@@ -30,7 +30,7 @@ Highlights:
 
 ## Installation
 
-There are no packaged releases yet; run Webring Studio from source.
+You can run Webring Studio from source (below) or build a standalone desktop executable for **Windows**, **macOS**, or **Linux** (including **Arch / Omarchy** and Debian/Ubuntu) — see [BUILDING.md](./BUILDING.md) for packaging and optional code-signing instructions.
 
 **Requirements**
 
