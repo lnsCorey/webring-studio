@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
+import { makeFaviconImages } from './imagePipeline';
 import { markdownToPlainText, renderMarkdown } from '../../src/shared/markdown';
 import { AVATAR_PAGE_SCRIPT } from '../../src/shared/avatar';
 import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
@@ -186,8 +187,31 @@ export class StaticSiteGenerator {
       writeJson(manifestPath, doc);
     }
 
+    // 3b. Favicon generated from the local Profile Photo (overwritten whenever the profile photo changes)
+    const faviconPngPath = path.join(outputDir, 'favicon.png');
+    const faviconIcoPath = path.join(outputDir, 'favicon.ico');
+    let faviconHash = '';
+    if (this.mediaStoreDir && bundle.profile.avatarUrl && MediaLibrary.isLocalUrl(bundle.profile.avatarUrl)) {
+      const avatarFile = new MediaLibrary(this.mediaStoreDir).resolveLocalUrl(bundle.profile.avatarUrl);
+      if (avatarFile && fs.existsSync(avatarFile)) {
+        try {
+          const { png, ico } = makeFaviconImages(fs.readFileSync(avatarFile));
+          fs.writeFileSync(faviconPngPath, png.buffer);
+          fs.writeFileSync(faviconIcoPath, ico);
+          filesWritten.push('favicon.png', 'favicon.ico');
+          faviconHash = crypto.createHash('sha256').update(png.buffer).digest('hex').slice(0, 12);
+        } catch {
+          // Unsupported or unreadable image: skip favicon rather than failing site export
+        }
+      }
+    }
+    if (!faviconHash) {
+      if (fs.existsSync(faviconPngPath)) fs.rmSync(faviconPngPath, { force: true });
+      if (fs.existsSync(faviconIcoPath)) fs.rmSync(faviconIcoPath, { force: true });
+    }
+
     // 4. Write standalone index.html for the hosted Profile Website
-    const indexHtml = this.buildStandaloneProfileHtml(bundle);
+    const indexHtml = this.buildStandaloneProfileHtml(bundle, { faviconHash });
 
     fs.writeFileSync(path.join(outputDir, 'index.html'), indexHtml, 'utf8');
     filesWritten.push('index.html');
@@ -198,7 +222,7 @@ export class StaticSiteGenerator {
       const relPath = albumPagePath(album.slug);
       const fullPath = safeOutputPath(outputDir, relPath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id }), 'utf8');
+      fs.writeFileSync(fullPath, this.buildStandaloneProfileHtml(bundle, { albumId: album.id, faviconHash }), 'utf8');
       filesWritten.push(relPath);
     }
 
@@ -215,6 +239,9 @@ export class StaticSiteGenerator {
       '    Header set Access-Control-Allow-Origin "*"',
       '  </FilesMatch>',
       '  <FilesMatch "\\.(html|json)$">',
+      '    Header set Cache-Control "no-cache"',
+      '  </FilesMatch>',
+      '  <FilesMatch "^favicon\\.(ico|png)$">',
       '    Header set Cache-Control "no-cache"',
       '  </FilesMatch>',
       '</IfModule>',
@@ -274,7 +301,10 @@ export class StaticSiteGenerator {
    * same page plus a base URL for local Media Library images and a bridge that sends link clicks
    * to Studio. Preview extras are never part of a published file.
    */
-  public buildStandaloneProfileHtml(bundle: CompleteSiteBundle, options: { preview?: boolean; albumId?: string } = {}): string {
+  public buildStandaloneProfileHtml(
+    bundle: CompleteSiteBundle,
+    options: { preview?: boolean; albumId?: string; faviconHash?: string } = {}
+  ): string {
     const preview = options.preview === true;
     const album = options.albumId ? bundle.albums.albums.find((a) => a.id === options.albumId) : undefined;
     const albumId = album ? album.id : '';
@@ -379,6 +409,21 @@ export class StaticSiteGenerator {
       path.join(__dirname, '../../electron/assets/site.css'),
     ];
     const compiledSiteCss = loadSiteCss(cssCandidates);
+    const logoCandidates = [
+      path.join(__dirname, '../assets/webring-logo-thumb.png'),
+      path.join(__dirname, '../../../electron/assets/webring-logo-thumb.png'),
+      path.join(__dirname, '../../electron/assets/webring-logo-thumb.png'),
+    ];
+    const webringLogoDataUri = loadWebringLogoDataUri(logoCandidates);
+
+    const httpsAvatar = bundle.profile.avatarUrl ? safeExternalUrl(bundle.profile.avatarUrl) : null;
+    const faviconHead = options.faviconHash
+      ? `\n  <link rel="icon" type="image/png" sizes="64x64" href="./favicon.png?v=${options.faviconHash}" />` +
+        `\n  <link rel="icon" type="image/x-icon" href="./favicon.ico?v=${options.faviconHash}" />` +
+        `\n  <link rel="apple-touch-icon" href="./favicon.png?v=${options.faviconHash}" />`
+      : httpsAvatar && httpsAvatar.startsWith('https://')
+        ? `\n  <link rel="icon" href="${this.escapeHtml(httpsAvatar)}" />`
+        : '';
 
     return withInlineScriptHashes(`<!DOCTYPE html>
 <html lang="en">
@@ -386,7 +431,7 @@ export class StaticSiteGenerator {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' ${INLINE_SCRIPT_HASHES}${commentHost}${scriptSrcExtras ? ' ' + scriptSrcExtras : ''}; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:${preview ? ' studio-media:' : ''};${frameSrcClause} connect-src 'self' https: http:;" />
-  <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
+  <title>${this.escapeHtml(pageTitle)}</title>${albumHead}${faviconHead}${preview ? '\n  <base href="studio-media://local/" />' : ''}
   <link rel="alternate" type="application/json" title="Webring Manifest" href="./api/manifest.json" />
   <link rel="me" href="${this.escapeHtml(bundle.profile.siteUrl)}" />${analyticsHeadSnippet}${adsHeadSnippet}
   <script>window.__WEBRING_BUNDLE__ = ${safeJson};${albumId ? `\n  window.__WEBRING_ALBUM_ID__ = ${embedJson(albumId)};` : ''}${archivesJson ? `\n  window.__WEBRING_ARCHIVES__ = ${archivesJson};` : ''}</script>
@@ -1106,9 +1151,10 @@ ${AVATAR_PAGE_SCRIPT}
         : '';
       const archiveView = { renderItem: renderItem, wrapClass: 'grid grid-cols-1 md:grid-cols-2 gap-4' };
 
+      const webringLogoUrl = ${JSON.stringify(webringLogoDataUri)};
       const footerHtml = \`
         <footer class="text-center text-xs opacity-60 pt-8 border-t border-white/10">
-          <p>Self-contained static profile powered by <strong>Webring Studio JSON Protocol v\${esc(data.manifest.schemaVersion)}</strong> • Cryptographically signed via <code>\${esc(profile.did)}</code></p>
+          <p class="inline-flex items-center justify-center gap-2">\${webringLogoUrl ? \`<img class="wr-site-logo wr-site-logo-sm" src="\${esc(webringLogoUrl)}" alt="Webring" title="Webring Social Media Site" />\` : ''}<code>\${esc(profile.did)}</code></p>
         </footer>\`;
 
       // An album's own page: just the album, no profile layout
@@ -1135,7 +1181,7 @@ ${AVATAR_PAGE_SCRIPT}
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
           blockRenderers, section, emptyNote, albumHref, albumCover, albumShownExpanded, albumPhotoTotal, albumPhotosLabel, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
-          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView
+          webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView, webringLogoUrl
         });
       } else root.innerHTML = \`
         \${webringBars}
@@ -1146,6 +1192,7 @@ ${AVATAR_PAGE_SCRIPT}
               \${profile.avatarUrl ? \`<img src="\${safeUrl(profile.avatarUrl)}" class="profile-avatar w-28 h-28 rounded-2xl object-cover border-4 border-slate-900 shadow-lg bg-slate-800" />\` : ''}
               <div>
                 <div class="flex flex-wrap items-center gap-2">
+                  \${webringLogoUrl ? \`<img class="wr-site-logo" src="\${esc(webringLogoUrl)}" alt="Webring" title="Webring Social Media Site" />\` : ''}
                   <h1 class="text-2xl sm:text-3xl font-extrabold">\${esc(profile.displayName)}</h1>
                   <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono" title="Verified Ed25519 DID Identity">\${esc(profile.did)}</span>
                 </div>
@@ -1289,6 +1336,16 @@ export function loadSiteCss(candidates: string[]): string {
     if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf8');
   }
   throw new Error(SITE_CSS_MISSING_MESSAGE);
+}
+
+/** Small Webring logo thumbnail as a data URI so standalone/exported pages work without extra image requests. */
+export function loadWebringLogoDataUri(candidates: string[]): string {
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return `data:image/png;base64,${fs.readFileSync(candidate).toString('base64')}`;
+    }
+  }
+  return '';
 }
 
 /** Stands in for the inline scripts' hashes in a page's CSP until the page is complete. */

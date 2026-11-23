@@ -401,3 +401,68 @@ export function makeWebImages(source: Buffer): { web: EncodedImage; thumb: Encod
     thumb: encodeImage(thumbPixels, format, THUMB_JPEG_QUALITY),
   };
 }
+
+/** Center-crops an image to a square using its shorter side. */
+export function cropCenterSquare(image: RawImage): RawImage {
+  const { width: w, height: h, data } = image;
+  if (w === h) return image;
+  const side = Math.min(w, h);
+  const x0 = Math.floor((w - side) / 2);
+  const y0 = Math.floor((h - side) / 2);
+  const out = new Uint8Array(side * side * 4);
+  for (let y = 0; y < side; y++) {
+    const srcStart = ((y0 + y) * w + x0) * 4;
+    out.set(data.subarray(srcStart, srcStart + side * 4), y * side * 4);
+  }
+  return { width: side, height: side, data: out };
+}
+
+/** Center-crops an image to a square and resizes it to exact `size × size` pixels. */
+export function resizeSquare(image: RawImage, size: number): RawImage {
+  const sq = cropCenterSquare(image);
+  if (sq.width === size) return sq;
+  if (sq.width > size) return resizeToFit(sq, size);
+  const out = new Uint8Array(size * size * 4);
+  const ratio = sq.width / size;
+  for (let oy = 0; oy < size; oy++) {
+    const sy = Math.min(sq.height - 1, Math.floor(oy * ratio));
+    for (let ox = 0; ox < size; ox++) {
+      const sx = Math.min(sq.width - 1, Math.floor(ox * ratio));
+      const src = (sy * sq.width + sx) * 4;
+      const dst = (oy * size + ox) * 4;
+      out[dst] = sq.data[src];
+      out[dst + 1] = sq.data[src + 1];
+      out[dst + 2] = sq.data[src + 2];
+      out[dst + 3] = sq.data[src + 3];
+    }
+  }
+  return { width: size, height: size, data: out };
+}
+
+/** Wraps a single PNG buffer inside a standard Windows/browser `.ico` container. */
+export function encodeIcoFromPng(pngBuffer: Buffer, width: number, height: number): Buffer {
+  const header = Buffer.alloc(22);
+  header.writeUInt16LE(0, 0); // Reserved
+  header.writeUInt16LE(1, 2); // Type: 1 = ICO
+  header.writeUInt16LE(1, 4); // Count: 1 image
+  header.writeUInt8(width >= 256 ? 0 : width, 6);
+  header.writeUInt8(height >= 256 ? 0 : height, 7);
+  header.writeUInt8(0, 8); // ColorCount
+  header.writeUInt8(0, 9); // Reserved
+  header.writeUInt16LE(1, 10); // Planes
+  header.writeUInt16LE(32, 12); // BitCount
+  header.writeUInt32LE(pngBuffer.length, 14); // BytesInRes
+  header.writeUInt32LE(22, 18); // ImageOffset
+  return Buffer.concat([header, pngBuffer]);
+}
+
+/** Generates a square 64×64 PNG favicon and 32×32 PNG-in-ICO favicon from a profile photo. */
+export function makeFaviconImages(source: Buffer): { png: EncodedImage; ico: Buffer } {
+  const { image } = decodeImage(source);
+  const png64 = encodeImage(resizeSquare(image, 64), 'png');
+  const png32 = encodeImage(resizeSquare(image, 32), 'png');
+  return {
+    png: png64,
+    ico: encodeIcoFromPng(png32.buffer, 32, 32),
+  };
+}
