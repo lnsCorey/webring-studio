@@ -1071,7 +1071,7 @@ ${AVATAR_PAGE_SCRIPT}
             '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(i => i.type === 'album' ? renderAlbumPost(i.album) : renderItem(i)).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
         },
         friends: (b) => allFriends.length
-          ? section(b, '🤝 Friend Ring & Connections (' + allFriends.length + ')',
+          ? section(b, '🤝 Friends & Connections (' + allFriends.length + ')',
               '<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">' + allFriends.map(renderFriend).join('') + '</div>')
           : '',
         text: (b) => {
