@@ -488,7 +488,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
   </style>
 </head>
 <body class="${templateBodyClasses(bundle.profile.theme)} min-h-screen antialiased pb-20"${this.appearanceAttributes(appearance)}>
-  <div id="profile-root" class="max-w-5xl mx-auto px-4 sm:px-6 pt-6"></div>
+  <div id="profile-root" class="max-w-6xl mx-auto px-3 sm:px-6 lg:px-8 pt-4 sm:pt-6"></div>
 
   <script>
     (async function() {
@@ -1071,7 +1071,7 @@ ${AVATAR_PAGE_SCRIPT}
             '<div class="grid grid-cols-1 md:grid-cols-2 gap-4">' + (list.map(i => i.type === 'album' ? renderAlbumPost(i.album) : renderItem(i)).join('') || emptyNote('Nothing shared here yet.')) + '</div>');
         },
         friends: (b) => allFriends.length
-          ? section(b, '🤝 Friend Ring & Connections (' + allFriends.length + ')',
+          ? section(b, '🤝 Friends & Connections (' + allFriends.length + ')',
               '<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">' + allFriends.map(renderFriend).join('') + '</div>')
           : '',
         text: (b) => {
@@ -1183,23 +1183,30 @@ ${AVATAR_PAGE_SCRIPT}
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView, webringLogoUrl
         });
-      } else root.innerHTML = \`
+      } else {
+        const stackHasBannerAndAvatar = Boolean(profile.bannerUrl && profile.avatarUrl);
+        const stackRawHandle = String(profile.handle || '').trim();
+        const stackHandle = stackRawHandle ? (stackRawHandle.startsWith('@') ? stackRawHandle : '@' + stackRawHandle) : '';
+        const stackHasMeta = Boolean(profile.location || profile.atprotoHandle || (profile.customLinks && profile.customLinks.length));
+        const stackHasBody = Boolean(profile.bio || (profile.interests && profile.interests.length) || stackHasMeta);
+        root.innerHTML = \`
         \${webringBars}
         <div class="card-surface rounded-2xl overflow-hidden mb-8 shadow-xl">
-          \${profile.bannerUrl ? \`<div class="profile-banner h-48 sm:h-60 w-full overflow-hidden bg-slate-800"><img src="\${safeUrl(profile.bannerUrl)}" class="w-full h-full object-cover" /></div>\` : ''}
-          <div class="p-6 sm:p-8 flex flex-col sm:flex-row sm:items-end justify-between gap-6 \${profile.bannerUrl ? '-mt-16' : ''}">
-            <div class="flex flex-col sm:flex-row sm:items-end gap-5">
-              \${profile.avatarUrl ? \`<img src="\${safeUrl(profile.avatarUrl)}" class="profile-avatar w-28 h-28 rounded-2xl object-cover border-4 border-slate-900 shadow-lg bg-slate-800" />\` : ''}
-              <div>
+          \${profile.bannerUrl ? \`<div class="profile-banner h-44 sm:h-60 w-full overflow-hidden bg-slate-800"><img src="\${safeUrl(profile.bannerUrl)}" class="w-full h-full object-cover" /></div>\` : ''}
+          <div class="p-5 sm:p-8 flex flex-col sm:flex-row sm:items-end justify-between gap-5 \${stackHasBannerAndAvatar ? '-mt-14 sm:-mt-16' : ''}">
+            <div class="flex flex-col sm:flex-row sm:items-end gap-4 sm:gap-5 min-w-0">
+              \${profile.avatarUrl ? \`<img src="\${safeUrl(profile.avatarUrl)}" class="profile-avatar w-24 h-24 sm:w-28 sm:h-28 rounded-2xl object-cover border-4 border-slate-900 shadow-lg bg-slate-800 shrink-0" />\` : ''}
+              <div class="min-w-0">
                 <div class="flex flex-wrap items-center gap-2">
                   \${webringLogoUrl ? \`<img class="wr-site-logo" src="\${esc(webringLogoUrl)}" alt="Webring" title="Webring Social Media Site" />\` : ''}
                   <h1 class="text-2xl sm:text-3xl font-extrabold">\${esc(profile.displayName)}</h1>
-                  <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono" title="Verified Ed25519 DID Identity">\${esc(profile.did)}</span>
+                  \${stackHandle ? \`<span class="text-sm opacity-70">\${esc(stackHandle)}</span>\` : ''}
+                  <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono break-all" title="Verified Ed25519 DID Identity">\${esc(profile.did)}</span>
                 </div>
-                <p class="text-sm opacity-80 mt-1">\${esc(profile.tagline || '')}</p>
+                \${profile.tagline ? \`<p class="text-sm opacity-80 mt-1">\${esc(profile.tagline)}</p>\` : ''}
               </div>
             </div>
-            <div class="flex flex-wrap gap-2">
+            <div class="flex flex-wrap gap-2 shrink-0">
               <a href="\${buildDeepLink('friend', profile.siteUrl, profile.displayName, profile.avatarUrl)}" class="accent-solid px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm shadow">
                 + Add to Friend Ring
               </a>
@@ -1208,17 +1215,15 @@ ${AVATAR_PAGE_SCRIPT}
               </a>
             </div>
           </div>
-          <div class="px-6 sm:px-8 pb-6">
-            <p class="text-base leading-relaxed max-w-3xl mb-4">\${esc(profile.bio || '')}</p>
-            <div class="flex flex-wrap gap-2 mb-4">
-              \${(profile.interests || []).map(tag => \`<span class="text-xs px-3 py-1 rounded-full bg-white/10 font-medium">#\${esc(tag)}</span>\`).join('')}
-            </div>
-            <div class="flex flex-wrap gap-4 text-xs opacity-80 pt-3 border-t border-white/10">
+          \${stackHasBody ? \`<div class="px-5 sm:px-8 pb-6">
+            \${profile.bio ? \`<p class="text-base leading-relaxed max-w-3xl mb-4 whitespace-pre-line">\${esc(profile.bio)}</p>\` : ''}
+            \${(profile.interests || []).length ? \`<div class="flex flex-wrap gap-2 mb-4">\${(profile.interests || []).map(tag => \`<span class="text-xs px-3 py-1 rounded-full bg-white/10 font-medium">#\${esc(tag)}</span>\`).join('')}</div>\` : ''}
+            \${stackHasMeta ? \`<div class="flex flex-wrap gap-4 text-xs opacity-80 pt-3 border-t border-white/10">
               \${profile.location ? \`<span>📍 \${esc(profile.location)}</span>\` : ''}
               \${profile.atprotoHandle ? \`<span>🦋 ATProto: @\${esc(profile.atprotoHandle)}</span>\` : ''}
               \${(profile.customLinks || []).map(l => \`<a href="\${safeUrl(l.url)}" target="_blank" rel="noopener noreferrer" class="underline hover:opacity-100">🔗 \${esc(l.label)}</a>\`).join('')}
-            </div>
-          </div>
+            </div>\` : ''}
+          </div>\` : ''}
         </div>
 
         \${headerAdHtml}
@@ -1229,6 +1234,7 @@ ${AVATAR_PAGE_SCRIPT}
         \${footerAdHtml}
         \${footerHtml}
       \`;
+      }
 
       // Interactive extras: lightbox, post view, sortable tables (pageEnhancements.ts)
       const installPageEnhancements = ${enhancementsSource};
