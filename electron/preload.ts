@@ -225,6 +225,7 @@ contextBridge.exposeInMainWorld('studioApi', {
   checkDatabaseIntegrity: () => ipcRenderer.invoke('studio:data-check-integrity'),
   cleanUnusedMedia: () => ipcRenderer.invoke('studio:data-clean-unused-media'),
   revealDataPath: (targetPath: string) => ipcRenderer.invoke('studio:data-reveal-path', targetPath),
+  setAppTheme: (theme: 'dark' | 'light' | 'system') => ipcRenderer.invoke('studio:set-app-theme', theme),
   onDataBackupCompleted: (callback: (result: unknown) => void) => {
     const listener = (_event: unknown, result: unknown) => callback(result);
     ipcRenderer.on('studio:data-backup-completed', listener);

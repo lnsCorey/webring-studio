@@ -83,6 +83,8 @@ import {
   Link2,
   Lock,
   MessageSquare,
+  Monitor,
+  Moon,
   Plus,
   Radio,
   RefreshCw,
@@ -90,6 +92,7 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
+  Sun,
   Pencil,
   Trash2,
   UploadCloud,
@@ -790,6 +793,7 @@ declare global {
       cleanUnusedMedia: DataSettingsApi['cleanUnusedMedia'];
       revealDataPath: DataSettingsApi['revealDataPath'];
       onDataBackupCompleted?: DataSettingsApi['onDataBackupCompleted'];
+      setAppTheme?: (theme: 'dark' | 'light' | 'system') => Promise<{ ok: boolean; shouldUseDarkColors: boolean }>;
     };
   }
 }
@@ -817,6 +821,40 @@ export const App: React.FC = () => {
     settings: false,
   });
   const [dbLimitLevel, setDbLimitLevel] = useState<'ok' | 'warning' | 'critical'>('ok');
+  const [appTheme, setAppTheme] = useState<'dark' | 'light' | 'system'>(() => {
+    try {
+      const saved = window.localStorage.getItem('webring-studio-theme');
+      if (saved === 'light' || saved === 'dark' || saved === 'system') return saved;
+    } catch {
+      // ignore storage errors
+    }
+    return 'dark';
+  });
+  useEffect(() => {
+    const apply = () => {
+      const resolved =
+        appTheme === 'system'
+          ? window.matchMedia?.('(prefers-color-scheme: light)').matches
+            ? 'light'
+            : 'dark'
+          : appTheme;
+      document.documentElement.dataset.theme = resolved;
+    };
+    apply();
+    try {
+      window.localStorage.setItem('webring-studio-theme', appTheme);
+    } catch {
+      // ignore
+    }
+    void window.studioApi?.setAppTheme?.(appTheme);
+    if (appTheme !== 'system' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: light)');
+    const onChange = () => apply();
+    mq.addEventListener?.('change', onChange);
+    return () => mq.removeEventListener?.('change', onChange);
+  }, [appTheme]);
+  const cycleAppTheme = () =>
+    setAppTheme((prev) => (prev === 'dark' ? 'light' : prev === 'light' ? 'system' : 'dark'));
   const toggleSidebarSection = (section: SidebarSectionId) =>
     setOpenSidebarSections((prev) => ({ ...prev, [section]: !prev[section] }));
   useEffect(() => {
@@ -3242,6 +3280,22 @@ export const App: React.FC = () => {
                 </div>
               )
             )}
+            <button
+              type="button"
+              onClick={cycleAppTheme}
+              className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 border border-slate-700 transition"
+              title={`Theme: ${appTheme} (click to cycle Dark / Light / System)`}
+              aria-label={`Color theme: ${appTheme}. Click to switch.`}
+            >
+              {appTheme === 'light' ? (
+                <Sun className="w-3.5 h-3.5 text-amber-400" />
+              ) : appTheme === 'system' ? (
+                <Monitor className="w-3.5 h-3.5 text-sky-400" />
+              ) : (
+                <Moon className="w-3.5 h-3.5 text-indigo-300" />
+              )}
+              <span className="capitalize">{appTheme}</span>
+            </button>
             <button
               onClick={handleSyncAllFriends}
               disabled={isSyncingFriends}
