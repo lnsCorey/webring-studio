@@ -393,6 +393,14 @@ function mediaSrc(url: string): string {
   return url.startsWith('media/') ? `studio-media://local/${url.slice('media/'.length)}` : url;
 }
 
+/** Resolves a specific persona's local media URL (each persona has its own isolated media-store folder). */
+function personaMediaSrc(personaId: string, url: string): string {
+  if (!url) return '';
+  return url.startsWith('media/')
+    ? `studio-media://persona/${encodeURIComponent(personaId)}/${url.slice('media/'.length)}`
+    : url;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
@@ -1646,8 +1654,12 @@ export const App: React.FC = () => {
     try {
       const result = await window.studioApi.setProfileImage(kind, filePath);
       if (!result) return;
-      if (kind === 'avatar') setAvatarUrl(result.url);
-      else setBannerUrl(result.url);
+      if (kind === 'avatar') {
+        setAvatarUrl(result.url);
+        setPersonas((prev) => prev.map((p) => (p.id === activePersonaId ? { ...p, avatarUrl: result.url } : p)));
+      } else {
+        setBannerUrl(result.url);
+      }
       setBundle((prev) => (prev ? { ...prev, profile: { ...prev.profile, [kind === 'avatar' ? 'avatarUrl' : 'bannerUrl']: result.url } } : prev));
       notify(kind === 'avatar' ? 'Profile photo uploaded and saved.' : 'Banner image uploaded and saved.');
     } catch (err) {
@@ -3017,7 +3029,9 @@ export const App: React.FC = () => {
           >
             <img
               src={
-                bundle.profile.avatarUrl || localAvatarDataUri(bundle.profile.siteUrl || bundle.profile.displayName)
+                bundle.profile.avatarUrl
+                  ? personaMediaSrc(activePersonaId, bundle.profile.avatarUrl)
+                  : localAvatarDataUri(bundle.profile.siteUrl || bundle.profile.displayName)
               }
               alt={bundle.profile.displayName}
               className="w-7 h-7 rounded-md object-cover border border-slate-700 shrink-0"
@@ -5024,7 +5038,11 @@ export const App: React.FC = () => {
                             <div className="flex items-start justify-between gap-3">
                               <div className="flex items-center gap-2.5 min-w-0">
                                 <img
-                                  src={friendAvatarSrc(entry.friendAvatarUrl, entry.friendSiteUrl)}
+                                  src={
+                                    entry.isMine && entry.friendAvatarUrl
+                                      ? personaMediaSrc(activePersonaId, entry.friendAvatarUrl)
+                                      : friendAvatarSrc(entry.friendAvatarUrl, entry.friendSiteUrl)
+                                  }
                                   referrerPolicy="no-referrer"
                                   alt={entry.friendName}
                                   className="w-8 h-8 rounded-full object-cover shrink-0"
@@ -9425,7 +9443,9 @@ git push -u origin main --force`}
                           <div className="flex items-center gap-3 min-w-0">
                             <img
                               src={
-                                p.avatarUrl || localAvatarDataUri(p.displayName)
+                                p.avatarUrl
+                                  ? personaMediaSrc(p.id, p.avatarUrl)
+                                  : localAvatarDataUri(p.siteUrl || p.displayName)
                               }
                               alt={p.displayName}
                               className="w-12 h-12 rounded-xl object-cover border border-slate-700 shrink-0"
