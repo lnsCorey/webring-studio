@@ -208,5 +208,27 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.on('webring:deep-link', listener);
     return () => ipcRenderer.removeListener('webring:deep-link', listener);
   },
+  // Settings -> Data (Dashboard, Database, Backup & Restore)
+  getDataDashboard: () => ipcRenderer.invoke('studio:data-get-dashboard'),
+  getDatabaseStatus: () => ipcRenderer.invoke('studio:data-get-db-status'),
+  getDataSettings: () => ipcRenderer.invoke('studio:data-get-settings'),
+  saveDataSettings: (patch: unknown) => ipcRenderer.invoke('studio:data-save-settings', patch),
+  chooseBackupFolder: () => ipcRenderer.invoke('studio:data-choose-backup-folder'),
+  pickRestoreFile: () => ipcRenderer.invoke('studio:data-pick-restore-file'),
+  listBackups: () => ipcRenderer.invoke('studio:data-list-backups'),
+  runBackup: (options?: { scope?: 'active' | 'all'; targetDir?: string }) =>
+    ipcRenderer.invoke('studio:data-run-backup', options),
+  deleteBackup: (filePath: string) => ipcRenderer.invoke('studio:data-delete-backup', filePath),
+  restoreBackup: (filePath: string, personaId?: string) =>
+    ipcRenderer.invoke('studio:data-restore-backup', filePath, personaId),
+  compactDatabase: () => ipcRenderer.invoke('studio:data-compact-db'),
+  checkDatabaseIntegrity: () => ipcRenderer.invoke('studio:data-check-integrity'),
+  cleanUnusedMedia: () => ipcRenderer.invoke('studio:data-clean-unused-media'),
+  revealDataPath: (targetPath: string) => ipcRenderer.invoke('studio:data-reveal-path', targetPath),
+  onDataBackupCompleted: (callback: (result: unknown) => void) => {
+    const listener = (_event: unknown, result: unknown) => callback(result);
+    ipcRenderer.on('studio:data-backup-completed', listener);
+    return () => ipcRenderer.removeListener('studio:data-backup-completed', listener);
+  },
 });
 

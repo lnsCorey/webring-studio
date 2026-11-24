@@ -4880,7 +4880,100 @@ export class StudioDatabase {
     };
   }
 
+  public getDatabaseDiagnostics(): {
+    sqliteVersion: string;
+    schemaVersion: number;
+    fileSizeBytes: number;
+    walSizeBytes: number;
+    shmSizeBytes: number;
+    totalSizeBytes: number;
+    pageSize: number;
+    pageCount: number;
+    freelistCount: number;
+  } {
+    const versionRow = this.db.prepare('SELECT sqlite_version() AS v').get() as { v?: string } | undefined;
+    const userVerRow = this.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
+    const pageSizeRow = this.db.prepare('PRAGMA page_size').get() as { page_size?: number } | undefined;
+    const pageCountRow = this.db.prepare('PRAGMA page_count').get() as { page_count?: number } | undefined;
+    const freelistRow = this.db.prepare('PRAGMA freelist_count').get() as { freelist_count?: number } | undefined;
+
+    const safeSize = (p: string) => {
+      try {
+        return fs.existsSync(p) ? fs.statSync(p).size : 0;
+      } catch {
+        return 0;
+      }
+    };
+    const fileSizeBytes = safeSize(this.dbPath);
+    const walSizeBytes = safeSize(`${this.dbPath}-wal`);
+    const shmSizeBytes = safeSize(`${this.dbPath}-shm`);
+    return {
+      sqliteVersion: String(versionRow?.v || 'unknown'),
+      schemaVersion: Number(userVerRow?.user_version ?? 0),
+      fileSizeBytes,
+      walSizeBytes,
+      shmSizeBytes,
+      totalSizeBytes: fileSizeBytes + walSizeBytes + shmSizeBytes,
+      pageSize: Number(pageSizeRow?.page_size ?? 4096),
+      pageCount: Number(pageCountRow?.page_count ?? 0),
+      freelistCount: Number(freelistRow?.freelist_count ?? 0),
+    };
+  }
+
+  /** Creates an atomic, compacted, WAL-safe backup of this database at `destFilePath`. */
+  public vacuumInto(destFilePath: string): void {
+    fs.mkdirSync(path.dirname(destFilePath), { recursive: true });
+    if (fs.existsSync(destFilePath)) {
+      fs.rmSync(destFilePath, { force: true });
+    }
+    this.db.prepare('VACUUM INTO ?').run(destFilePath);
+  }
+
+  /** Truncates the WAL and runs VACUUM to reclaim unused disk space. */
+  public compact(): { beforeBytes: number; afterBytes: number; freedBytes: number } {
+    const beforeBytes = this.getDatabaseDiagnostics().totalSizeBytes;
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    this.db.exec('VACUUM');
+    const afterBytes = this.getDatabaseDiagnostics().totalSizeBytes;
+    return {
+      beforeBytes,
+      afterBytes,
+      freedBytes: Math.max(0, beforeBytes - afterBytes),
+    };
+  }
+
+  /** Runs SQLite PRAGMA integrity_check on this database. */
+  public checkIntegrity(): { ok: boolean; messages: string[] } {
+    const rows = this.db.prepare('PRAGMA integrity_check').all() as Array<Record<string, unknown>>;
+    const messages = rows.map((r) => String(Object.values(r)[0] ?? '')).filter(Boolean);
+    const ok = messages.length === 1 && messages[0].toLowerCase() === 'ok';
+    return { ok, messages };
+  }
+
   public close(): void {
     this.db.close();
+  }
+}
+
+/** Validates an external SQLite file with PRAGMA integrity_check before restoring it. */
+export function checkSqliteFileIntegrity(filePath: string): { ok: boolean; messages: string[] } {
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    return { ok: false, messages: ['Backup file does not exist.'] };
+  }
+  let adapter: ReturnType<typeof openSqliteAdapter> | null = null;
+  try {
+    adapter = openSqliteAdapter(filePath);
+    const rows = adapter.prepare('PRAGMA integrity_check').all() as Array<Record<string, unknown>>;
+    const messages = rows.map((r) => String(Object.values(r)[0] ?? '')).filter(Boolean);
+    const ok = messages.length === 1 && messages[0].toLowerCase() === 'ok';
+    return { ok, messages };
+  } catch (err) {
+    return { ok: false, messages: [err instanceof Error ? err.message : String(err)] };
+  } finally {
+    try {
+      adapter?.close();
+    } catch {
+      // ignore close errors
+    }
   }
 }
