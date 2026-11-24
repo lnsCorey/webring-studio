@@ -57,6 +57,7 @@ import {
   deleteAlbumWithFiles,
   deletePhotoWithFiles,
   importPhotosIntoAlbum,
+  MediaLibrary,
   replacePhotoImage,
   setProfileImageFromFile,
 } from './services/mediaLibrary';
@@ -712,9 +713,27 @@ if (!gotTheLock) {
         ? null
         : showSplash(assetPath('splash.html'));
     protocol.handle('studio-media', (request) => {
-      // Studio uses studio-media://local/<path>; the site preview's <base> gives studio-media://local/media/<path>
-      const relative = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, '')).replace(/^media\//, '');
-      const file = personaManager.getActiveContext().mediaLibrary.resolveLocalUrl(`media/${relative}`);
+      // Studio uses:
+      // - studio-media://local/<path> for the active persona's Media Library (preview's <base> gives /media/<path>)
+      // - studio-media://persona/<personaId>/<path> for a specific persona's Media Library (e.g. Persona Switcher)
+      const parsed = new URL(request.url);
+      const rawPath = decodeURIComponent(parsed.pathname.replace(/^\/+/, ''));
+      let file: string | null = null;
+      if (parsed.hostname === 'persona') {
+        const slashIdx = rawPath.indexOf('/');
+        if (slashIdx > 0) {
+          const personaId = rawPath.slice(0, slashIdx);
+          const relative = rawPath.slice(slashIdx + 1).replace(/^media\//, '');
+          const rec = personaManager.listPersonaRecords().find((p) => p.id === personaId);
+          if (rec) {
+            const lib = new MediaLibrary(path.join(personaManager.getUserDataDir(), rec.mediaDirName));
+            file = lib.resolveLocalUrl(`media/${relative}`);
+          }
+        }
+      } else {
+        const relative = rawPath.replace(/^media\//, '');
+        file = personaManager.getActiveContext().mediaLibrary.resolveLocalUrl(`media/${relative}`);
+      }
       if (!file || !fs.existsSync(file)) return new Response('Not found', { status: 404 });
       return net.fetch(pathToFileURL(file).toString());
     });
