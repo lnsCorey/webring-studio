@@ -13,6 +13,7 @@ import {
   THEME_LABELS,
 } from '../shared/schema';
 import { MarkdownField } from './MarkdownField';
+import { HorizontalTabs } from './HorizontalTabs';
 
 /**
  * Site Design: the look & feel options and the ordered content blocks of the published page.
@@ -191,6 +192,7 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
   const [theme, setTheme] = useState<ProfileTheme>(props.theme);
   const [appearance, setAppearance] = useState<Appearance>(props.appearance || {});
   const [layout, setLayout] = useState<LayoutBlock[]>(props.layout ?? DEFAULT_LAYOUT);
+  const [designTab, setDesignTab] = useState<'templates' | 'styling' | 'layout'>('templates');
   const [expanded, setExpanded] = useState<string | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
@@ -454,210 +456,229 @@ export function SiteDesignPanel(props: SiteDesignPanelProps) {
   };
 
   return (
-    <div className="space-y-5">
-      {/* Look & feel */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="font-bold text-sm">Look &amp; feel</h3>
-          {saving && <span className="text-[10px] text-slate-500">Saving…</span>}
-        </div>
-        {(
-          [
-            ['classic', 'Classic themes', 'Colours and fonts over the standard page.'],
-            ['social', 'Social-style templates', 'These also rearrange the page. Your blocks keep their order within it.'],
-          ] as const
-        ).map(([group, heading, note]) => (
-          <div key={group}>
-            <p className="text-xs text-slate-400">{heading}</p>
-            <p className="text-[11px] text-slate-500 mb-1.5">{note}</p>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2" role="radiogroup" aria-label={heading}>
-              {THEMES.filter((t) => t.group === group).map((t) => (
-                <button
-                  key={t.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={theme === t.id}
-                  onClick={() => chooseTheme(t.id)}
-                  className={`text-left p-1.5 rounded-lg border ${theme === t.id ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-800 hover:border-slate-600'}`}
-                >
-                  <ThemeThumb option={t} />
-                  <span className="block text-xs font-semibold text-slate-100 mt-1">{THEME_LABELS[t.id]}</span>
-                  <span className="block text-[10px] text-slate-400 leading-tight">{t.hint}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
-        {themeOption.suggestedOrder && (
-          <button
-            type="button"
-            onClick={applySuggestedOrder}
-            className="text-[11px] px-2.5 py-1 rounded-lg border border-slate-700 hover:border-slate-500 text-slate-300"
-          >
-            Use {THEME_LABELS[theme]}'s suggested block order
-          </button>
-        )}
-        <div>
-          <p className="text-xs text-slate-400 mb-1.5">Accent colour</p>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => updateAppearance({ accent: undefined })}
-              className={`h-7 px-2 rounded-lg text-[10px] border ${!appearance.accent ? 'border-white' : 'border-slate-700'} bg-slate-950`}
-            >
-              Theme
-            </button>
-            {ACCENTS.map((color) => (
-              <button
-                key={color}
-                type="button"
-                aria-label={`Accent ${color}`}
-                onClick={() => updateAppearance({ accent: color })}
-                className={`w-7 h-7 rounded-lg border-2 ${appearance.accent === color ? 'border-white' : 'border-transparent'}`}
-                style={{ background: color }}
-              />
-            ))}
-            <input
-              type="color"
-              aria-label="Custom accent colour"
-              value={appearance.accent || '#6366f1'}
-              onChange={(e) => updateAppearance({ accent: e.target.value })}
-              className="w-9 h-7 rounded-lg bg-transparent border border-slate-700 cursor-pointer"
-            />
-          </div>
-          {accentContrast !== null && accentContrast < 3 && (
-            <p className="text-[11px] text-amber-300 mt-1.5">
-              This colour is hard to see on this theme's background (contrast {accentContrast.toFixed(1)}:1). Try a
-              {contrastRatio(themeBackground, '#000000') > contrastRatio(themeBackground, '#ffffff') ? ' darker' : ' lighter'} shade.
-            </p>
-          )}
-        </div>
-        <div className="grid grid-cols-2 gap-2 text-xs text-slate-400">
-          {(
-            [
-              ['font', 'Font', [['theme', 'As theme'], ['sans', 'Sans'], ['serif', 'Serif'], ['rounded', 'Rounded'], ['mono', 'Mono']]],
-              ['corners', 'Corners', [['rounded', 'Rounded'], ['sharp', 'Sharp'], ['soft', 'Extra soft']]],
-              ['surface', 'Sections', [['card', 'Cards'], ['flat', 'Flat']]],
-              ['background', 'Background', [['theme', 'As theme'], ['gradient', 'Accent glow'], ['banner-blur', 'Blurred banner']]],
-              ['bannerHeight', 'Banner height', [['medium', 'Medium'], ['short', 'Short'], ['tall', 'Tall']]],
-              ['avatarShape', 'Profile photo', [['rounded', 'Rounded square'], ['circle', 'Circle']]],
-              ['interactions', 'Interactive extras', [['on', 'On (lightbox, post view)'], ['off', 'Off']]],
-            ] as const
-          ).map(([key, label, choices]) => (
-            <label key={key} className="block">
-              {label}
-              <select
-                className={`${selectClass} w-full mt-1 text-slate-100`}
-                value={(appearance[key] as string | undefined) || choices[0][0]}
-                onChange={(e) => updateAppearance({ [key]: e.target.value } as Partial<Appearance>)}
-              >
-                {choices.map(([value, text]) => (
-                  <option key={value} value={value}>{text}</option>
-                ))}
-              </select>
-            </label>
-          ))}
-        </div>
+    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="font-bold text-sm">Site Design</h3>
+        {saving && <span className="text-[10px] text-slate-500">Saving…</span>}
       </div>
 
-      {/* Page layout */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-        <div>
-          <h3 className="font-bold text-sm">Page layout</h3>
-          <p className="text-[11px] text-slate-400 mt-0.5">
+      <HorizontalTabs
+        ariaLabel="Site design sections"
+        tabs={[
+          { id: 'templates', label: 'Templates' },
+          { id: 'styling', label: 'Styling', alert: Boolean(accentContrast !== null && accentContrast < 3) },
+          { id: 'layout', label: 'Page Layout', badge: layout.length },
+        ]}
+        activeId={designTab}
+        onChange={(id) => setDesignTab(id as 'templates' | 'styling' | 'layout')}
+      />
+
+      {/* Tab 1: Templates */}
+      {designTab === 'templates' && (
+        <div className="space-y-3">
+          {(
+            [
+              ['classic', 'Classic themes', 'Colours and fonts over the standard page.'],
+              ['social', 'Social-style templates', 'These also rearrange the page. Your blocks keep their order within it.'],
+            ] as const
+          ).map(([group, heading, note]) => (
+            <div key={group}>
+              <p className="text-xs font-semibold text-slate-300">{heading}</p>
+              <p className="text-[11px] text-slate-500 mb-1.5">{note}</p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-2 gap-2" role="radiogroup" aria-label={heading}>
+                {THEMES.filter((t) => t.group === group).map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={theme === t.id}
+                    onClick={() => chooseTheme(t.id)}
+                    className={`text-left p-1.5 rounded-lg border ${theme === t.id ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-800 hover:border-slate-600'}`}
+                  >
+                    <ThemeThumb option={t} />
+                    <span className="block text-xs font-semibold text-slate-100 mt-1">{THEME_LABELS[t.id]}</span>
+                    <span className="block text-[10px] text-slate-400 leading-tight">{t.hint}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+          {themeOption.suggestedOrder && (
+            <button
+              type="button"
+              onClick={applySuggestedOrder}
+              className="text-[11px] px-2.5 py-1.5 rounded-lg border border-slate-700 hover:border-slate-500 text-slate-300"
+            >
+              Use {THEME_LABELS[theme]}'s suggested block order
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Tab 2: Styling */}
+      {designTab === 'styling' && (
+        <div className="space-y-4">
+          <div>
+            <p className="text-xs font-semibold text-slate-300 mb-1.5">Accent colour</p>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => updateAppearance({ accent: undefined })}
+                className={`h-7 px-2 rounded-lg text-[10px] border ${!appearance.accent ? 'border-white' : 'border-slate-700'} bg-slate-950`}
+              >
+                Theme
+              </button>
+              {ACCENTS.map((color) => (
+                <button
+                  key={color}
+                  type="button"
+                  aria-label={`Accent ${color}`}
+                  onClick={() => updateAppearance({ accent: color })}
+                  className={`w-7 h-7 rounded-lg border-2 ${appearance.accent === color ? 'border-white' : 'border-transparent'}`}
+                  style={{ background: color }}
+                />
+              ))}
+              <input
+                type="color"
+                aria-label="Custom accent colour"
+                value={appearance.accent || '#6366f1'}
+                onChange={(e) => updateAppearance({ accent: e.target.value })}
+                className="w-9 h-7 rounded-lg bg-transparent border border-slate-700 cursor-pointer"
+              />
+            </div>
+            {accentContrast !== null && accentContrast < 3 && (
+              <p className="text-[11px] text-amber-300 mt-1.5">
+                This colour is hard to see on this theme's background (contrast {accentContrast.toFixed(1)}:1). Try a
+                {contrastRatio(themeBackground, '#000000') > contrastRatio(themeBackground, '#ffffff') ? ' darker' : ' lighter'} shade.
+              </p>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-2.5 text-xs text-slate-400">
+            {(
+              [
+                ['font', 'Font', [['theme', 'As theme'], ['sans', 'Sans'], ['serif', 'Serif'], ['rounded', 'Rounded'], ['mono', 'Mono']]],
+                ['corners', 'Corners', [['rounded', 'Rounded'], ['sharp', 'Sharp'], ['soft', 'Extra soft']]],
+                ['surface', 'Sections', [['card', 'Cards'], ['flat', 'Flat']]],
+                ['background', 'Background', [['theme', 'As theme'], ['gradient', 'Accent glow'], ['banner-blur', 'Blurred banner']]],
+                ['bannerHeight', 'Banner height', [['medium', 'Medium'], ['short', 'Short'], ['tall', 'Tall']]],
+                ['avatarShape', 'Profile photo', [['rounded', 'Rounded square'], ['circle', 'Circle']]],
+                ['interactions', 'Interactive extras', [['on', 'On (lightbox, post view)'], ['off', 'Off']]],
+              ] as const
+            ).map(([key, label, choices]) => (
+              <label key={key} className="block">
+                {label}
+                <select
+                  className={`${selectClass} w-full mt-1 text-slate-100`}
+                  value={(appearance[key] as string | undefined) || choices[0][0]}
+                  onChange={(e) => updateAppearance({ [key]: e.target.value } as Partial<Appearance>)}
+                >
+                  {choices.map(([value, text]) => (
+                    <option key={value} value={value}>{text}</option>
+                  ))}
+                </select>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Tab 3: Page Layout */}
+      {designTab === 'layout' && (
+        <div className="space-y-3">
+          <p className="text-[11px] text-slate-400">
             Your banner, photo, name, bio and links stay at the top. Drag the blocks below to arrange the rest of
             the page.
           </p>
-        </div>
-        <ul className="space-y-1.5">
-          {layout.map((block, index) => (
-            <li
-              key={block.id}
-              draggable
-              onDragStart={() => setDragIndex(index)}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={() => {
-                if (dragIndex !== null) move(dragIndex, index);
-                setDragIndex(null);
-              }}
-              onDragEnd={() => setDragIndex(null)}
-              className={`rounded-xl border ${dragIndex === index ? 'border-indigo-400' : 'border-slate-800'} bg-slate-950`}
-            >
-              <div className="flex items-center gap-1.5 px-2 py-1.5">
-                <GripVertical className="w-4 h-4 text-slate-500 cursor-grab shrink-0" aria-hidden />
-                <button
-                  type="button"
-                  onClick={() => setExpanded(expanded === block.id ? null : block.id)}
-                  className={`flex-1 text-left text-xs font-medium truncate ${block.visible ? '' : 'text-slate-500 line-through'}`}
-                >
-                  {block.title || BLOCK_LABELS[block.type]}
-                  {block.title && <span className="text-slate-500 font-normal"> · {BLOCK_LABELS[block.type]}</span>}
-                </button>
-                <button type="button" title="Move up" disabled={index === 0} onClick={() => move(index, index - 1)} className="p-1 rounded hover:bg-slate-800 disabled:opacity-30">
-                  <ArrowUp className="w-3.5 h-3.5" />
-                </button>
-                <button type="button" title="Move down" disabled={index === layout.length - 1} onClick={() => move(index, index + 1)} className="p-1 rounded hover:bg-slate-800 disabled:opacity-30">
-                  <ArrowDown className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  title={block.visible ? 'Hide' : 'Show'}
-                  onClick={() => updateBlock(block.id, (b) => ({ ...b, visible: !b.visible }), 100)}
-                  className="p-1 rounded hover:bg-slate-800"
-                >
-                  {block.visible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-slate-500" />}
-                </button>
-                <button
-                  type="button"
-                  title="Remove block"
-                  onClick={() => updateLayout(layout.filter((b) => b.id !== block.id), 100)}
-                  className="p-1 rounded hover:bg-slate-800 text-rose-300"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </div>
-              {expanded === block.id && (
-                <div className="px-3 pb-3 pt-1 space-y-2 border-t border-slate-800">
-                  <input
-                    className={inputClass}
-                    placeholder="Heading (leave empty for the default)"
-                    value={block.title ?? ''}
-                    onChange={(e) => updateBlock(block.id, (b) => ({ ...b, title: e.target.value || undefined }), 900)}
-                  />
-                  {renderBlockSettings(block)}
+          <ul className="space-y-1.5">
+            {layout.map((block, index) => (
+              <li
+                key={block.id}
+                draggable
+                onDragStart={() => setDragIndex(index)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => {
+                  if (dragIndex !== null) move(dragIndex, index);
+                  setDragIndex(null);
+                }}
+                onDragEnd={() => setDragIndex(null)}
+                className={`rounded-xl border ${dragIndex === index ? 'border-indigo-400' : 'border-slate-800'} bg-slate-950`}
+              >
+                <div className="flex items-center gap-1.5 px-2 py-1.5">
+                  <GripVertical className="w-4 h-4 text-slate-500 cursor-grab shrink-0" aria-hidden />
+                  <button
+                    type="button"
+                    onClick={() => setExpanded(expanded === block.id ? null : block.id)}
+                    className={`flex-1 text-left text-xs font-medium truncate ${block.visible ? '' : 'text-slate-500 line-through'}`}
+                  >
+                    {block.title || BLOCK_LABELS[block.type]}
+                    {block.title && <span className="text-slate-500 font-normal"> · {BLOCK_LABELS[block.type]}</span>}
+                  </button>
+                  <button type="button" title="Move up" disabled={index === 0} onClick={() => move(index, index - 1)} className="p-1 rounded hover:bg-slate-800 disabled:opacity-30">
+                    <ArrowUp className="w-3.5 h-3.5" />
+                  </button>
+                  <button type="button" title="Move down" disabled={index === layout.length - 1} onClick={() => move(index, index + 1)} className="p-1 rounded hover:bg-slate-800 disabled:opacity-30">
+                    <ArrowDown className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    title={block.visible ? 'Hide' : 'Show'}
+                    onClick={() => updateBlock(block.id, (b) => ({ ...b, visible: !b.visible }), 100)}
+                    className="p-1 rounded hover:bg-slate-800"
+                  >
+                    {block.visible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-slate-500" />}
+                  </button>
+                  <button
+                    type="button"
+                    title="Remove block"
+                    onClick={() => updateLayout(layout.filter((b) => b.id !== block.id), 100)}
+                    className="p-1 rounded hover:bg-slate-800 text-rose-300"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
                 </div>
-              )}
-            </li>
-          ))}
-        </ul>
-        {layout.length < MAX_LAYOUT_BLOCKS && (
-          <div className="flex flex-wrap items-center gap-2">
-            <Plus className="w-3.5 h-3.5 text-slate-400" />
-            <select
-              className={selectClass}
-              value=""
-              onChange={(e) => {
-                if (!e.target.value) return;
-                const block = newBlock(e.target.value as LayoutBlockType);
-                updateLayout([...layout, block], 100);
-                setExpanded(block.id);
-              }}
-            >
-              <option value="">Add a block…</option>
-              {(Object.keys(BLOCK_LABELS) as LayoutBlockType[]).map((type) => (
-                <option key={type} value={type}>{BLOCK_LABELS[type]}</option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={() => updateLayout(DEFAULT_LAYOUT.map((b) => ({ ...b })), 100)}
-              className="ml-auto text-[11px] text-slate-400 hover:text-white"
-            >
-              Reset to default
-            </button>
-          </div>
-        )}
-      </div>
+                {expanded === block.id && (
+                  <div className="px-3 pb-3 pt-1 space-y-2 border-t border-slate-800">
+                    <input
+                      className={inputClass}
+                      placeholder="Heading (leave empty for the default)"
+                      value={block.title ?? ''}
+                      onChange={(e) => updateBlock(block.id, (b) => ({ ...b, title: e.target.value || undefined }), 900)}
+                    />
+                    {renderBlockSettings(block)}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+          {layout.length < MAX_LAYOUT_BLOCKS && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Plus className="w-3.5 h-3.5 text-slate-400" />
+              <select
+                className={selectClass}
+                value=""
+                onChange={(e) => {
+                  if (!e.target.value) return;
+                  const block = newBlock(e.target.value as LayoutBlockType);
+                  updateLayout([...layout, block], 100);
+                  setExpanded(block.id);
+                }}
+              >
+                <option value="">Add a block…</option>
+                {(Object.keys(BLOCK_LABELS) as LayoutBlockType[]).map((type) => (
+                  <option key={type} value={type}>{BLOCK_LABELS[type]}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => updateLayout(DEFAULT_LAYOUT.map((b) => ({ ...b })), 100)}
+                className="ml-auto text-[11px] text-slate-400 hover:text-white"
+              >
+                Reset to default
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
