@@ -111,6 +111,12 @@ These are added to the six rules above:
 - `webringHubSupports(record, id)` is true only for a known id at the API version Studio speaks.
 - The Publish tab shows each hub's extensions as badges.
 
+### social (Conversations)
+
+The hub's `social` extension reads the items `webhook-sync` collected and adds threads (comments matched to the post they target), reactions, member reports and moderation, an activity view, events with RSVPs and a calendar feed, polls, an asks & offers board and a weekly digest. Reactions, RSVPs, votes and reports are stored on the hub only for members who opted in, under the DID they signed in with; posts, comments, events and asks/offers stay on members' own sites.
+
+Studio's part is publishing: a post with `event` or `listing` details (see `SPEC.md`, "Events and asks/offers") appears on the hub's Events or Asks & offers page after the site syncs. Replies are ordinary `comment` items whose `targetUrl` is the post's canonical URL, which the hub feed view's Reply action already creates.
+
 ### key-witness (first extension)
 
 The Tier 2 "cross-check" and "key history" items, built as an extension.

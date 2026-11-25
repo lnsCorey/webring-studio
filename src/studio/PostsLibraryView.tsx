@@ -6,6 +6,7 @@ import { MarkdownField } from './MarkdownField';
 import { ItemEdit, ItemEditor } from './ItemEditor';
 import { StudioViewMode, ViewModeToggle, loadViewMode, saveViewMode } from './ViewModeToggle';
 import { ItemFilterType, filterAndSortItems } from './studioFilters';
+import { PostExtrasDraft, PostExtrasFields, formatEventWhen } from './PostExtras';
 
 export interface PostsLibraryViewProps {
   items: SharedItem[];
@@ -30,6 +31,8 @@ export interface PostsLibraryViewProps {
   setItemCommentary: (v: string) => void;
   itemTags: string;
   setItemTags: (v: string) => void;
+  itemExtras: PostExtrasDraft;
+  setItemExtras: (d: PostExtrasDraft) => void;
   handlePickLocalPostImage: () => void;
   handleCreateItem: (e: React.FormEvent) => Promise<void> | void;
   editingItemId: string | null;
@@ -47,6 +50,20 @@ const TYPE_META: Record<SharedItemType, { label: string; badgeClass: string }> =
   recommendation: { label: 'Recommend', badgeClass: 'bg-amber-500/20 text-amber-300 border border-amber-500/30' },
   comment: { label: 'Comment', badgeClass: 'bg-purple-500/20 text-purple-300 border border-purple-500/30' },
 };
+
+/** The badge for an item: events and asks/offers are posts but get their own label. */
+function itemMeta(item: SharedItem): { label: string; badgeClass: string } {
+  if (item.type === 'post' && item.event) {
+    return { label: 'Event', badgeClass: 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30' };
+  }
+  if (item.type === 'post' && item.listing) {
+    const closed = item.listing.status === 'closed' ? ' · closed' : '';
+    return item.listing.kind === 'ask'
+      ? { label: `Ask${closed}`, badgeClass: 'bg-rose-500/20 text-rose-300 border border-rose-500/30' }
+      : { label: `Offer${closed}`, badgeClass: 'bg-lime-500/20 text-lime-300 border border-lime-500/30' };
+  }
+  return TYPE_META[item.type] || TYPE_META.post;
+}
 
 function formatDate(iso?: string): string {
   if (!iso) return '';
@@ -188,7 +205,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
       ) : viewMode === 'list' ? (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden divide-y divide-slate-800">
           {filteredItems.map((item) => {
-            const meta = TYPE_META[item.type] || TYPE_META.post;
+            const meta = itemMeta(item);
             const commentCount = endorsements.filter(
               (e) => e.targetCanonicalUrl === item.canonicalUrl && e.type === 'comment'
             ).length;
@@ -247,7 +264,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filteredItems.map((item) => {
-            const meta = TYPE_META[item.type] || TYPE_META.post;
+            const meta = itemMeta(item);
             const commentCount = endorsements.filter(
               (e) => e.targetCanonicalUrl === item.canonicalUrl && e.type === 'comment'
             ).length;
@@ -322,8 +339,8 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
           >
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-2">
-                <span className={`text-[11px] uppercase font-bold px-2.5 py-0.5 rounded-full ${(TYPE_META[selectedItem.type] || TYPE_META.post).badgeClass}`}>
-                  {(TYPE_META[selectedItem.type] || TYPE_META.post).label}
+                <span className={`text-[11px] uppercase font-bold px-2.5 py-0.5 rounded-full ${itemMeta(selectedItem).badgeClass}`}>
+                  {itemMeta(selectedItem).label}
                 </span>
                 <span className="text-xs text-slate-500">{formatDate(selectedItem.createdAt)}</span>
                 {selectedItem.updatedAt && <span className="text-[11px] text-slate-500">(edited)</span>}
@@ -375,6 +392,13 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
             ) : (
               <div className="space-y-3">
                 <h3 className="text-xl font-bold text-white">{selectedItem.title}</h3>
+                {selectedItem.event && (
+                  <div className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-3 text-sm text-slate-200 space-y-1">
+                    <p>📅 {formatEventWhen(selectedItem.event)}</p>
+                    {selectedItem.event.location && <p>📍 {selectedItem.event.location}</p>}
+                    {selectedItem.event.url && <p className="break-all">🔗 {selectedItem.event.url}</p>}
+                  </div>
+                )}
                 {selectedItem.targetUrl && selectedItem.targetUrl !== selectedItem.canonicalUrl && (
                   <p className="text-xs text-indigo-400 font-mono break-all">Target: {selectedItem.targetUrl}</p>
                 )}
@@ -488,6 +512,12 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
 
               {itemType === 'post' ? (
                 <>
+                  <PostExtrasFields
+                    draft={props.itemExtras}
+                    onChange={props.setItemExtras}
+                    fieldClass="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                    labelClass="block text-xs text-slate-400 mb-1"
+                  />
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     <div className="md:col-span-2">
                       <label className="block text-xs text-slate-400 mb-1">

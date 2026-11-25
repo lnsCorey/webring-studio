@@ -28,6 +28,7 @@ import { HorizontalTabs } from './HorizontalTabs';
 import { DataSettingsApi, DataSettingsView } from './DataSettingsView';
 import { MediaLibraryView } from './MediaLibraryView';
 import { PostsLibraryView } from './PostsLibraryView';
+import { EMPTY_POST_EXTRAS, PostExtrasDraft, extrasToFields } from './PostExtras';
 import { FriendEdit, FriendEditor } from './FriendEditor';
 import { SavedPostView, SavedPostsView } from './SavedPostsView';
 import { FriendAlbumView } from './FriendAlbumView';
@@ -1043,6 +1044,7 @@ export const App: React.FC = () => {
   const [itemMediaUrl, setItemMediaUrl] = useState('');
   const [itemRating, setItemRating] = useState<number>(5);
   const [itemTags, setItemTags] = useState('');
+  const [itemExtras, setItemExtras] = useState<PostExtrasDraft>(EMPTY_POST_EXTRAS);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
 
   // New Friend & Webring state
@@ -1950,8 +1952,23 @@ export const App: React.FC = () => {
     } else {
       if (!itemTitle.trim() || !itemTargetUrl.trim()) return;
     }
+    let postFields: ReturnType<typeof extrasToFields> = { event: null, listing: null };
+    if (itemType === 'post') {
+      try {
+        postFields = extrasToFields(itemExtras);
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      if (postFields.event && !itemTitle.trim()) {
+        notify('Give the event a title.');
+        return;
+      }
+    }
 
-    await window.studioApi.createItem({
+    try {
+      await window.studioApi.createItem({
+      ...(itemType === 'post' ? { event: postFields.event, listing: postFields.listing } : {}),
       type: itemType,
       title: itemTitle.trim(),
       targetUrl: itemTargetUrl.trim(),
@@ -1965,7 +1982,13 @@ export const App: React.FC = () => {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
-    });
+      });
+    } catch (err) {
+      notify(err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err));
+      return;
+    }
+    const createdKind = itemType === 'post' && postFields.event ? 'Event' : itemType === 'post' && postFields.listing ? (postFields.listing.kind === 'ask' ? 'Ask' : 'Offer') : null;
+    setItemExtras(EMPTY_POST_EXTRAS);
     setItemTitle('');
     setItemTargetUrl('');
     setItemAuthorName('');
@@ -1976,7 +1999,9 @@ export const App: React.FC = () => {
     await refreshStudioData();
     notify(
       afterChangeNote(
-        itemType === 'post'
+        createdKind
+          ? createdKind
+          : itemType === 'post'
           ? 'Wall Post'
           : itemType === 'comment'
           ? 'Comment'
@@ -3705,6 +3730,8 @@ export const App: React.FC = () => {
               setItemCommentary={setItemCommentary}
               itemTags={itemTags}
               setItemTags={setItemTags}
+              itemExtras={itemExtras}
+              setItemExtras={setItemExtras}
               handlePickLocalPostImage={handlePickLocalPostImage}
               handleCreateItem={handleCreateItem}
               editingItemId={editingItemId}

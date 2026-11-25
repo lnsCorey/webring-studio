@@ -454,6 +454,38 @@ export const SharedItemTypeSchema = z.enum([
 ]);
 export type SharedItemType = z.infer<typeof SharedItemTypeSchema>;
 
+/** ISO-8601 date and time with a time zone (Z or ±HH:MM), as events need an unambiguous instant. */
+const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2})$/i;
+const isoWithZone = z
+  .string()
+  .regex(ISO_WITH_ZONE, 'Use an ISO date and time with a time zone, e.g. 2026-12-05T18:00:00-04:00')
+  .refine((v) => !Number.isNaN(Date.parse(v)), 'Not a valid date and time');
+
+/**
+ * Optional event details on a `post`. Readers that don't know the field keep seeing a post, so
+ * adding events doesn't break older Studios or other readers (Webring Hubs list them as events).
+ */
+export const ItemEventSchema = z
+  .object({
+    startsAt: isoWithZone,
+    endsAt: isoWithZone.optional(),
+    allDay: z.boolean().optional(),
+    location: z.string().max(200).optional(),
+    url: z.string().max(500).regex(/^https?:\/\//i, 'The event link must start with http:// or https://').optional(),
+  })
+  .refine((e) => !e.endsAt || Date.parse(e.endsAt) >= Date.parse(e.startsAt), {
+    message: 'The event must end after it starts',
+    path: ['endsAt'],
+  });
+export type ItemEvent = z.infer<typeof ItemEventSchema>;
+
+/** Optional ask/offer details on a `post` (a mutual-aid listing). */
+export const ItemListingSchema = z.object({
+  kind: z.enum(['ask', 'offer']),
+  status: z.enum(['open', 'closed']).default('open'),
+});
+export type ItemListing = z.infer<typeof ItemListingSchema>;
+
 export const SharedItemSchema = z.object({
   id: z.string(),
   canonicalUrl: z.string(), // e.g., https://alice.example/api/items.json#item-456
@@ -471,8 +503,24 @@ export const SharedItemSchema = z.object({
   createdAt: z.string(),
   /** Set when the item has been edited since it was first published. */
   updatedAt: z.string().optional().catch(undefined),
+  /** Event details (posts only). Invalid details are dropped rather than rejecting the item. */
+  event: ItemEventSchema.optional().catch(undefined),
+  /** Ask/offer details (posts only). */
+  listing: ItemListingSchema.optional().catch(undefined),
 });
 export type SharedItem = z.infer<typeof SharedItemSchema>;
+
+/**
+ * A list of items that skips the ones it can't read (for example a type added by a newer Studio)
+ * instead of rejecting the whole document, so new item types never break older readers again.
+ * Signatures are always checked on the raw JSON, so skipping an item doesn't weaken them.
+ */
+export const TolerantSharedItemListSchema = z.array(z.unknown()).transform((raw) =>
+  raw.flatMap((entry) => {
+    const parsed = SharedItemSchema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  })
+);
 
 /**
  * When a site publishes only its recent items, `items.json` says so: `since` is the oldest
@@ -497,7 +545,7 @@ export const ItemsDocumentSchema = z.object({
   siteUrl: z.string(),
   did: z.string(),
   updatedAt: z.string(),
-  items: z.array(SharedItemSchema),
+  items: TolerantSharedItemListSchema,
   archive: ItemsArchiveIndexSchema.optional().catch(undefined),
   proof: SignatureProofSchema.optional(),
 });
@@ -585,7 +633,16 @@ export const ConnectionsDocumentSchema = z.object({
   updatedAt: z.string(),
   friends: z.array(FriendConnectionSchema),
   webrings: z.array(WebringMembershipSchema),
-  endorsements: z.array(EndorsementItemSchema).default([]),
+  // Endorsements of a type this version doesn't know are skipped, not fatal (see TolerantSharedItemListSchema)
+  endorsements: z
+    .array(z.unknown())
+    .default([])
+    .transform((raw) =>
+      raw.flatMap((entry) => {
+        const parsed = EndorsementItemSchema.safeParse(entry);
+        return parsed.success ? [parsed.data] : [];
+      })
+    ),
   proof: SignatureProofSchema.optional(),
 });
 export type ConnectionsDocument = z.infer<typeof ConnectionsDocumentSchema>;

@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { ImagePlus, Trash2 } from 'lucide-react';
 import { SharedItem } from '../shared/schema';
 import { MarkdownField } from './MarkdownField';
+import { ItemEvent, ItemListing } from '../shared/schema';
+import { PostExtrasDraft, PostExtrasFields, extrasFromItem, extrasToFields } from './PostExtras';
 
 /** The fields of a post or shared item that can be edited after publishing. */
 export interface ItemEdit {
@@ -14,6 +16,10 @@ export interface ItemEdit {
   mediaUrl: string;
   rating?: number | null;
   tags: string[];
+  /** Posts only: event details, or null for none. */
+  event?: ItemEvent | null;
+  /** Posts only: ask/offer details, or null for none. */
+  listing?: ItemListing | null;
 }
 
 const fieldClass = 'w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm focus:border-indigo-500 focus:outline-none';
@@ -46,14 +52,27 @@ export function ItemEditor(props: {
     tags: item.tags.join(', '),
   });
   const [saving, setSaving] = useState(false);
+  const [extras, setExtras] = useState<PostExtrasDraft>(() => extrasFromItem(item));
+  const [error, setError] = useState<string | null>(null);
   const set = (patch: Partial<typeof draft>) => setDraft((d) => ({ ...d, ...patch }));
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isPost && !draft.commentary.trim() && !draft.title.trim()) return;
+    let postFields: { event: ItemEvent | null; listing: ItemListing | null } | null = null;
+    if (isPost) {
+      try {
+        postFields = extrasToFields(extras);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+    }
+    setError(null);
     setSaving(true);
     try {
       await props.onSave({
+        ...(postFields ?? {}),
         title: draft.title,
         commentary: draft.commentary,
         mediaUrl: draft.mediaUrl.trim(),
@@ -68,6 +87,8 @@ export function ItemEditor(props: {
             }),
         ...(rated ? { rating: draft.rating || null } : {}),
       });
+    } catch (err) {
+      setError(err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err));
     } finally {
       setSaving(false);
     }
@@ -75,6 +96,8 @@ export function ItemEditor(props: {
 
   return (
     <form onSubmit={save} className="space-y-3">
+      {isPost && <PostExtrasFields draft={extras} onChange={setExtras} fieldClass={fieldClass} labelClass={labelClass} />}
+      {error && <p role="alert" className="text-xs text-rose-300">{error}</p>}
       <div>
         <label className={labelClass}>Title</label>
         <input

@@ -904,6 +904,38 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
         return ' • <span class="item-edited" title="Edited ' + esc(d.toLocaleString()) + '">edited</span>';
       }
 
+      // Events and asks/offers are posts with optional event / listing details
+      function eventWhen(ev) {
+        var s = new Date(ev.startsAt);
+        var e = ev.endsAt ? new Date(ev.endsAt) : null;
+        if (isNaN(s.getTime())) return '';
+        if (ev.allDay) {
+          var o = { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' };
+          return s.toLocaleDateString(undefined, o) + (e && String(ev.endsAt).slice(0, 10) !== String(ev.startsAt).slice(0, 10) ? ' – ' + e.toLocaleDateString(undefined, o) : ' (all day)');
+        }
+        var t = s.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+        if (!e || isNaN(e.getTime())) return t;
+        return t + ' – ' + (e.toDateString() === s.toDateString()
+          ? e.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+          : e.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }));
+      }
+      function eventBlock(item) {
+        var ev = item.type === 'post' && item.event && typeof item.event === 'object' ? item.event : null;
+        if (!ev || !ev.startsAt) return '';
+        return '<div class="item-event text-sm rounded-lg px-3 py-2 mb-3 bg-cyan-500/10 border border-cyan-500/30">' +
+          '<p>📅 ' + esc(eventWhen(ev)) + '</p>' +
+          (ev.location ? '<p>📍 ' + esc(ev.location) + '</p>' : '') +
+          (ev.url ? '<p>🔗 <a href="' + safeUrl(ev.url) + '" target="_blank" rel="noopener noreferrer" class="underline">Event link</a></p>' : '') +
+          '</div>';
+      }
+      function postLabel(item) {
+        if (item.type === 'post' && item.event) return '📅 Event';
+        if (item.type === 'post' && item.listing) {
+          return (item.listing.kind === 'ask' ? '🙋 Ask' : '🎁 Offer') + (item.listing.status === 'closed' ? ' · closed' : '');
+        }
+        return item.type === 'post' ? '📝 Wall Post' : String(item.type);
+      }
+
       function renderItem(item) {
         const badgeColor = item.type === 'post'
           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
@@ -924,7 +956,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           <div class="card-surface rounded-xl p-4 flex flex-col justify-between \${item.type === 'post' ? 'md:col-span-2' : ''}">
             <div>
               <div class="flex items-center justify-between gap-2 mb-2">
-                <span class="text-xs uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-full \${badgeColor}">\${item.type === 'post' ? '📝 Wall Post' : esc(item.type)}</span>
+                <span class="text-xs uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-full \${badgeColor}">\${esc(postLabel(item))}</span>
                 <span class="text-xs opacity-60">\${esc(item.category)} \${item.rating && item.type !== 'post' && item.type !== 'comment' ? '• ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : ''}\${editedNote(item)}</span>
               </div>
               \${item.mediaUrl ? \`<img src="\${safeUrl(item.mediaUrl)}" class="w-full \${item.type === 'post' ? 'max-h-80' : 'h-40'} object-cover rounded-lg mb-3" />\` : ''}
@@ -932,6 +964,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
                 \${isSelfPost ? \`<span>\${esc(item.title)}</span>\` : \`<a href="\${safeUrl(item.targetUrl)}" target="_blank" rel="noopener noreferrer" class="hover:underline">\${esc(item.title)} ↗</a>\`}
               </h4>\`}
               \${item.targetAuthorName ? \`<p class="text-xs opacity-70 mb-2">\${item.type === 'comment' ? 'Replying to' : 'Source'}: <a href="\${safeUrl(item.targetAuthorUrl || item.targetUrl)}" target="_blank" rel="noopener noreferrer" class="underline">\${esc(item.targetAuthorName)}</a></p>\` : ''}
+              \${eventBlock(item)}
               \${item.type === 'post'
                 ? (item.commentary ? \`<div class="prose-block post-body text-sm opacity-90 mb-3">\${renderMarkdown(item.commentary)}</div>\` : '')
                 : \`<p class="text-sm opacity-90 mb-3 whitespace-pre-line">\${esc(item.commentary || '')}</p>\`}
