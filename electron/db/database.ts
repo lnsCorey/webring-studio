@@ -46,6 +46,10 @@ import {
   ProfileTheme,
   SharedItem,
   SharedItemType,
+  ItemEvent,
+  ItemEventSchema,
+  ItemListing,
+  ItemListingSchema,
   signDocument,
   siteUrlToDidWeb,
   verifyKeyRotationChain,
@@ -657,6 +661,44 @@ export function splitItemsForPublishing(items: SharedItem[], nowMs: number): { r
   let split = sorted.findIndex((item, index) => index >= PUBLISH_MIN_RECENT && item.createdAt < cutoff);
   if (split === -1) split = sorted.length;
   return { recent: sorted.slice(0, split), archived: sorted.slice(split) };
+}
+
+/**
+ * Validates event details for a post (null/undefined = none). Throws a readable error so the
+ * compose form and MCP tools can show what's wrong.
+ */
+function validateItemEvent(type: SharedItemType, value: unknown): ItemEvent | null {
+  if (value === undefined || value === null) return null;
+  if (type !== 'post') throw new Error('Only posts can be events.');
+  const parsed = ItemEventSchema.safeParse(value);
+  if (!parsed.success) throw new Error(`Event details are not valid: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+  const e = parsed.data;
+  return {
+    startsAt: e.startsAt,
+    ...(e.endsAt ? { endsAt: e.endsAt } : {}),
+    ...(e.allDay ? { allDay: true } : {}),
+    ...(e.location && e.location.trim() ? { location: e.location.trim() } : {}),
+    ...(e.url && e.url.trim() ? { url: e.url.trim() } : {}),
+  };
+}
+
+/** Validates ask/offer details for a post (null/undefined = none). */
+function validateItemListing(type: SharedItemType, value: unknown): ItemListing | null {
+  if (value === undefined || value === null) return null;
+  if (type !== 'post') throw new Error('Only posts can be asks or offers.');
+  const parsed = ItemListingSchema.safeParse(value);
+  if (!parsed.success) throw new Error('An ask or offer needs kind "ask" or "offer" and status "open" or "closed".');
+  return parsed.data;
+}
+
+function parseStoredJson<T>(raw: unknown, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): T | undefined {
+  if (typeof raw !== 'string' || raw === '') return undefined;
+  try {
+    const parsed = schema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** An item's title, or one derived from its text when left empty (as when it was created). */
@@ -1413,6 +1455,17 @@ export class StudioDatabase {
         version: 6,
         name: 'webring_hubs_and_feed_cache',
         up: () => this.migrateWebringHubsTableAndFeedCache(),
+      },
+      {
+        // Posts can carry event details or an ask/offer listing (published as optional
+        // `event` / `listing` fields in items.json).
+        version: 7,
+        name: 'item_event_and_listing',
+        up: () => {
+          const cols = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
+          if (!cols.some((c) => c.name === 'event_json')) this.db.exec('ALTER TABLE items ADD COLUMN event_json TEXT;');
+          if (!cols.some((c) => c.name === 'listing_json')) this.db.exec('ALTER TABLE items ADD COLUMN listing_json TEXT;');
+        },
       },
     ];
   }
@@ -2620,6 +2673,14 @@ export class StudioDatabase {
         tags: JSON.parse(String(r.tags_json || '[]')),
         createdAt: String(r.created_at),
         ...(r.updated_at ? { updatedAt: String(r.updated_at) } : {}),
+        ...((() => {
+          const event = r.type === 'post' ? parseStoredJson<ItemEvent>(r.event_json, ItemEventSchema) : undefined;
+          return event ? { event } : {};
+        })()),
+        ...((() => {
+          const listing = r.type === 'post' ? parseStoredJson<ItemListing>(r.listing_json, ItemListingSchema) : undefined;
+          return listing ? { listing } : {};
+        })()),
       };
     });
   }
@@ -2636,8 +2697,12 @@ export class StudioDatabase {
     mediaUrl?: string;
     rating?: number;
     tags?: string[];
+    event?: ItemEvent | null;
+    listing?: ItemListing | null;
   }): SharedItem {
     assertAllowedMediaReference(input.mediaUrl);
+    const event = validateItemEvent(input.type, input.event);
+    const listing = validateItemListing(input.type, input.listing);
     const id = `item-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     const profile = this.getProfile();
@@ -2652,8 +2717,8 @@ export class StudioDatabase {
       .prepare(
         `INSERT INTO items (
           id, type, title, target_url, target_author_url, target_author_name,
-          via_url, category, commentary, media_url, rating, tags_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          via_url, category, commentary, media_url, rating, tags_json, created_at, event_json, listing_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -2668,7 +2733,9 @@ export class StudioDatabase {
         input.mediaUrl || '',
         input.rating ?? null,
         JSON.stringify(input.tags || []),
-        now
+        now,
+        event ? JSON.stringify(event) : null,
+        listing ? JSON.stringify(listing) : null
       );
 
     return this.getItems().find((i) => i.id === id)!;
@@ -2690,11 +2757,17 @@ export class StudioDatabase {
       mediaUrl?: string;
       rating?: number | null;
       tags?: string[];
+      /** New event details, or null to make the post a plain post again. */
+      event?: ItemEvent | null;
+      /** New ask/offer details (e.g. status "closed"), or null to remove them. */
+      listing?: ItemListing | null;
     }
   ): SharedItem {
     const current = this.getItems().find((i) => i.id === itemId);
     if (!current) throw new Error(`Item "${itemId}" not found.`);
     assertAllowedMediaReference(updates.mediaUrl);
+    const event = updates.event === undefined ? current.event ?? null : validateItemEvent(current.type, updates.event);
+    const listing = updates.listing === undefined ? current.listing ?? null : validateItemListing(current.type, updates.listing);
     const text = (value: string | undefined, fallback: string) => (value === undefined ? fallback : value.trim());
     const commentary = text(updates.commentary, current.commentary);
     const targetAuthorName = text(updates.targetAuthorName, current.targetAuthorName || '');
@@ -2714,7 +2787,7 @@ export class StudioDatabase {
     this.db
       .prepare(
         `UPDATE items SET title = ?, target_url = ?, target_author_url = ?, target_author_name = ?, category = ?,
-          commentary = ?, media_url = ?, rating = ?, tags_json = ?, updated_at = ? WHERE id = ?`
+          commentary = ?, media_url = ?, rating = ?, tags_json = ?, updated_at = ?, event_json = ?, listing_json = ? WHERE id = ?`
       )
       .run(
         title,
@@ -2727,6 +2800,8 @@ export class StudioDatabase {
         rating,
         JSON.stringify(tags),
         new Date().toISOString(),
+        event ? JSON.stringify(event) : null,
+        listing ? JSON.stringify(listing) : null,
         itemId
       );
     return this.getItems().find((i) => i.id === itemId)!;

@@ -98,7 +98,7 @@ describe('Migration 6 & Webring Hubs SQLite table (250 Hubs)', () => {
 
     const db = new StudioDatabase(dir, 'legacy.sqlite', { keyCipher: makeTestKeyCipher(true) });
     try {
-      expect(db.getSchemaVersion()).toBe(6);
+      expect(db.getSchemaVersion()).toBeGreaterThanOrEqual(6);
       const hubs = db.getWebringHubs();
       expect(hubs).toHaveLength(1);
       expect(hubs[0].url).toBe('https://hub-one.example');

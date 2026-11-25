@@ -71,6 +71,7 @@ export const TEMPLATE_CSS = String.raw`
     .tpl-actions a, .tpl-actions button { padding: 0.35rem 0.7rem; border-radius: 0.5rem; opacity: 0.8; }
     .tpl-actions a:hover, .tpl-actions button:hover { opacity: 1; background: color-mix(in srgb, var(--accent, var(--tpl-accent)) 12%, transparent); color: var(--accent, var(--tpl-accent)); }
     .tpl-comments { margin-top: 0.5rem; display: grid; gap: 0.4rem; font-size: 0.8rem; }
+    .tpl-event { margin-top: 0.4rem; padding: 0.45rem 0.7rem; border-radius: 0.5rem; border: 1px solid var(--tpl-line); display: grid; gap: 0.15rem; }
     .tpl-comments div { padding: 0.45rem 0.7rem; border-radius: 0.9rem; background: color-mix(in srgb, currentColor 6%, transparent); }
     .tpl-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.35rem; }
     @media (max-width: 420px) { .tpl-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
@@ -328,6 +329,31 @@ export function renderTemplatePage(ctx: any): string {
       '<a href="' + link('share', item.targetUrl, item.title, item.mediaUrl, item.category) + '">↻ ' + (labels ? 'Share' : '') + '</a>' +
       live + '<button type="button" data-open-post="' + esc(item.id) + '" aria-label="Open post">⤢ ' + (labels ? 'Open' : '') + '</button></div>';
   };
+  // Events (posts with event details): when, where and a link
+  const eventBlock = (item: any) => {
+    const ev = item.type === 'post' && item.event && typeof item.event === 'object' ? item.event : null;
+    if (!ev || !ev.startsAt) return '';
+    const s = new Date(ev.startsAt);
+    if (isNaN(s.getTime())) return '';
+    const e = ev.endsAt ? new Date(ev.endsAt) : null;
+    let when: string;
+    if (ev.allDay) {
+      const o: Intl.DateTimeFormatOptions = { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' };
+      when = s.toLocaleDateString(undefined, o) + (e && String(ev.endsAt).slice(0, 10) !== String(ev.startsAt).slice(0, 10) ? ' – ' + e.toLocaleDateString(undefined, o) : ' (all day)');
+    } else {
+      when = s.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+      if (e && !isNaN(e.getTime())) {
+        when += ' – ' + (e.toDateString() === s.toDateString()
+          ? e.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+          : e.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }));
+      }
+    }
+    return '<div class="tpl-event text-sm mt-1">' +
+      '<p>📅 ' + esc(when) + '</p>' +
+      (ev.location ? '<p>📍 ' + esc(ev.location) + '</p>' : '') +
+      (ev.url ? '<p>🔗 <a href="' + safeUrl(ev.url) + '" target="_blank" rel="noopener noreferrer" class="underline">Event link</a></p>' : '') +
+      '</div>';
+  };
   const itemBody = (item: any) => {
     const isSelfPost = item.type === 'post' && (!item.targetUrl || item.targetUrl === item.canonicalUrl);
     const r = reactions(item.canonicalUrl);
@@ -342,7 +368,7 @@ export function renderTemplatePage(ctx: any): string {
       ? '<p class="text-xs tpl-muted">' + (item.type === 'comment' ? 'Replying to' : 'Source') + ': <a href="' + safeUrl(item.targetAuthorUrl || item.targetUrl) + '" target="_blank" rel="noopener noreferrer" class="underline">' + esc(item.targetAuthorName) + '</a></p>'
       : '';
     const stars = item.rating && item.type !== 'post' && item.type !== 'comment' ? ' ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : '';
-    return title + source +
+    return title + source + eventBlock(item) +
       (item.type === 'post' && item.commentary
         ? '<div class="prose-block post-body text-sm mt-1">' + ctx.renderMarkdown(item.commentary) + '</div>'
         : item.commentary ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(item.commentary) + stars + '</p>' : stars ? '<p class="text-sm">' + stars + '</p>' : '') +
@@ -354,7 +380,11 @@ export function renderTemplatePage(ctx: any): string {
         : '') +
       '<div id="live-comments-' + esc(item.id) + '" class="hidden mt-2"></div>';
   };
-  const typeLabel = (item: any) => esc(TYPE_LABELS[item.type] || item.type);
+  const typeLabel = (item: any) => {
+    if (item.type === 'post' && item.event) return 'Event';
+    if (item.type === 'post' && item.listing) return (item.listing.kind === 'ask' ? 'Ask' : 'Offer') + (item.listing.status === 'closed' ? ' · closed' : '');
+    return esc(TYPE_LABELS[item.type] || item.type);
+  };
   // Short text for tiles and reel cards: posts are Markdown, so drop the markers
   const snippet = (item: any) => (item.type === 'post' ? ctx.markdownToPlainText(item.commentary || '') : String(item.commentary || ''));
   const edited = (item: any) => {

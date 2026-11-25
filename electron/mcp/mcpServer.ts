@@ -34,6 +34,8 @@ import {
   LayoutBlock,
   ProfileTheme,
   SharedItemType,
+  ItemEvent,
+  ItemListing,
   ProfileThemeSchema,
 } from '../../src/shared/schema';
 
@@ -703,6 +705,29 @@ export class WebringMcpServer {
               items: { type: 'string' },
               description: 'Optional list of topic tags.',
             },
+            event: {
+              type: 'object',
+              description:
+                'Makes the post an event (Webring Hubs list it on their Events page for RSVPs). startsAt is required: an ISO date-time with a time zone, e.g. 2026-12-05T18:00:00-04:00. For all-day events use T00:00:00Z on the day and allDay: true.',
+              properties: {
+                startsAt: { type: 'string' },
+                endsAt: { type: 'string' },
+                allDay: { type: 'boolean' },
+                location: { type: 'string', description: 'Up to 200 characters, e.g. "Library, Room 2" or "Online".' },
+                url: { type: 'string', description: 'Optional http(s) link: meeting room, tickets or details.' },
+              },
+              required: ['startsAt'],
+            },
+            listing: {
+              type: 'object',
+              description:
+                'Makes the post an ask (you need help) or an offer (you can help/share). Webring Hubs match its tags with members\' interests. Set status "closed" when it is sorted.',
+              properties: {
+                kind: { type: 'string', enum: ['ask', 'offer'] },
+                status: { type: 'string', enum: ['open', 'closed'] },
+              },
+              required: ['kind'],
+            },
           },
           required: ['commentary'],
         },
@@ -775,6 +800,14 @@ export class WebringMcpServer {
             mediaUrl: { type: 'string', description: 'Image URL, or "" to remove the image.' },
             rating: { type: 'number', description: '1-5, for likes and recommendations.' },
             tags: { type: 'array', items: { type: 'string' } },
+            event: {
+              type: ['object', 'null'],
+              description: 'Wall posts only: new event details (same shape as in webring_create_post), or null to make it a plain post again.',
+            },
+            listing: {
+              type: ['object', 'null'],
+              description: 'Wall posts only: { kind: "ask" | "offer", status: "open" | "closed" }, or null to remove. Use status "closed" when an ask or offer is sorted.',
+            },
           },
           required: ['itemId'],
         },
@@ -1869,9 +1902,15 @@ export class WebringMcpServer {
             mediaUrl: args.mediaUrl ? String(args.mediaUrl) : undefined,
             category: 'status',
             tags: Array.isArray(args.tags) ? args.tags.map(String) : ['wall', 'webring'],
+            event: args.event && typeof args.event === 'object' ? (args.event as ItemEvent) : undefined,
+            listing: args.listing && typeof args.listing === 'object' ? (args.listing as ItemListing) : undefined,
           });
           resultData = created;
-          summary = `Published Wall Post "${created.title}"`;
+          summary = created.event
+            ? `Published event "${created.title}"`
+            : created.listing
+            ? `Published ${created.listing.kind} "${created.title}"`
+            : `Published Wall Post "${created.title}"`;
           break;
         }
 
@@ -1912,6 +1951,8 @@ export class WebringMcpServer {
             mediaUrl: str('mediaUrl'),
             rating: typeof args.rating === 'number' ? args.rating : undefined,
             tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
+            event: args.event === null ? null : args.event && typeof args.event === 'object' ? (args.event as ItemEvent) : undefined,
+            listing: args.listing === null ? null : args.listing && typeof args.listing === 'object' ? (args.listing as ItemListing) : undefined,
           });
           cleanUpLibrary(ctx.db, ctx.mediaLibrary);
           resultData = updated;
