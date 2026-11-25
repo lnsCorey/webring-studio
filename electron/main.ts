@@ -6,6 +6,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   net,
   Notification,
   powerMonitor,
@@ -1671,6 +1672,14 @@ function registerIpcHandlers() {
     }
     shell.showItemInFolder(resolved);
     return { ok: true };
+  });
+  ipcMain.handle('studio:set-app-theme', (_e, theme: 'dark' | 'light' | 'system') => {
+    const valid = theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'dark';
+    nativeTheme.themeSource = valid;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#090d16' : '#f8fafc');
+    }
+    return { ok: true, shouldUseDarkColors: nativeTheme.shouldUseDarkColors };
   });
 }
 
