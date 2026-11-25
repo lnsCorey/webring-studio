@@ -5981,22 +5981,22 @@ describe('Webring Hubs (optional third-party index)', () => {
     }
   });
 
-  it('moves the pre-rename directoriesJson setting to webringHubsJson once, without losing data', () => {
+  it('moves the pre-rename directoriesJson and webringHubsJson settings into webring_hubs once, without losing data', () => {
     const raw = (d: StudioDatabase) => (d as unknown as { db: DatabaseSync }).db;
     const setting = (d: StudioDatabase, key: string) =>
       (raw(d).prepare('SELECT value FROM local_settings WHERE key = ?').get(key) as { value: string } | undefined)?.value;
     const saved = [{ url: HUB, title: 'Test Hub', addedAt: '2026-11-01T00:00:00.000Z', listMe: true, state: 'listed' }];
     raw(db).prepare("INSERT INTO local_settings (key, value) VALUES ('directoriesJson', ?)").run(JSON.stringify(saved));
 
-    expect(db.getWebringHubs()).toEqual(saved);
+    expect(db.getWebringHubs()).toEqual([{ ...saved[0], pingEnabled: true, extensions: [] }]);
     expect(setting(db, 'directoriesJson')).toBeUndefined();
-    expect(JSON.parse(setting(db, 'webringHubsJson')!)).toEqual(saved);
+    expect(setting(db, 'webringHubsJson')).toBeUndefined();
 
-    // Survives a reopen, and a stray old key never overwrites the new one
+    // Survives a reopen, and a stray old key never overwrites the migrated row
     db.close();
     db = new StudioDatabase(tempRoot, 'dir.sqlite');
     raw(db).prepare("INSERT INTO local_settings (key, value) VALUES ('directoriesJson', '[]')").run();
-    expect(db.getWebringHubs()).toEqual(saved);
+    expect(db.getWebringHubs()).toEqual([{ ...saved[0], pingEnabled: true, extensions: [] }]);
     expect(setting(db, 'directoriesJson')).toBeUndefined();
   });
 

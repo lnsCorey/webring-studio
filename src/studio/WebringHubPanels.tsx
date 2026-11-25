@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { BookOpen, CircleDot, Globe, Loader2, Plus, Search, ShieldCheck, Trash2, UserPlus, X } from 'lucide-react';
-import { normalizeSiteUrl } from '../shared/schema';
+import { BookOpen, CircleDot, Globe, Loader2, Plus, Radio, Search, ShieldCheck, Trash2, UserPlus, X } from 'lucide-react';
+import { normalizeSiteUrl, SharedItemType } from '../shared/schema';
 
 /**
  * Optional Webring Hubs (electron/services/webringHubService.ts,
@@ -15,14 +15,48 @@ export interface WebringHubView {
   addedAt: string;
   listMe: boolean;
   state: 'not-listed' | 'listed' | 'blocked' | 'key-changed' | 'error';
+  pingEnabled?: boolean;
   lastListedAt?: string;
   lastPingAt?: string;
+  lastPingStatus?: number | null;
   pendingPingFor?: string;
   pendingSince?: string;
   lastError?: string;
   /** Extensions the hub advertises in /api/info. */
   extensions?: Array<{ id: string; version: string; apiVersion: number }>;
   infoCheckedAt?: string;
+}
+
+export interface HubFeedEntryView {
+  hubId: string;
+  itemUri: string;
+  itemId: string;
+  authorDid: string;
+  authorSiteUrl: string;
+  authorName: string;
+  authorHandle: string;
+  authorAvatarUrl: string;
+  entryType: SharedItemType;
+  title: string;
+  targetUrl: string;
+  category: string;
+  commentary: string;
+  mediaUrl: string;
+  rating?: number;
+  tags: string[];
+  publishedAt: string;
+  updatedAt?: string;
+  verifiedAt: string;
+  rawSignedJson: string;
+}
+
+export interface HubFeedPageResultView {
+  hubUrl: string;
+  entries: HubFeedEntryView[];
+  cachedTotal: number;
+  verifiedCount: number;
+  rejectedCount: number;
+  nextCursor: string | null;
 }
 
 /** webringHubService.ts WebringHubKeyCheck. Shown, never stored. */
@@ -48,6 +82,11 @@ const EXTENSION_LABELS: Record<string, { label: string; apiVersion: number; hint
     label: 'Key witness',
     apiVersion: 1,
     hint: 'Keeps a history of the signing keys it has seen, so Studio can compare a friend\'s key with it.',
+  },
+  'webhook-sync': {
+    label: 'Webhook Sync & Feed',
+    apiVersion: 1,
+    hint: 'Accepts fast signed webhook pings on publish and serves a zero-trust aggregated Hub feed.',
   },
 };
 
@@ -81,6 +120,17 @@ export interface WebringHubApi {
     options?: { limit?: number; offset?: number }
   ) => Promise<{ webringHubUrl: string; total: number; results: WebringHubSearchResultView[] }>;
   setWebringHubListed: (url: string, listed: boolean) => Promise<WebringHubView>;
+  setWebringHubPingEnabled?: (url: string, enabled: boolean) => Promise<WebringHubView>;
+  pingWebringHubsNow?: () => Promise<Array<{ url: string; outcome: string; message?: string }>>;
+  getCachedHubFeed?: (
+    url: string,
+    options?: { before?: string; limit?: number; contentType?: string }
+  ) => Promise<{ hubUrl: string; entries: HubFeedEntryView[]; cachedTotal: number }>;
+  fetchHubFeed?: (
+    url: string,
+    options?: { before?: string; limit?: number; contentType?: string }
+  ) => Promise<HubFeedPageResultView>;
+  clearHubFeedCache?: (url?: string) => Promise<{ ok: boolean }>;
   checkKeyWithWebringHubs?: (siteUrl: string) => Promise<WebringHubKeyCheckView>;
   approveWebringHubAuth?: (req: HubAuthRequestView, optInExtensions?: string[]) => Promise<{ ok: boolean; did: string; hubUrl: string }>;
   launchWebringHub?: (url: string, targetPath?: string, optInExtensions?: string[]) => Promise<{ ok: boolean }>;
@@ -185,8 +235,9 @@ export function WebringHubListingsPanel(props: {
   reload: () => Promise<void>;
   hasPublished: boolean;
   notify: (message: string) => void;
+  onOpenHubFeed?: (hubUrl: string) => void;
 }) {
-  const { api, webringHubs, reload, hasPublished, notify } = props;
+  const { api, webringHubs, reload, hasPublished, notify, onOpenHubFeed } = props;
   const [newUrl, setNewUrl] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
@@ -295,7 +346,7 @@ export function WebringHubListingsPanel(props: {
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-3">
                     <label
                       className={`flex items-center gap-1.5 text-xs ${hasPublished ? 'text-slate-200' : 'text-slate-500'}`}
                       title={hasPublished ? '' : 'Publish your site first'}
@@ -315,7 +366,34 @@ export function WebringHubListingsPanel(props: {
                       />
                       List my site
                     </label>
-                    {busy === d.url && <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" />}
+                    {api.setWebringHubPingEnabled && (
+                      <label
+                        className={`flex items-center gap-1.5 text-xs ${d.listMe ? 'text-slate-200' : 'text-slate-400'}`}
+                        title="Send a signed Ed25519 webhook ping to this Hub whenever you publish your site"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={d.pingEnabled !== false}
+                          disabled={busy !== null}
+                          onChange={(e) => {
+                            const enabled = e.target.checked;
+                            void run(`ping:${d.url}`, async () => {
+                              await api.setWebringHubPingEnabled!(d.url, enabled);
+                              notify(
+                                enabled
+                                  ? `Enabled webhook pings on publish for ${d.title}.`
+                                  : `Paused webhook pings on publish for ${d.title}.`
+                              );
+                            });
+                          }}
+                          className="accent-emerald-500"
+                        />
+                        Ping Hub on Publish
+                      </label>
+                    )}
+                    {(busy === d.url || busy === `ping:${d.url}`) && (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" />
+                    )}
                     <button
                       type="button"
                       disabled={busy !== null}
@@ -349,11 +427,66 @@ export function WebringHubListingsPanel(props: {
                     </button>
                   </div>
                 </div>
-                <div className="text-[11px] text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
+                <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-x-4 gap-y-1">
                   {d.lastListedAt && <span>Listed {formatTime(d.lastListedAt)}</span>}
-                  {d.lastPingAt && <span>Last re-read {formatTime(d.lastPingAt)}</span>}
-                  {d.listMe && d.pendingPingFor && <span>Waiting for your live site to show the last publish</span>}
+                  {d.lastPingAt && (
+                    <span className="flex items-center gap-1.5">
+                      Last ping {formatTime(d.lastPingAt)}
+                      {d.lastPingStatus !== undefined && d.lastPingStatus !== null && (
+                        <span
+                          className={`px-1.5 py-0.5 rounded font-mono text-[10px] ${
+                            d.lastPingStatus === 202 || d.lastPingStatus === 200
+                              ? 'bg-emerald-500/15 text-emerald-300'
+                              : d.lastPingStatus === 409
+                                ? 'bg-slate-800 text-slate-300'
+                                : 'bg-rose-500/15 text-rose-300'
+                          }`}
+                        >
+                          {d.lastPingStatus === 0 ? 'network error' : `HTTP ${d.lastPingStatus}`}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                  {d.listMe && d.pingEnabled === false && (
+                    <span className="text-amber-300">Auto-ping paused</span>
+                  )}
+                  {d.listMe && d.pingEnabled !== false && d.pendingPingFor && (
+                    <span>Waiting for your live site to show the last publish</span>
+                  )}
                 </div>
+                {onOpenHubFeed && d.extensions?.some((ext) => ext.id === 'webhook-sync' && ext.apiVersion === 1) && (
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => onOpenHubFeed(d.url)}
+                      className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 text-[11px] font-medium flex items-center gap-1"
+                    >
+                      <Radio className="w-3 h-3" /> Browse Verified Hub Feed
+                    </button>
+                    {d.state === 'listed' && api.optOutWebringHubExtension && (
+                      <button
+                        type="button"
+                        disabled={busy !== null}
+                        onClick={() => {
+                          if (
+                            !window.confirm(
+                              `Opt out of Webhook Sync & Feed on ${d.title} and purge your cached posts from its feed?`
+                            )
+                          ) {
+                            return;
+                          }
+                          void run(`optout-feed:${d.url}`, async () => {
+                            await api.optOutWebringHubExtension!(d.url, 'webhook-sync');
+                            notify(`Opted out of Webhook Sync on ${d.title} and purged your feed items there.`);
+                          });
+                        }}
+                        className="px-2.5 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 text-[11px] font-medium disabled:opacity-40"
+                      >
+                        Purge My Posts on Hub
+                      </button>
+                    )}
+                  </div>
+                )}
                 {d.state === 'listed' && api?.launchWebringHub && (
                   <div className="flex flex-wrap items-center gap-2 pt-1">
                     <button
