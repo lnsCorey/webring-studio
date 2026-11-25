@@ -133,7 +133,7 @@ export interface PublicJsonResponse {
  */
 export async function requestPublicJson(
   url: string,
-  init: { method?: 'GET' | 'POST'; body?: unknown; proxyUrl?: string } = {}
+  init: { method?: 'GET' | 'POST'; body?: unknown; proxyUrl?: string; timeoutMs?: number } = {}
 ): Promise<PublicJsonResponse> {
   if (!/^https?:\/\//i.test(url)) throw new Error(`Not a web address: ${url}`);
   const res = await fetchPublic(url, {
@@ -145,6 +145,7 @@ export async function requestPublicJson(
     method: init.method || 'GET',
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
     anyStatus: true,
+    timeoutMs: init.timeoutMs,
   });
   if (res.status === 'not-modified') throw new Error(`Unexpected 304 from ${url}`);
   const text = res.body.toString('utf8').trim();
@@ -163,7 +164,7 @@ export async function requestPublicJson(
  * Default fetcher that supports both HTTP(S) URLs and local `file://` or directory paths
  * (making local multi-site testing and offline ring folders work seamlessly).
  */
-export async function defaultJsonFetcher(urlOrPath: string, proxyUrl?: string): Promise<unknown> {
+export async function defaultJsonFetcher(urlOrPath: string, proxyUrl?: string, timeoutMs?: number): Promise<unknown> {
   if (urlOrPath.startsWith('file://')) {
     const filePath = new URL(urlOrPath).pathname.replace(/^\/([A-Za-z]:)/, '$1');
     const stat = fs.statSync(filePath);
@@ -191,6 +192,7 @@ export async function defaultJsonFetcher(urlOrPath: string, proxyUrl?: string): 
     validators: null,
     compressed: true,
     proxyUrl,
+    timeoutMs,
   });
   if (res.status === 'not-modified') throw new Error(`Unexpected 304 fetching ${urlOrPath}`);
   return JSON.parse(res.body.toString('utf8'));
@@ -218,6 +220,8 @@ interface PublicFetchOptions {
   body?: string;
   /** Resolve with any HTTP status (and its body) instead of rejecting non-2xx answers. */
   anyStatus?: boolean;
+  /** Optional request timeout override in milliseconds (defaults to 10000ms). */
+  timeoutMs?: number;
 }
 
 /** Errors where the connection dropped (often a reused keep-alive socket the host had closed). */
@@ -272,11 +276,15 @@ function fetchPublicOnce(
       return;
     }
 
+    const effectiveTimeoutMs =
+      options.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? Math.floor(options.timeoutMs)
+        : FETCH_TIMEOUT_MS;
     const client = url.protocol === 'https:' ? https : http;
     let proxyAgent: http.Agent | https.Agent | undefined;
     if (options.proxyUrl) {
       try {
-        proxyAgent = createProxyAgent(options.proxyUrl, url.protocol as 'http:' | 'https:', FETCH_TIMEOUT_MS);
+        proxyAgent = createProxyAgent(options.proxyUrl, url.protocol as 'http:' | 'https:', effectiveTimeoutMs);
       } catch (err) {
         reject(err instanceof Error ? err : new Error(String(err)));
         return;
@@ -300,7 +308,7 @@ function fetchPublicOnce(
           ...(options.validators?.lastModified ? { 'If-Modified-Since': options.validators.lastModified } : {}),
         },
         ...(proxyAgent ? { agent: proxyAgent } : { lookup: guardedLookup }),
-        timeout: FETCH_TIMEOUT_MS,
+        timeout: effectiveTimeoutMs,
       },
       (res) => {
         const status = res.statusCode || 0;
@@ -383,7 +391,7 @@ function fetchPublicOnce(
     // `timeout` only covers idle sockets; also cap the whole request
     const deadline = setTimeout(
       () => req.destroy(new Error(`Timed out fetching ${rawUrl}`)),
-      FETCH_TIMEOUT_MS
+      effectiveTimeoutMs
     );
     req.on('close', () => clearTimeout(deadline));
     req.on('timeout', () => req.destroy(new Error(`Timed out fetching ${rawUrl}`)));

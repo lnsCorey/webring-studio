@@ -60,6 +60,7 @@ import {
   ringsForHubSearch,
   useWebringHubs,
 } from './WebringHubPanels';
+import { HubFeedView } from './HubFeedView';
 import { WebringShareBlock } from './QrCodeSvg';
 import { SetupApi, SetupHealthCard, SetupWizard } from './SetupWizard';
 import type { SetupStatus } from '../shared/setup';
@@ -603,6 +604,11 @@ declare global {
       removeWebringHub?: WebringHubApi['removeWebringHub'];
       searchWebringHub?: WebringHubApi['searchWebringHub'];
       setWebringHubListed?: WebringHubApi['setWebringHubListed'];
+      setWebringHubPingEnabled?: WebringHubApi['setWebringHubPingEnabled'];
+      pingWebringHubsNow?: WebringHubApi['pingWebringHubsNow'];
+      getCachedHubFeed?: WebringHubApi['getCachedHubFeed'];
+      fetchHubFeed?: WebringHubApi['fetchHubFeed'];
+      clearHubFeedCache?: WebringHubApi['clearHubFeedCache'];
       checkKeyWithWebringHubs?: WebringHubApi['checkKeyWithWebringHubs'];
       setProxySettings?: (
         input: { enabled?: boolean; proxyUrl?: string },
@@ -868,7 +874,8 @@ export const App: React.FC = () => {
             : 'site';
     setOpenSidebarSections((prev) => (prev[section] ? prev : { ...prev, [section]: true }));
   }, [activeTab]);
-  const [friendsSubTab, setFriendsSubTab] = useState<'friends' | 'notices' | 'webrings' | 'hosted' | 'discover'>('friends');
+  const [friendsSubTab, setFriendsSubTab] = useState<'friends' | 'hub-feed' | 'notices' | 'webrings' | 'hosted' | 'discover'>('friends');
+  const [selectedHubFeedUrl, setSelectedHubFeedUrl] = useState('');
   const [publishSubTab, setPublishSubTab] = useState<
     | 'deploy'
     | 'schedule'
@@ -3737,6 +3744,13 @@ export const App: React.FC = () => {
                 tabs={[
                   { id: 'friends', label: 'Friends', badge: allFriends.length },
                   {
+                    id: 'hub-feed',
+                    label: 'Hub Feed',
+                    badge:
+                      webringHubs.filter((h) => h.extensions?.some((e) => e.id === 'webhook-sync' && e.apiVersion === 1))
+                        .length || undefined,
+                  },
+                  {
                     id: 'notices',
                     label: 'Notices & Sync',
                     badge: friendNotices.length + friendSyncNotices.length,
@@ -3747,6 +3761,59 @@ export const App: React.FC = () => {
                   { id: 'discover', label: 'Discover & Privacy' },
                 ]}
               />
+
+              {friendsSubTab === 'hub-feed' && (
+                <HubFeedView
+                  api={webringHubApi}
+                  webringHubs={webringHubs}
+                  selectedHubUrl={selectedHubFeedUrl}
+                  onSelectHubUrl={setSelectedHubFeedUrl}
+                  ownSiteUrl={bundle.profile.siteUrl}
+                  friendSiteUrls={new Set(allFriends.map((f) => f.siteUrl))}
+                  myLikedUrls={
+                    new Set(bundle.items.items.filter((i) => i.type === 'like').map((i) => i.targetUrl))
+                  }
+                  mySharedUrls={
+                    new Set(bundle.items.items.filter((i) => i.type === 'share').map((i) => i.targetUrl))
+                  }
+                  onCreateSignedInteraction={async (input) => {
+                    if (!window.studioApi) return;
+                    await window.studioApi.createItem({
+                      type: input.type,
+                      title: input.title,
+                      targetUrl: input.targetUrl,
+                      targetAuthorName: input.targetAuthorName,
+                      targetAuthorUrl: input.targetAuthorUrl,
+                      category: input.type === 'comment' ? 'comment' : 'general',
+                      commentary: input.commentary || '',
+                      mediaUrl: input.mediaUrl && /^https:\/\//i.test(input.mediaUrl) ? input.mediaUrl : '',
+                      tags: [],
+                    });
+                    await refreshStudioData();
+                    notify(
+                      afterChangeNote(
+                        input.type === 'like' ? 'Like' : input.type === 'comment' ? 'Reply' : 'Share'
+                      )
+                    );
+                  }}
+                  onAddFriendFromHub={(author) => {
+                    setFriendSiteUrl(author.siteUrl);
+                    setFriendName(author.displayName);
+                    setFriendAvatar(author.avatarUrl);
+                    setFriendsSubTab('discover');
+                    notify(`Pre-filled "${author.displayName}" in Add Friend — review and save below.`);
+                  }}
+                  onModerateAuthor={async (targetSiteUrl, authorName, action) => {
+                    await handleSetModeration(targetSiteUrl, authorName, action);
+                  }}
+                  onOpenExternal={(url) => window.studioApi?.openExternal(url)}
+                  onManageHubs={() => {
+                    setActiveTab('publish');
+                    setPublishSubTab('hubs');
+                  }}
+                  notify={notify}
+                />
+              )}
 
               {friendsSubTab === 'notices' && (
                 <div className="space-y-4">
@@ -6037,6 +6104,11 @@ export const App: React.FC = () => {
                 reload={reloadWebringHubs}
                 hasPublished={Boolean(publishSettings.lastPublishedAt)}
                 notify={notify}
+                onOpenHubFeed={(hubUrl) => {
+                  setSelectedHubFeedUrl(hubUrl);
+                  setActiveTab('friends');
+                  setFriendsSubTab('hub-feed');
+                }}
               />
               )}
 

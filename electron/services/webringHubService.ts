@@ -9,6 +9,7 @@ import {
 } from '../../src/shared/schema';
 import { privatePeersAllowed } from '../security/networkGuard';
 import { defaultJsonFetcher, JsonFetcher, PublicJsonResponse, requestPublicJson } from './ringCrawler';
+import { emitWebhookPings } from '../sync/webhookPing';
 import * as crypto from 'crypto';
 
 /**
@@ -29,7 +30,7 @@ import * as crypto from 'crypto';
  * - Requests use the persona's proxy and the crawler's private-network guard.
  */
 
-export const MAX_WEBRING_HUBS = 10;
+export const MAX_WEBRING_HUBS = 250;
 /** A ping waiting for the live site to show a publish is dropped after this long. */
 export const WEBRING_HUB_PING_MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 const MAX_RESULTS = 50;
@@ -43,11 +44,12 @@ const MAX_EXTENSIONS = 50;
  */
 export const KNOWN_WEBRING_HUB_EXTENSIONS: Record<string, number> = {
   'key-witness': 1,
+  'webhook-sync': 1,
 };
 
 export type WebringHubRequester = (
   url: string,
-  init: { method: 'GET' | 'POST'; body?: unknown }
+  init: { method: 'GET' | 'POST'; body?: unknown; timeoutMs?: number }
 ) => Promise<PublicJsonResponse>;
 
 export interface WebringHubServiceDeps {
@@ -290,11 +292,21 @@ export class WebringHubService {
       addedAt: at,
       listMe: false,
       state: 'not-listed',
+      pingEnabled: true,
       extensions: parseWebringHubExtensions(info),
       infoCheckedAt: at,
     };
     this.db.saveWebringHubs([...existing, record]);
     return record;
+  }
+
+  /** Toggles whether Studio emits a signed webhook ping to this Hub on publish. */
+  public setPingEnabled(rawUrl: string, enabled: boolean): WebringHubRecord {
+    const record = this.find(rawUrl);
+    if (typeof this.db.setWebringHubPingEnabled === 'function') {
+      return this.db.setWebringHubPingEnabled(record.url, enabled);
+    }
+    return this.update(record.url, { pingEnabled: enabled });
   }
 
   /**
@@ -653,8 +665,8 @@ export class WebringHubService {
   }
 
   /**
-   * Called after a successful publish: every hub the site is listed in should re-read it
-   * once the live site shows this publish.
+   * Called after a successful publish: every hub the site is listed in (with `pingEnabled !== false`)
+   * should re-read it once the live site shows this publish.
    */
   public markPublished(manifestUpdatedAt: string | undefined): void {
     if (!manifestUpdatedAt) return;
@@ -662,7 +674,7 @@ export class WebringHubService {
     const all = this.db.getWebringHubs();
     let changed = false;
     for (const d of all) {
-      if (!d.listMe) continue;
+      if (!d.listMe || d.pingEnabled === false) continue;
       // A newer publish replaces any older one still waiting, and restarts the wait
       d.pendingPingFor = manifestUpdatedAt;
       d.pendingSince = at;
@@ -671,90 +683,68 @@ export class WebringHubService {
     if (changed) this.db.saveWebringHubs(all);
   }
 
-  /** True when some listed hub is still waiting for a ping. */
+  /** True when some listed, ping-enabled hub is still waiting for a ping. */
   public hasPendingPings(): boolean {
-    return this.db.getWebringHubs().some((d) => d.listMe && d.pendingPingFor);
+    return this.db.getWebringHubs().some((d) => d.listMe && d.pingEnabled !== false && d.pendingPingFor);
+  }
+
+  private async probeLiveManifestUpdatedAt(): Promise<string> {
+    try {
+      const profile = this.db.getProfile();
+      if (isPlaceholderSiteUrl(profile.siteUrl)) return '';
+      const siteUrl = normalizeSiteUrl(profile.siteUrl);
+      const manifest = (await this.fetchJson(`${siteUrl}/api/manifest.json?check=${this.now().getTime()}`)) as
+        | { updatedAt?: unknown }
+        | undefined;
+      return typeof manifest?.updatedAt === 'string' ? manifest.updatedAt : '';
+    } catch {
+      return '';
+    }
   }
 
   /**
-   * Sends waiting pings: for each listed hub with a pending publish, checks that the live
-   * manifest is at least that new, then asks the hub to re-read the site. Best effort; it
-   * never throws, and a site that isn't live yet stays pending (up to a day).
+   * Immediately emits bounded-concurrency (`10` max, `5000ms` timeout) signed webhook pings to all
+   * listed, `pingEnabled` Hubs right after a successful publish. Non-blocking: logs status codes
+   * (`lastPingStatus`) without failing or rolling back the publish.
+   */
+  public async emitPublishPings(): Promise<WebringHubPingResult[]> {
+    const targets = this.db.getWebringHubs().filter((d) => d.listMe && d.pingEnabled !== false);
+    if (targets.length === 0) return [];
+    const liveManifestUpdatedAt = await this.probeLiveManifestUpdatedAt();
+    const outcomes = await emitWebhookPings(this.db, {
+      transport: (url, init) => this.request(url, { method: init.method, body: init.body, timeoutMs: init.timeoutMs }),
+      liveManifestUpdatedAt,
+      now: this.now,
+      maxWaitMs: WEBRING_HUB_PING_MAX_WAIT_MS,
+      onlyPending: false,
+    });
+    return outcomes.map((o) => ({
+      url: o.url,
+      outcome: o.outcome === 'stale' ? 'pinged' : o.outcome === 'blocked' || o.outcome === 'skipped' ? 'error' : o.outcome,
+      ...(o.message ? { message: o.message } : {}),
+    }));
+  }
+
+  /**
+   * Sends waiting follow-up pings: for each listed hub with a pending publish (e.g. GitHub Pages
+   * CDN catching up), checks that the live manifest is at least that new, then asks the hub to
+   * re-read the site via `emitWebhookPings` (bounded concurrency 10, 5000ms timeout).
    */
   public async flushPendingPings(): Promise<WebringHubPingResult[]> {
-    const pending = this.db.getWebringHubs().filter((d) => d.listMe && d.pendingPingFor);
+    const pending = this.db.getWebringHubs().filter((d) => d.listMe && d.pingEnabled !== false && d.pendingPingFor);
     if (pending.length === 0) return [];
-    const now = this.now();
-    const profile = this.db.getProfile();
-    const siteUrl = normalizeSiteUrl(profile.siteUrl);
-    const did = siteUrlToDidWeb(siteUrl);
-
-    let liveUpdatedAt = '';
-    try {
-      const manifest = (await this.fetchJson(`${siteUrl}/api/manifest.json?check=${now.getTime()}`)) as
-        | { updatedAt?: unknown }
-        | undefined;
-      liveUpdatedAt = typeof manifest?.updatedAt === 'string' ? manifest.updatedAt : '';
-    } catch {
-      liveUpdatedAt = '';
-    }
-
-    const results: WebringHubPingResult[] = [];
-    for (const d of pending) {
-      const target = d.pendingPingFor!;
-      if (!liveUpdatedAt || liveUpdatedAt < target) {
-        const since = Date.parse(d.pendingSince || '') || now.getTime();
-        if (now.getTime() - since > WEBRING_HUB_PING_MAX_WAIT_MS) {
-          this.update(d.url, {
-            pendingPingFor: undefined,
-            pendingSince: undefined,
-            lastError: "Your live site didn't show the latest publish within a day, so the Webring Hub wasn't asked to re-read it.",
-          });
-          results.push({ url: d.url, outcome: 'dropped' });
-        } else {
-          results.push({ url: d.url, outcome: 'waiting' });
-        }
-        continue;
-      }
-      try {
-        const res = await this.request(`${d.url}/api/entries/${encodeURIComponent(did)}/refresh`, { method: 'POST' });
-        const at = this.now().toISOString();
-        if (res.status === 200) {
-          this.update(d.url, {
-            state: 'listed',
-            lastPingAt: at,
-            lastError: undefined,
-            pendingPingFor: undefined,
-            pendingSince: undefined,
-          });
-          results.push({ url: d.url, outcome: 'pinged' });
-        } else if (res.status === 404) {
-          // The operator removed or blocked the listing: respect that, don't re-submit
-          const message = `${d.title} no longer lists your site. List it again if you want to be included.`;
-          this.update(d.url, {
-            listMe: false,
-            state: 'not-listed',
-            lastError: message,
-            pendingPingFor: undefined,
-            pendingSince: undefined,
-          });
-          results.push({ url: d.url, outcome: 'not-listed', message });
-        } else if (errorCode(res) === 'key_changed') {
-          const message = errorMessage(res, 'The Webring Hub pinned a different key');
-          this.update(d.url, { state: 'key-changed', lastError: message, pendingPingFor: undefined, pendingSince: undefined });
-          results.push({ url: d.url, outcome: 'key-changed', message });
-        } else {
-          const message = errorMessage(res, `${d.title} couldn't re-read your site`);
-          this.update(d.url, { lastError: message, pendingPingFor: undefined, pendingSince: undefined });
-          results.push({ url: d.url, outcome: 'error', message });
-        }
-      } catch (err) {
-        // Unreachable hub: keep it pending for the next try
-        const message = err instanceof Error ? err.message : String(err);
-        this.update(d.url, { lastError: message });
-        results.push({ url: d.url, outcome: 'error', message });
-      }
-    }
-    return results;
+    const liveManifestUpdatedAt = await this.probeLiveManifestUpdatedAt();
+    const outcomes = await emitWebhookPings(this.db, {
+      transport: (url, init) => this.request(url, { method: init.method, body: init.body, timeoutMs: init.timeoutMs }),
+      liveManifestUpdatedAt,
+      now: this.now,
+      maxWaitMs: WEBRING_HUB_PING_MAX_WAIT_MS,
+      onlyPending: true,
+    });
+    return outcomes.map((o) => ({
+      url: o.url,
+      outcome: o.outcome === 'stale' ? 'pinged' : o.outcome === 'blocked' || o.outcome === 'skipped' ? 'error' : o.outcome,
+      ...(o.message ? { message: o.message } : {}),
+    }));
   }
 }

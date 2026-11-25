@@ -1227,6 +1227,42 @@ function registerIpcHandlers() {
       .getActiveContext()
       .webringHubService.optOutExtension(String(url || ''), String(extensionId || ''))
   );
+  ipcMain.handle('studio:webring-hub-set-ping-enabled', (_e, url: string, enabled: boolean) =>
+    personaManager.getActiveContext().webringHubService.setPingEnabled(String(url || ''), Boolean(enabled))
+  );
+  ipcMain.handle('studio:webring-hub-ping-now', () =>
+    withActiveLock((_personaId, ctx) => ctx.webringHubService.emitPublishPings())
+  );
+  ipcMain.handle(
+    'studio:hub-feed-get-cached',
+    (_e, hubUrl: string, options?: { before?: string; limit?: number; contentType?: string }) =>
+      personaManager.getActiveContext().hubFeedService.getCachedFeed(String(hubUrl || ''), {
+        before: typeof options?.before === 'string' ? options.before : undefined,
+        limit: Number(options?.limit) || undefined,
+        contentType: (options?.contentType as never) || undefined,
+      })
+  );
+  ipcMain.handle(
+    'studio:hub-feed-fetch',
+    async (_e, hubUrl: string, options?: { before?: string; limit?: number; contentType?: string }) => {
+      try {
+        return await personaManager.getActiveContext().hubFeedService.fetchFeedPage(String(hubUrl || ''), {
+          before: typeof options?.before === 'string' ? options.before : undefined,
+          limit: Number(options?.limit) || undefined,
+          contentType: (options?.contentType as never) || undefined,
+        });
+      } catch (err) {
+        if (err instanceof ProxyUnavailableError) pushSecurityStatus(true);
+        throw err;
+      }
+    }
+  );
+  ipcMain.handle('studio:hub-feed-clear-cache', (_e, hubUrl?: string) => {
+    personaManager
+      .getActiveContext()
+      .db.clearHubFeedCache(typeof hubUrl === 'string' && hubUrl.trim() ? hubUrl : undefined);
+    return { ok: true };
+  });
 
   ipcMain.handle('studio:ring-request-join', async (_e, hubUrl: string) => {
     const personaId = personaManager.getActivePersonaId();

@@ -105,6 +105,14 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:webring-hub-launch', url, targetPath, optInExtensions),
   optOutWebringHubExtension: (url: string, extensionId: string) =>
     ipcRenderer.invoke('studio:webring-hub-opt-out', url, extensionId),
+  setWebringHubPingEnabled: (url: string, enabled: boolean) =>
+    ipcRenderer.invoke('studio:webring-hub-set-ping-enabled', url, enabled),
+  pingWebringHubsNow: () => ipcRenderer.invoke('studio:webring-hub-ping-now'),
+  getCachedHubFeed: (url: string, options?: { before?: string; limit?: number; contentType?: string }) =>
+    ipcRenderer.invoke('studio:hub-feed-get-cached', url, options),
+  fetchHubFeed: (url: string, options?: { before?: string; limit?: number; contentType?: string }) =>
+    ipcRenderer.invoke('studio:hub-feed-fetch', url, options),
+  clearHubFeedCache: (url?: string) => ipcRenderer.invoke('studio:hub-feed-clear-cache', url),
   createFriendNotice: (friendSiteUrl: string) => ipcRenderer.invoke('studio:friend-notice-create', friendSiteUrl),
   reviewFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-review', link),
   acceptFriendNotice: (link: string) => ipcRenderer.invoke('studio:friend-notice-accept', link),

@@ -9,6 +9,7 @@ import { SitePublisher } from './publisher';
 import { RingCrawler } from './ringCrawler';
 import { RingService } from './ringService';
 import { WebringHubService } from './webringHubService';
+import { HubFeedService } from '../sync/hubFeed';
 import { CreatePersonaInput, PersonaSummary } from '../../src/shared/schema';
 
 interface StoredPersonaRecord {
@@ -33,6 +34,7 @@ export interface ActivePersonaContext {
   ringCrawler: RingCrawler;
   ringService: RingService;
   webringHubService: WebringHubService;
+  hubFeedService: HubFeedService;
 }
 
 /**
@@ -183,6 +185,7 @@ export class PersonaManager {
       ringCrawler: new RingCrawler(db),
       ringService: new RingService(db),
       webringHubService: new WebringHubService(db),
+      hubFeedService: new HubFeedService(db),
     };
   }
 

@@ -92,7 +92,11 @@ export async function publishTo(
   const result = await publishToDestination(ctx, destination, paths, overrides);
   if (result.success) {
     ctx.webringHubService.markPublished(ctx.db.getPublishedManifestUpdatedAt());
-    await notifyWebringHubs(ctx);
+    try {
+      await ctx.webringHubService.emitPublishPings();
+    } catch {
+      // Failed pings or locked proxies never roll back or fail a completed publish.
+    }
   }
   return result;
 }

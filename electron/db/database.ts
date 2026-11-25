@@ -214,8 +214,12 @@ export interface WebringHubRecord {
   /** The user chose to list this persona's site here (opt-in; off when added). */
   listMe: boolean;
   state: 'not-listed' | 'listed' | 'blocked' | 'key-changed' | 'error';
+  /** Whether Studio emits a signed webhook ping to this hub after publish (default true). */
+  pingEnabled?: boolean;
   lastListedAt?: string;
   lastPingAt?: string;
+  /** HTTP status code of the last webhook ping attempt (or 0 on network/timeout failure). */
+  lastPingStatus?: number | null;
   /** `updatedAt` of the published manifest the hub should be asked to re-read. */
   pendingPingFor?: string;
   pendingSince?: string;
@@ -223,6 +227,45 @@ export interface WebringHubRecord {
   /** Extensions the hub advertised in `/api/info` when last checked. Metadata only. */
   extensions?: WebringHubExtensionInfo[];
   infoCheckedAt?: string;
+}
+
+export const HUB_FEED_CACHE_LIMIT = 500;
+
+/**
+ * Isolated per-Hub feed cache row (`hub_feed_cache`). Never mixed with `network_feed`,
+ * `items`, `friends`, or `endorsements`, and never exported to the user's static site.
+ */
+export interface HubFeedCacheRow {
+  hubId: string;
+  itemUri: string;
+  authorDid: string;
+  authorSiteUrl: string;
+  publishedAt: string;
+  rawSignedJson: string;
+  verifiedAt: string;
+}
+
+export interface HubFeedEntry {
+  hubId: string;
+  itemUri: string;
+  itemId: string;
+  authorDid: string;
+  authorSiteUrl: string;
+  authorName: string;
+  authorHandle: string;
+  authorAvatarUrl: string;
+  entryType: SharedItemType;
+  title: string;
+  targetUrl: string;
+  category: string;
+  commentary: string;
+  mediaUrl: string;
+  rating?: number;
+  tags: string[];
+  publishedAt: string;
+  updatedAt?: string;
+  verifiedAt: string;
+  rawSignedJson: string;
 }
 
 export type SftpAuthMethod = 'password' | 'privateKey' | 'agent';
@@ -1113,6 +1156,38 @@ export class StudioDatabase {
         dismissed_at TEXT,
         PRIMARY KEY (site_url, kind, doc)
       );
+
+      -- Webring Hubs this persona uses (up to 250 hubs). Local only, never exported.
+      CREATE TABLE IF NOT EXISTS webring_hubs (
+        url TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        added_at TEXT NOT NULL,
+        list_me INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'not-listed',
+        ping_enabled INTEGER NOT NULL DEFAULT 1,
+        last_listed_at TEXT,
+        last_ping_at TEXT,
+        last_ping_status INTEGER,
+        pending_ping_for TEXT,
+        pending_since TEXT,
+        last_error TEXT,
+        extensions_json TEXT NOT NULL DEFAULT '[]',
+        info_checked_at TEXT
+      );
+
+      -- Isolated zero-trust Hub feed cache (strictly separated from direct friends' network_feed).
+      CREATE TABLE IF NOT EXISTS hub_feed_cache (
+        hub_id TEXT NOT NULL,
+        item_uri TEXT NOT NULL,
+        author_did TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        raw_signed_json TEXT NOT NULL,
+        verified_at TEXT NOT NULL,
+        PRIMARY KEY (hub_id, item_uri)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hub_feed_cache_hub_pub
+        ON hub_feed_cache(hub_id, published_at DESC, item_uri DESC);
     `);
 
     // Safe migration for existing databases lacking friends.visibility or TOFU key pinning columns
@@ -1332,7 +1407,106 @@ export class StudioDatabase {
         name: 'clear_unsafe_media_addresses',
         up: () => this.clearUnsafeMediaAddresses(),
       },
+      {
+        // Dedicated webring_hubs table (with ping_enabled, last_ping_at, last_ping_status) and
+        // isolated zero-trust hub_feed_cache table, migrating any saved webringHubsJson entries.
+        version: 6,
+        name: 'webring_hubs_and_feed_cache',
+        up: () => this.migrateWebringHubsTableAndFeedCache(),
+      },
     ];
+  }
+
+  /**
+   * Migration 6. Ensures `webring_hubs` and `hub_feed_cache` exist with all ping/cache columns,
+   * and migrates any legacy `directoriesJson` / `webringHubsJson` records from `local_settings`.
+   */
+  private migrateWebringHubsTableAndFeedCache(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS webring_hubs (
+        url TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        added_at TEXT NOT NULL,
+        list_me INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'not-listed',
+        ping_enabled INTEGER NOT NULL DEFAULT 1,
+        last_listed_at TEXT,
+        last_ping_at TEXT,
+        last_ping_status INTEGER,
+        pending_ping_for TEXT,
+        pending_since TEXT,
+        last_error TEXT,
+        extensions_json TEXT NOT NULL DEFAULT '[]',
+        info_checked_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS hub_feed_cache (
+        hub_id TEXT NOT NULL,
+        item_uri TEXT NOT NULL,
+        author_did TEXT NOT NULL,
+        author_site_url TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        raw_signed_json TEXT NOT NULL,
+        verified_at TEXT NOT NULL,
+        PRIMARY KEY (hub_id, item_uri)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hub_feed_cache_hub_pub
+        ON hub_feed_cache(hub_id, published_at DESC, item_uri DESC);
+    `);
+
+    const existingHubCols = this.db.prepare('PRAGMA table_info(webring_hubs)').all() as Array<{ name: string }>;
+    for (const [col, ddl] of [
+      ['ping_enabled', 'INTEGER NOT NULL DEFAULT 1'],
+      ['last_ping_at', 'TEXT'],
+      ['last_ping_status', 'INTEGER'],
+    ] as const) {
+      if (!existingHubCols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE webring_hubs ADD COLUMN ${col} ${ddl};`);
+      }
+    }
+
+    for (const settingKey of ['webringHubsJson', 'directoriesJson'] as const) {
+      const row = this.db
+        .prepare('SELECT value FROM local_settings WHERE key = ?')
+        .get(settingKey) as { value: string } | undefined;
+      if (!row?.value) continue;
+      try {
+        const parsed = JSON.parse(row.value) as unknown;
+        if (Array.isArray(parsed)) {
+          const insert = this.db.prepare(`
+            INSERT OR IGNORE INTO webring_hubs (
+              url, title, added_at, list_me, state, ping_enabled,
+              last_listed_at, last_ping_at, last_ping_status,
+              pending_ping_for, pending_since, last_error,
+              extensions_json, info_checked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const item of parsed) {
+            if (!item || typeof item !== 'object') continue;
+            const d = item as Partial<WebringHubRecord>;
+            if (typeof d.url !== 'string' || !d.url.trim()) continue;
+            insert.run(
+              d.url.trim(),
+              typeof d.title === 'string' && d.title.trim() ? d.title.trim() : d.url.trim(),
+              typeof d.addedAt === 'string' && d.addedAt ? d.addedAt : new Date().toISOString(),
+              d.listMe ? 1 : 0,
+              typeof d.state === 'string' ? d.state : 'not-listed',
+              d.pingEnabled === false ? 0 : 1,
+              d.lastListedAt ?? null,
+              d.lastPingAt ?? null,
+              typeof d.lastPingStatus === 'number' ? d.lastPingStatus : null,
+              d.pendingPingFor ?? null,
+              d.pendingSince ?? null,
+              d.lastError ?? null,
+              Array.isArray(d.extensions) ? JSON.stringify(d.extensions) : '[]',
+              d.infoCheckedAt ?? null
+            );
+          }
+        }
+      } catch {
+        // Ignore malformed legacy JSON
+      }
+      this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(settingKey);
+    }
   }
 
   /** Migration 5. Clears image fields whose media/ address isn't a safe Media Library path. */
@@ -3210,7 +3384,10 @@ export class StudioDatabase {
       this.db
         .prepare('INSERT OR REPLACE INTO moderation (site_url, action, created_at) VALUES (?, ?, ?)')
         .run(normalized, action, new Date().toISOString());
-      if (action === 'block') this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalized);
+      if (action === 'block') {
+        this.db.prepare('DELETE FROM friend_notices WHERE site_url = ?').run(normalized);
+        this.db.prepare('DELETE FROM hub_feed_cache WHERE author_site_url = ?').run(normalized);
+      }
     } else {
       this.db.prepare('DELETE FROM moderation WHERE site_url = ?').run(normalized);
     }
@@ -3870,50 +4047,397 @@ export class StudioDatabase {
 
   // ---------------------------------------------------------------------------
   // Webring Hubs this persona uses (local only, never exported). Search results are never
-  // stored; only the hub addresses and this persona's listing state are.
+  // stored; Hub feed items live strictly in `hub_feed_cache`, isolated from `network_feed`.
 
-  /**
-   * One-time move of the setting saved before the rename to Webring Hubs (`directoriesJson`).
-   * Copies it to `webringHubsJson` only when that key doesn't exist yet, then drops the old key.
-   */
-  private migrateLegacyWebringHubsSetting(): void {
-    const legacy = this.db
-      .prepare("SELECT value FROM local_settings WHERE key = 'directoriesJson'")
-      .get() as { value: string } | undefined;
-    if (!legacy) return;
-    // No transaction (callers may already be in one). Safe to repeat: if the delete never ran,
-    // the next call finds the new key in place and only deletes the old one.
-    this.db
-      .prepare("INSERT INTO local_settings (key, value) VALUES ('webringHubsJson', ?) ON CONFLICT(key) DO NOTHING")
-      .run(legacy.value);
-    this.db.prepare("DELETE FROM local_settings WHERE key = 'directoriesJson'").run();
+  private mapWebringHubRow(row: Record<string, unknown>): WebringHubRecord {
+    let extensions: WebringHubExtensionInfo[] | undefined;
+    try {
+      const parsed = JSON.parse(String(row.extensions_json || '[]')) as unknown;
+      if (Array.isArray(parsed)) {
+        extensions = parsed.filter(
+          (e): e is WebringHubExtensionInfo =>
+            Boolean(e) && typeof e === 'object' && typeof (e as WebringHubExtensionInfo).id === 'string'
+        );
+      }
+    } catch {
+      extensions = undefined;
+    }
+    const rawStatus = row.last_ping_status;
+    const lastPingStatus =
+      rawStatus !== null && rawStatus !== undefined && Number.isFinite(Number(rawStatus))
+        ? Number(rawStatus)
+        : undefined;
+    return {
+      url: String(row.url),
+      title: String(row.title || row.url),
+      addedAt: String(row.added_at),
+      listMe: Boolean(row.list_me),
+      state: (String(row.state || 'not-listed') as WebringHubRecord['state']),
+      pingEnabled: row.ping_enabled === undefined || row.ping_enabled === null ? true : Boolean(row.ping_enabled),
+      ...(row.last_listed_at ? { lastListedAt: String(row.last_listed_at) } : {}),
+      ...(row.last_ping_at ? { lastPingAt: String(row.last_ping_at) } : {}),
+      ...(lastPingStatus !== undefined ? { lastPingStatus } : {}),
+      ...(row.pending_ping_for ? { pendingPingFor: String(row.pending_ping_for) } : {}),
+      ...(row.pending_since ? { pendingSince: String(row.pending_since) } : {}),
+      ...(row.last_error ? { lastError: String(row.last_error) } : {}),
+      ...(extensions !== undefined ? { extensions } : {}),
+      ...(row.info_checked_at ? { infoCheckedAt: String(row.info_checked_at) } : {}),
+    };
   }
 
-  public getWebringHubs(): WebringHubRecord[] {
-    this.migrateLegacyWebringHubsSetting();
-    const row = this.db
-      .prepare("SELECT value FROM local_settings WHERE key = 'webringHubsJson'")
-      .get() as { value: string } | undefined;
-    if (!row?.value) return [];
-    try {
-      const parsed = JSON.parse(row.value) as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter(
-        (d): d is WebringHubRecord =>
-          Boolean(d) && typeof d === 'object' && typeof (d as WebringHubRecord).url === 'string'
-      );
-    } catch {
-      return [];
+  private drainLegacyWebringHubsJson(): void {
+    for (const settingKey of ['webringHubsJson', 'directoriesJson'] as const) {
+      const row = this.db
+        .prepare('SELECT value FROM local_settings WHERE key = ?')
+        .get(settingKey) as { value: string } | undefined;
+      if (!row) continue;
+      if (row.value) {
+        try {
+          const parsed = JSON.parse(row.value) as unknown;
+          if (Array.isArray(parsed)) {
+            const insert = this.db.prepare(`
+              INSERT OR IGNORE INTO webring_hubs (
+                url, title, added_at, list_me, state, ping_enabled,
+                last_listed_at, last_ping_at, last_ping_status,
+                pending_ping_for, pending_since, last_error,
+                extensions_json, info_checked_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            for (const item of parsed) {
+              if (!item || typeof item !== 'object') continue;
+              const d = item as Partial<WebringHubRecord>;
+              if (typeof d.url !== 'string' || !d.url.trim()) continue;
+              insert.run(
+                d.url.trim(),
+                typeof d.title === 'string' && d.title.trim() ? d.title.trim() : d.url.trim(),
+                typeof d.addedAt === 'string' && d.addedAt ? d.addedAt : new Date().toISOString(),
+                d.listMe ? 1 : 0,
+                typeof d.state === 'string' ? d.state : 'not-listed',
+                d.pingEnabled === false ? 0 : 1,
+                d.lastListedAt ?? null,
+                d.lastPingAt ?? null,
+                typeof d.lastPingStatus === 'number' ? d.lastPingStatus : null,
+                d.pendingPingFor ?? null,
+                d.pendingSince ?? null,
+                d.lastError ?? null,
+                Array.isArray(d.extensions) ? JSON.stringify(d.extensions) : '[]',
+                d.infoCheckedAt ?? null
+              );
+            }
+          }
+        } catch {
+          // ignore malformed JSON
+        }
+      }
+      this.db.prepare('DELETE FROM local_settings WHERE key = ?').run(settingKey);
     }
   }
 
+  public getWebringHubs(): WebringHubRecord[] {
+    this.drainLegacyWebringHubsJson();
+    const rows = this.db
+      .prepare('SELECT * FROM webring_hubs ORDER BY added_at ASC, url ASC')
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapWebringHubRow(r));
+  }
+
   public saveWebringHubs(hubs: WebringHubRecord[]): void {
-    this.migrateLegacyWebringHubsSetting();
-    this.db
+    this.transaction(() => {
+      const existing = (this.db.prepare('SELECT url FROM webring_hubs').all() as Array<{ url: string }>).map(
+        (r) => r.url
+      );
+      const keep = new Set(hubs.map((h) => h.url));
+      for (const oldUrl of existing) {
+        if (!keep.has(oldUrl)) {
+          this.db.prepare('DELETE FROM webring_hubs WHERE url = ?').run(oldUrl);
+          this.db.prepare('DELETE FROM hub_feed_cache WHERE hub_id = ?').run(oldUrl);
+        }
+      }
+      const upsert = this.db.prepare(`
+        INSERT INTO webring_hubs (
+          url, title, added_at, list_me, state, ping_enabled,
+          last_listed_at, last_ping_at, last_ping_status,
+          pending_ping_for, pending_since, last_error,
+          extensions_json, info_checked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET
+          title = excluded.title,
+          added_at = excluded.added_at,
+          list_me = excluded.list_me,
+          state = excluded.state,
+          ping_enabled = excluded.ping_enabled,
+          last_listed_at = excluded.last_listed_at,
+          last_ping_at = excluded.last_ping_at,
+          last_ping_status = excluded.last_ping_status,
+          pending_ping_for = excluded.pending_ping_for,
+          pending_since = excluded.pending_since,
+          last_error = excluded.last_error,
+          extensions_json = excluded.extensions_json,
+          info_checked_at = excluded.info_checked_at
+      `);
+      for (const h of hubs) {
+        upsert.run(
+          h.url,
+          h.title || h.url,
+          h.addedAt || new Date().toISOString(),
+          h.listMe ? 1 : 0,
+          h.state || 'not-listed',
+          h.pingEnabled === false ? 0 : 1,
+          h.lastListedAt ?? null,
+          h.lastPingAt ?? null,
+          h.lastPingStatus !== undefined && h.lastPingStatus !== null ? Number(h.lastPingStatus) : null,
+          h.pendingPingFor ?? null,
+          h.pendingSince ?? null,
+          h.lastError ?? null,
+          JSON.stringify(h.extensions || []),
+          h.infoCheckedAt ?? null
+        );
+      }
+    });
+  }
+
+  public setWebringHubPingEnabled(url: string, enabled: boolean): WebringHubRecord {
+    const normalized = url.trim().replace(/\/+$/, '');
+    const res = this.db
+      .prepare('UPDATE webring_hubs SET ping_enabled = ? WHERE url = ?')
+      .run(enabled ? 1 : 0, normalized) as { changes?: number | bigint };
+    if (!Number(res.changes || 0)) {
+      throw new Error(`${normalized} isn't in your Webring Hubs.`);
+    }
+    const row = this.db.prepare('SELECT * FROM webring_hubs WHERE url = ?').get(normalized) as Record<string, unknown>;
+    return this.mapWebringHubRow(row);
+  }
+
+  public recordWebringHubPingStatus(
+    url: string,
+    update: {
+      lastPingAt: string;
+      lastPingStatus: number | null;
+      state?: WebringHubRecord['state'];
+      listMe?: boolean;
+      lastError?: string | null;
+      pendingPingFor?: string | null;
+      pendingSince?: string | null;
+    }
+  ): void {
+    const sets: string[] = ['last_ping_at = ?', 'last_ping_status = ?'];
+    const params: unknown[] = [update.lastPingAt, update.lastPingStatus];
+    if (update.state !== undefined) {
+      sets.push('state = ?');
+      params.push(update.state);
+    }
+    if (update.listMe !== undefined) {
+      sets.push('list_me = ?');
+      params.push(update.listMe ? 1 : 0);
+    }
+    if (update.lastError !== undefined) {
+      sets.push('last_error = ?');
+      params.push(update.lastError);
+    }
+    if (update.pendingPingFor !== undefined) {
+      sets.push('pending_ping_for = ?');
+      params.push(update.pendingPingFor);
+    }
+    if (update.pendingSince !== undefined) {
+      sets.push('pending_since = ?');
+      params.push(update.pendingSince);
+    }
+    params.push(url);
+    this.db.prepare(`UPDATE webring_hubs SET ${sets.join(', ')} WHERE url = ?`).run(...params);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Isolated Zero-Trust Hub Feed Cache (`hub_feed_cache`)
+
+  /**
+   * Upserts verified Hub feed items for one Hub and automatically prunes older rows so each Hub
+   * keeps at most `maxItemsPerHub` (default 500) newest items. Never touches `network_feed`.
+   */
+  public upsertHubFeedCacheEntries(
+    hubId: string,
+    rows: HubFeedCacheRow[],
+    maxItemsPerHub = HUB_FEED_CACHE_LIMIT
+  ): { upserted: number; pruned: number } {
+    const cleanHubId = hubId.trim().replace(/\/+$/, '');
+    const cap = Math.max(1, Math.floor(maxItemsPerHub));
+    let upserted = 0;
+    let pruned = 0;
+
+    this.transaction(() => {
+      if (rows.length > 0) {
+        const stmt = this.db.prepare(`
+          INSERT INTO hub_feed_cache (
+            hub_id, item_uri, author_did, author_site_url, published_at, raw_signed_json, verified_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(hub_id, item_uri) DO UPDATE SET
+            author_did = excluded.author_did,
+            author_site_url = excluded.author_site_url,
+            published_at = excluded.published_at,
+            raw_signed_json = excluded.raw_signed_json,
+            verified_at = excluded.verified_at
+        `);
+        for (const r of rows) {
+          stmt.run(
+            cleanHubId,
+            r.itemUri,
+            r.authorDid,
+            normalizeSiteUrl(r.authorSiteUrl),
+            r.publishedAt,
+            r.rawSignedJson,
+            r.verifiedAt
+          );
+          upserted++;
+        }
+      }
+
+      const pruneRes = this.db
+        .prepare(
+          `DELETE FROM hub_feed_cache
+           WHERE hub_id = ?
+             AND item_uri NOT IN (
+               SELECT item_uri FROM hub_feed_cache
+               WHERE hub_id = ?
+               ORDER BY published_at DESC, item_uri DESC
+               LIMIT ?
+             )`
+        )
+        .run(cleanHubId, cleanHubId, cap) as { changes?: number | bigint };
+      pruned = Number(pruneRes.changes || 0);
+    });
+
+    return { upserted, pruned };
+  }
+
+  /**
+   * Reads cached verified Hub feed entries for `hubId`, ordered newest first and filtered
+   * against the persona's local mute/block moderation list.
+   */
+  public getHubFeedCache(
+    hubId: string,
+    options: { before?: string; limit?: number; contentType?: SharedItemType } = {}
+  ): HubFeedEntry[] {
+    const cleanHubId = hubId.trim().replace(/\/+$/, '');
+    const limit = Math.min(Math.max(Math.floor(options.limit || 500), 1), HUB_FEED_CACHE_LIMIT);
+    const where = ['hub_id = ?'];
+    const params: unknown[] = [cleanHubId];
+
+    if (options.before && options.before.trim()) {
+      const beforeTs = options.before.split('|')[0];
+      if (beforeTs) {
+        where.push('published_at < ?');
+        params.push(beforeTs);
+      }
+    }
+
+    const rows = this.db
       .prepare(
-        "INSERT INTO local_settings (key, value) VALUES ('webringHubsJson', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        `SELECT hub_id, item_uri, author_did, author_site_url, published_at, raw_signed_json, verified_at
+         FROM hub_feed_cache
+         WHERE ${where.join(' AND ')}
+         ORDER BY published_at DESC, item_uri DESC
+         LIMIT ?`
       )
-      .run(JSON.stringify(hubs));
+      .all(...params, limit) as Array<Record<string, unknown>>;
+
+    const moderation = new Map(this.getModeration().map((m) => [m.siteUrl, m.action]));
+    const friendsByUrl = new Map(this.getFriends().map((f) => [normalizeSiteUrl(f.siteUrl), f]));
+
+    const entries: HubFeedEntry[] = [];
+    for (const r of rows) {
+      const authorSiteUrl = normalizeSiteUrl(String(r.author_site_url || ''));
+      const mod = moderation.get(authorSiteUrl);
+      if (mod === 'block' || mod === 'mute') continue;
+
+      const rawSignedJson = String(r.raw_signed_json || '{}');
+      let parsed: Record<string, unknown> = {};
+      try {
+        const decoded = JSON.parse(rawSignedJson) as unknown;
+        if (decoded && typeof decoded === 'object') parsed = decoded as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      const itemObj =
+        parsed.item && typeof parsed.item === 'object'
+          ? (parsed.item as Record<string, unknown>)
+          : parsed;
+
+      const entryType = (typeof itemObj.type === 'string' ? itemObj.type : 'post') as SharedItemType;
+      if (options.contentType && entryType !== options.contentType) continue;
+
+      const friend = friendsByUrl.get(authorSiteUrl);
+      let fallbackHost = authorSiteUrl;
+      try {
+        fallbackHost = new URL(authorSiteUrl).hostname;
+      } catch {
+        // keep siteUrl
+      }
+
+      const authorName =
+        (typeof parsed.authorName === 'string' && parsed.authorName.trim()) ||
+        friend?.displayName ||
+        fallbackHost;
+      const authorHandle =
+        (typeof parsed.authorHandle === 'string' && parsed.authorHandle.trim()) ||
+        friend?.handle ||
+        fallbackHost;
+      const rawAvatar =
+        (typeof parsed.authorAvatarUrl === 'string' && parsed.authorAvatarUrl.trim()) ||
+        friend?.avatarUrl ||
+        '';
+      const authorAvatarUrl =
+        rawAvatar.startsWith('https://') && isUrlWithinSite(rawAvatar, authorSiteUrl) ? rawAvatar : '';
+
+      const rawMedia = typeof itemObj.mediaUrl === 'string' ? itemObj.mediaUrl.trim() : '';
+      const mediaUrl =
+        /^https:\/\//i.test(rawMedia)
+          ? rawMedia
+          : rawMedia.startsWith('media/') && isAllowedMediaReference(rawMedia)
+            ? `${authorSiteUrl}/${rawMedia}`
+            : '';
+
+      entries.push({
+        hubId: String(r.hub_id),
+        itemUri: String(r.item_uri),
+        itemId: typeof itemObj.id === 'string' ? itemObj.id : String(r.item_uri),
+        authorDid: String(r.author_did),
+        authorSiteUrl,
+        authorName,
+        authorHandle,
+        authorAvatarUrl,
+        entryType,
+        title: typeof itemObj.title === 'string' ? itemObj.title : '',
+        targetUrl: typeof itemObj.targetUrl === 'string' ? itemObj.targetUrl : String(r.item_uri),
+        category: typeof itemObj.category === 'string' ? itemObj.category : 'general',
+        commentary: typeof itemObj.commentary === 'string' ? itemObj.commentary : '',
+        mediaUrl,
+        ...(typeof itemObj.rating === 'number' ? { rating: itemObj.rating } : {}),
+        tags: Array.isArray(itemObj.tags)
+          ? itemObj.tags.filter((t): t is string => typeof t === 'string').slice(0, 20)
+          : [],
+        publishedAt: String(r.published_at),
+        ...(typeof itemObj.updatedAt === 'string' ? { updatedAt: itemObj.updatedAt } : {}),
+        verifiedAt: String(r.verified_at),
+        rawSignedJson,
+      });
+    }
+    return entries;
+  }
+
+  public countHubFeedCache(hubId: string): number {
+    const cleanHubId = hubId.trim().replace(/\/+$/, '');
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM hub_feed_cache WHERE hub_id = ?')
+      .get(cleanHubId) as { n: number } | undefined;
+    return Number(row?.n || 0);
+  }
+
+  public clearHubFeedCache(hubId?: string): void {
+    if (hubId) {
+      this.db.prepare('DELETE FROM hub_feed_cache WHERE hub_id = ?').run(hubId.trim().replace(/\/+$/, ''));
+    } else {
+      this.db.exec('DELETE FROM hub_feed_cache');
+    }
   }
 
   // ---------------------------------------------------------------------------
