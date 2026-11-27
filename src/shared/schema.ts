@@ -302,6 +302,13 @@ export function parseLayout(raw: unknown): LayoutBlock[] {
   return blocks;
 }
 
+/** Optional short "Now" status on a profile (<=140 chars), shown on the site and hub Now wall. */
+export const ProfileNowSchema = z.object({
+  text: z.string().min(1).max(140),
+  updatedAt: z.string(),
+});
+export type ProfileNow = z.infer<typeof ProfileNowSchema>;
+
 export const ProfileDocumentSchema = z.object({
   schemaVersion: z.string().default(WEBRING_SCHEMA_VERSION),
   did: z.string(),
@@ -314,6 +321,7 @@ export const ProfileDocumentSchema = z.object({
   avatarUrl: z.string().default(''),
   bannerUrl: z.string().default(''),
   interests: z.array(z.string()).default([]),
+  now: ProfileNowSchema.optional().catch(undefined),
   customLinks: z
     .array(
       z.object({
@@ -486,6 +494,30 @@ export const ItemListingSchema = z.object({
 });
 export type ItemListing = z.infer<typeof ItemListingSchema>;
 
+/** Optional vouch (endorsement) details on a `post` about another member. */
+export const ItemVouchKindSchema = z.enum(['met', 'skill', 'worked-with']);
+export type ItemVouchKind = z.infer<typeof ItemVouchKindSchema>;
+
+export const ItemVouchSchema = z
+  .object({
+    subjectDid: z
+      .string()
+      .max(255)
+      .regex(/^did:web:[A-Za-z0-9._%:\-]+$/, 'Subject DID must be a valid did:web: identifier'),
+    subjectSiteUrl: z
+      .string()
+      .max(500)
+      .regex(/^https?:\/\/[^\s]+$/i, 'Subject site URL must start with http:// or https://'),
+    subjectName: z.string().max(120).optional(),
+    kind: ItemVouchKindSchema,
+    skill: z.string().max(60).optional(),
+  })
+  .refine((v) => v.kind !== 'skill' || Boolean(v.skill && v.skill.trim().length > 0), {
+    message: 'A skill vouch needs a skill name (up to 60 characters)',
+    path: ['skill'],
+  });
+export type ItemVouch = z.infer<typeof ItemVouchSchema>;
+
 export const SharedItemSchema = z.object({
   id: z.string(),
   canonicalUrl: z.string(), // e.g., https://alice.example/api/items.json#item-456
@@ -507,6 +539,8 @@ export const SharedItemSchema = z.object({
   event: ItemEventSchema.optional().catch(undefined),
   /** Ask/offer details (posts only). */
   listing: ItemListingSchema.optional().catch(undefined),
+  /** Vouch details (posts only). */
+  vouch: ItemVouchSchema.optional().catch(undefined),
 });
 export type SharedItem = z.infer<typeof SharedItemSchema>;
 
@@ -1216,13 +1250,16 @@ export function buildDidDocument(
  * Parses a custom `webring://interact?...` deep link URI into structured action parameters
  */
 export interface WebringDeepLinkAction {
-  action: 'like' | 'share' | 'comment' | 'friend' | 'join-ring';
+  action: 'post' | 'like' | 'share' | 'recommendation' | 'comment' | 'friend' | 'join-ring';
   targetUrl: string;
   title?: string;
   authorUrl?: string;
   authorName?: string;
   mediaUrl?: string;
   category?: string;
+  tags?: string[];
+  postLocation?: string;
+  hubName?: string;
 }
 
 export function parseWebringUri(uri: string): WebringDeepLinkAction | null {
@@ -1230,12 +1267,21 @@ export function parseWebringUri(uri: string): WebringDeepLinkAction | null {
     const parsed = new URL(uri);
     if (parsed.protocol !== 'webring:') return null;
     const actionParam = parsed.searchParams.get('action') || 'share';
-    const targetUrl = parsed.searchParams.get('targetUrl') || '';
-    if (!targetUrl) return null;
-
-    const action = (['like', 'share', 'comment', 'friend', 'join-ring'].includes(actionParam)
+    const action = (['post', 'like', 'share', 'recommendation', 'comment', 'friend', 'join-ring'].includes(actionParam)
       ? actionParam
       : 'share') as WebringDeepLinkAction['action'];
+    const targetUrl = parsed.searchParams.get('targetUrl') || '';
+    if (action !== 'post' && action !== 'share' && action !== 'recommendation' && !targetUrl) return null;
+
+    const rawTags = parsed.searchParams.get('tags') || '';
+    const tags = rawTags
+      .split(',')
+      .map((t) => t.trim().replace(/^#/, ''))
+      .filter((t) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,59}$/.test(t))
+      .slice(0, 10);
+
+    const rawLocation = (parsed.searchParams.get('location') || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 100);
+    const rawHubName = (parsed.searchParams.get('hub') || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 100);
 
     return {
       action,
@@ -1246,6 +1292,9 @@ export function parseWebringUri(uri: string): WebringDeepLinkAction | null {
       // Only a web image (a link can't name a file on this computer, or a crafted media/ path)
       mediaUrl: /^https:\/\//i.test(parsed.searchParams.get('mediaUrl') || '') ? parsed.searchParams.get('mediaUrl')! : undefined,
       category: parsed.searchParams.get('category') || undefined,
+      ...(tags.length ? { tags } : {}),
+      ...(rawLocation ? { postLocation: rawLocation } : {}),
+      ...(rawHubName ? { hubName: rawHubName } : {}),
     };
   } catch {
     return null;
@@ -1255,12 +1304,15 @@ export function parseWebringUri(uri: string): WebringDeepLinkAction | null {
 export function buildWebringUri(params: WebringDeepLinkAction): string {
   const search = new URLSearchParams();
   search.set('action', params.action);
-  search.set('targetUrl', params.targetUrl);
+  if (params.targetUrl) search.set('targetUrl', params.targetUrl);
   if (params.title) search.set('title', params.title);
   if (params.authorUrl) search.set('authorUrl', params.authorUrl);
   if (params.authorName) search.set('authorName', params.authorName);
   if (params.mediaUrl) search.set('mediaUrl', params.mediaUrl);
   if (params.category) search.set('category', params.category);
+  if (params.tags && params.tags.length) search.set('tags', params.tags.join(','));
+  if (params.postLocation) search.set('location', params.postLocation.slice(0, 100));
+  if (params.hubName) search.set('hub', params.hubName.slice(0, 100));
   return `webring://interact?${search.toString()}`;
 }
 

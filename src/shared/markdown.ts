@@ -69,11 +69,17 @@ export function renderMarkdown(source: string): string {
       continue;
     }
     if (/^```/.test(line)) {
+      const langMatch = /^```([A-Za-z0-9_+.-]{1,24})\s*$/.exec(line);
+      const lang = langMatch ? langMatch[1] : '';
       const code: string[] = [];
       i++;
       while (i < lines.length && !/^```/.test(lines[i])) code.push(lines[i++]);
       i++;
-      html.push(`<pre><code>${code.join('\n')}</code></pre>`);
+      if (lang) {
+        html.push(`<div class="code-block"><div class="code-block-head"><span class="code-lang">${lang}</span></div><pre><code class="lang-${lang}">${code.join('\n')}</code></pre></div>`);
+      } else {
+        html.push(`<pre><code>${code.join('\n')}</code></pre>`);
+      }
       continue;
     }
     const heading = /^(#{1,4})\s+(.*)$/.exec(line);

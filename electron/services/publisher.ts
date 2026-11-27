@@ -29,6 +29,45 @@ export interface PublishResult {
   hostKeyMismatch?: { host: string; port: number; expectedFingerprint: string; presentedFingerprint: string };
 }
 
+export interface UnpublishResult {
+  success: boolean;
+  method: 'github' | 'remote';
+  removedFiles: number;
+  message: string;
+}
+
+const SAFE_ROOT_STUDIO_FILES = new Set([
+  'index.html',
+  '404.html',
+  'favicon.png',
+  'favicon.ico',
+  'ads.txt',
+  'CNAME',
+  '.nojekyll',
+  '.well-known/did.json',
+]);
+
+const SAFE_STUDIO_PREFIXES = ['api/', 'albums/', 'media/', 'assets/', ...STUDIO_OWNED_PREFIXES];
+
+/**
+ * Filters a list of relative paths down to only safe, Studio-owned site files.
+ * Guarantees unpublish cleanup can never traverse directories or delete unrelated host files.
+ */
+export function filterSafeManagedPaths(paths: Iterable<string>): string[] {
+  const safe: string[] = [];
+  for (const raw of paths) {
+    const rel = String(raw || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
+    if (!rel || rel.startsWith('/') || rel.includes('..') || rel.includes('\0')) continue;
+    if (
+      SAFE_ROOT_STUDIO_FILES.has(rel) ||
+      SAFE_STUDIO_PREFIXES.some((prefix) => rel.startsWith(prefix))
+    ) {
+      safe.push(rel);
+    }
+  }
+  return [...new Set(safe)];
+}
+
 /**
  * The SFTP server's key isn't the one pinned at an earlier publish. Nothing was uploaded and the
  * new key isn't pinned: the user decides, after checking with their host.
@@ -838,10 +877,166 @@ export class SitePublisher {
    * error. We retry those (and raw 429s) with backoff instead of failing the whole deploy on one
    * unlucky request.
    */
+  /**
+   * Safely disables GitHub Pages on the previously configured repo so the old site and its
+   * `/.well-known/did.json` are taken offline without deleting the user's repository.
+   */
+  public async unpublishGitHubPages(settings: PublishSettings): Promise<UnpublishResult> {
+    const owner = (settings.githubOwner || '').trim();
+    const repo = (settings.githubRepo || '').trim();
+    const token = (settings.githubToken || '').trim();
+    if (!owner || !repo || !token) {
+      return {
+        success: false,
+        method: 'github',
+        removedFiles: 0,
+        message: 'GitHub owner, repository, and access token are required to disable the old GitHub Pages site.',
+      };
+    }
+    try {
+      const res = await this.githubRequest(token, `/repos/${owner}/${repo}/pages`, 'DELETE');
+      if (res.status === 204 || res.status === 404) {
+        return {
+          success: true,
+          method: 'github',
+          removedFiles: 0,
+          message:
+            res.status === 404
+              ? `GitHub Pages was already disabled for ${owner}/${repo}.`
+              : `Disabled GitHub Pages for ${owner}/${repo} (your repository and commit history were preserved).`,
+        };
+      }
+      return {
+        success: false,
+        method: 'github',
+        removedFiles: 0,
+        message: `Could not disable GitHub Pages for ${owner}/${repo} (HTTP ${res.status}${this.githubErrorDetail(res.body)}).`,
+      };
+    } catch (err: unknown) {
+      return {
+        success: false,
+        method: 'github',
+        removedFiles: 0,
+        message: `Failed to disable GitHub Pages: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * Safely deletes only Studio-managed files (recorded in the publish ledger) from the previously
+   * configured SFTP/FTP web host so unrelated files in the remote directory are never touched.
+   */
+  public async unpublishRemoteHost(settings: PublishSettings): Promise<UnpublishResult> {
+    if (!settings.host?.trim() || !settings.username?.trim()) {
+      return {
+        success: false,
+        method: 'remote',
+        removedFiles: 0,
+        message: 'SFTP/FTP host and username are required to remove the old web host site.',
+      };
+    }
+    const db = this.generator.database;
+    const mode = settings.protocol === 'sftp' ? 'sftp' : 'ftp';
+    const port = settings.port || (mode === 'sftp' ? 22 : 21);
+    const root = (settings.remotePath || '/').replace(/\/+$/, '') || '';
+    const remote = (relPath: string) => `${root}/${relPath}`;
+    const destination = `${mode}://${settings.username}@${settings.host}:${port}${root || '/'}`;
+    const ledgerPaths = [...db.getPublishLedger(destination).keys()];
+    const targets = filterSafeManagedPaths(
+      ledgerPaths.length > 0 ? ledgerPaths : [...SAFE_ROOT_STUDIO_FILES]
+    );
+
+    if (mode === 'sftp') {
+      const sftp = new SftpClient();
+      try {
+        const method = sftpAuthMethodOf(settings);
+        const auth: Record<string, unknown> =
+          method === 'agent'
+            ? { agent: resolveSshAgent() }
+            : method === 'privateKey'
+              ? {
+                  privateKey: fs.readFileSync(
+                    settings.sftpPrivateKeyPath ||
+                      (() => {
+                        throw new Error('Choose a key file for SFTP in Publishing settings.');
+                      })(),
+                    'utf8'
+                  ),
+                  ...(settings.sftpKeyPassphrase ? { passphrase: settings.sftpKeyPassphrase } : {}),
+                }
+              : { password: settings.password || '' };
+        await sftp.connect({
+          host: settings.host,
+          port,
+          username: settings.username,
+          ...auth,
+          hostHash: 'sha256',
+          hostVerifier: (hashedKey: string) =>
+            verifyOrPinSftpHostKey(db, settings.host, port, hashedKey).accepted,
+        });
+        let removed = 0;
+        for (const rel of targets) {
+          try {
+            await sftp.delete(remote(rel), true);
+            removed++;
+          } catch {
+            // File may already be absent on the remote host
+          }
+        }
+        await sftp.end();
+        db.clearPublishLedger(destination);
+        return {
+          success: true,
+          method: 'remote',
+          removedFiles: removed,
+          message: `Removed ${removed} Webring Studio file(s) from ${settings.host}:${root || '/'}.`,
+        };
+      } catch (err: unknown) {
+        await sftp.end().catch(() => undefined);
+        return {
+          success: false,
+          method: 'remote',
+          removedFiles: 0,
+          message: `SFTP cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+
+    const client = new ftp.Client();
+    try {
+      await client.access(ftpAccessOptions(settings, port));
+      let removed = 0;
+      for (const rel of targets) {
+        try {
+          await client.remove(remote(rel));
+          removed++;
+        } catch {
+          // File may already be absent
+        }
+      }
+      client.close();
+      db.clearPublishLedger(destination);
+      return {
+        success: true,
+        method: 'remote',
+        removedFiles: removed,
+        message: `Removed ${removed} Webring Studio file(s) from ${settings.host}:${root || '/'}.`,
+      };
+    } catch (err: unknown) {
+      client.close();
+      return {
+        success: false,
+        method: 'remote',
+        removedFiles: 0,
+        message: `FTP cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
   private async githubRequest(
     token: string,
     urlPath: string,
-    method: 'GET' | 'POST' | 'PATCH' | 'PUT' = 'GET',
+    method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE' = 'GET',
     body?: unknown,
     attempt = 1
   ): Promise<{ status: number; body: unknown }> {

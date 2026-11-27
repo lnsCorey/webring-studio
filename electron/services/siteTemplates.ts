@@ -284,6 +284,7 @@ export function renderTemplatePage(ctx: any): string {
     const d = new Date(iso);
     return isNaN(d.getTime()) ? '' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
   };
+  const renderTime = (iso: string) => (ctx.relTimeTag ? ctx.relTimeTag(iso) : esc(formatDate(iso)));
   const avatar = (cls: string) =>
     profile.avatarUrl
       ? '<img src="' + safeUrl(profile.avatarUrl) + '" alt="" class="profile-avatar tpl-avatar ' + cls + '" />'
@@ -354,6 +355,21 @@ export function renderTemplatePage(ctx: any): string {
       (ev.url ? '<p>🔗 <a href="' + safeUrl(ev.url) + '" target="_blank" rel="noopener noreferrer" class="underline">Event link</a></p>' : '') +
       '</div>';
   };
+  // Vouches (posts with vouch details): who and what kind
+  const vouchBlock = (item: any) => {
+    const v = item.type === 'post' && item.vouch && typeof item.vouch === 'object' ? item.vouch : null;
+    if (!v || !v.subjectDid || !v.subjectSiteUrl) return '';
+    let name = v.subjectName || '';
+    if (!name && Array.isArray(ctx.friends)) {
+      const f = ctx.friends.find((c: any) => c.did === v.subjectDid || String(c.siteUrl || '').replace(/\/+$/, '') === String(v.subjectSiteUrl).replace(/\/+$/, ''));
+      if (f && f.displayName) name = f.displayName;
+    }
+    if (!name) {
+      try { name = new URL(v.subjectSiteUrl).hostname; } catch { name = v.subjectDid; }
+    }
+    const detail = v.kind === 'skill' ? 'skill: ' + (v.skill || '') : v.kind === 'worked-with' ? 'worked with' : 'met';
+    return '<div class="tpl-event text-sm mt-1"><p>🤝 Vouches for <a href="' + safeUrl(v.subjectSiteUrl) + '" target="_blank" rel="noopener noreferrer" class="underline">' + esc(name) + '</a>: ' + esc(detail) + '</p></div>';
+  };
   const itemBody = (item: any) => {
     const isSelfPost = item.type === 'post' && (!item.targetUrl || item.targetUrl === item.canonicalUrl);
     const r = reactions(item.canonicalUrl);
@@ -368,10 +384,10 @@ export function renderTemplatePage(ctx: any): string {
       ? '<p class="text-xs tpl-muted">' + (item.type === 'comment' ? 'Replying to' : 'Source') + ': <a href="' + safeUrl(item.targetAuthorUrl || item.targetUrl) + '" target="_blank" rel="noopener noreferrer" class="underline">' + esc(item.targetAuthorName) + '</a></p>'
       : '';
     const stars = item.rating && item.type !== 'post' && item.type !== 'comment' ? ' ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : '';
-    return title + source + eventBlock(item) +
-      (item.type === 'post' && item.commentary
-        ? '<div class="prose-block post-body text-sm mt-1">' + ctx.renderMarkdown(item.commentary) + '</div>'
-        : item.commentary ? '<p class="text-sm mt-1 whitespace-pre-line">' + esc(item.commentary) + stars + '</p>' : stars ? '<p class="text-sm">' + stars + '</p>' : '') +
+    return title + source + eventBlock(item) + vouchBlock(item) +
+      (item.commentary
+        ? '<div class="prose-block post-body text-sm mt-1">' + ctx.renderMarkdown(item.commentary) + '</div>' + (stars ? '<p class="text-sm mt-1">' + stars + '</p>' : '')
+        : stars ? '<p class="text-sm">' + stars + '</p>' : '') +
       (item.mediaUrl ? '<img src="' + safeUrl(item.mediaUrl) + '" alt="" class="tpl-media" />' : '') +
       ((item.tags || []).length ? '<p class="text-xs tpl-accent mt-1">' + item.tags.map((t: string) => '#' + esc(t)).join(' ') + '</p>' : '') +
       (r.endorsements.length ? '<p class="text-xs tpl-muted mt-1">↻ ' + r.endorsements.map((e: any) => esc(e.authorName)).join(', ') + '</p>' : '') +
@@ -383,6 +399,7 @@ export function renderTemplatePage(ctx: any): string {
   const typeLabel = (item: any) => {
     if (item.type === 'post' && item.event) return 'Event';
     if (item.type === 'post' && item.listing) return (item.listing.kind === 'ask' ? 'Ask' : 'Offer') + (item.listing.status === 'closed' ? ' · closed' : '');
+    if (item.type === 'post' && item.vouch) return 'Vouch';
     return esc(TYPE_LABELS[item.type] || item.type);
   };
   // Short text for tiles and reel cards: posts are Markdown, so drop the markers
@@ -411,19 +428,19 @@ export function renderTemplatePage(ctx: any): string {
     });
   const albumPostCard = (a: any) =>
     '<article class="card-surface fp-post"><div class="fp-post-head">' + avatar('w-10 h-10 text-base') +
-    '<div><p class="font-bold text-sm">' + name + ' <span class="tpl-muted font-normal">posted an album</span></p><p class="text-xs tpl-muted">' + esc(formatDate(a.createdAt)) + '</p></div></div>' +
+    '<div><p class="font-bold text-sm">' + name + ' <span class="tpl-muted font-normal">posted an album</span></p><p class="text-xs tpl-muted">' + renderTime(a.createdAt) + '</p></div></div>' +
     '<div class="fp-post-body">' + albumPostBody(a) + '</div></article>';
   const albumTweetRow = (a: any) =>
-    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · posted an album · ' + esc(formatDate(a.createdAt)) + '</span></div>' +
+    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · posted an album · ' + renderTime(a.createdAt) + '</span></div>' +
     albumPostBody(a) + '</div></article>';
   const postCard = (item: any) =>
     item.type === 'album' ? albumPostCard(item.album) :
     '<article class="card-surface fp-post"><div class="fp-post-head">' + avatar('w-10 h-10 text-base') +
-    '<div><p class="font-bold text-sm">' + name + '</p><p class="text-xs tpl-muted">' + esc(formatDate(item.createdAt)) + ' · ' + typeLabel(item) + (item.category && item.category !== 'general' ? ' · ' + esc(item.category) : '') + edited(item) + '</p></div></div>' +
+    '<div><p class="font-bold text-sm">' + name + '</p><p class="text-xs tpl-muted">' + renderTime(item.createdAt) + ' · ' + typeLabel(item) + (item.category && item.category !== 'general' ? ' · ' + esc(item.category) : '') + edited(item) + '</p></div></div>' +
     '<div class="fp-post-body">' + itemBody(item) + '</div>' + itemActions(item, true) + '</article>';
   const tweetRow = (item: any) =>
     item.type === 'album' ? albumTweetRow(item.album) :
-    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · ' + esc(formatDate(item.createdAt)) + edited(item) + '</span>' +
+    '<article class="tw-row">' + avatar('') + '<div class="tw-main"><div class="tw-head"><span class="font-bold">' + name + '</span><span class="tpl-muted">' + esc(handle) + ' · ' + renderTime(item.createdAt) + edited(item) + '</span>' +
     (item.type !== 'post' ? '<span class="tpl-chip">' + typeLabel(item) + '</span>' : '') + '</div>' + itemBody(item) + itemActions(item, false) + '</div></article>';
   const itemTile = (item: any) => {
     if (item.type === 'album') return albumTile(item.album);
@@ -536,6 +553,7 @@ export function renderTemplatePage(ctx: any): string {
       '<div class="flex flex-wrap gap-2 pb-1">' + addFriend('tpl-btn-solid') + jsonLink + '</div></div>' + tabs('', rendered) + '</div>';
     const introBody =
       (profile.bio ? '<p class="text-sm mb-2 whitespace-pre-line">' + esc(profile.bio) + '</p>' : '') +
+      (profile.now && profile.now.text ? '<p class="text-xs mb-2"><strong>Now:</strong> ' + esc(profile.now.text) + '</p>' : '') +
       meta() + interests + '<p class="mt-3">' + didChip + '</p>';
     const intro =
       '<section class="card-surface fp-intro mb-4"><h2 class="text-lg font-bold mb-2">Intro</h2>' + introBody + '</section>';
@@ -552,7 +570,8 @@ export function renderTemplatePage(ctx: any): string {
       '<div class="td-body"><div class="wr-site-brand">' + logoImg('') + '<h1 class="text-xl font-extrabold">' + name + '</h1></div>' +
       (handle ? '<p class="text-sm tpl-muted">' + esc(handle) + '</p>' : '') +
       (profile.tagline ? '<p class="text-sm font-semibold mt-1">' + esc(profile.tagline) + '</p>' : '') +
-      (profile.bio ? '<p class="text-sm mt-2 whitespace-pre-line">' + esc(profile.bio) + '</p>' : '') + meta() + interests +
+      (profile.bio ? '<p class="text-sm mt-2 whitespace-pre-line">' + esc(profile.bio) + '</p>' : '') +
+      (profile.now && profile.now.text ? '<p class="text-xs mt-1.5"><strong>Now:</strong> ' + esc(profile.now.text) + '</p>' : '') + meta() + interests +
       '<div class="mt-3">' + stats([[postCount, 'Posts'], [photoCount, 'Photos'], [friendCount, 'Friends']]) + '</div>' +
       '<div class="flex flex-wrap gap-2 mt-3">' + addFriend('tpl-btn-solid') + jsonLink + '</div><p class="mt-3 text-xs">' + didChip + '</p>' +
       ctx.headerAdHtml + ctx.inFeedAdHtml + ctx.footerAdHtml + '</div></div>';

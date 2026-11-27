@@ -1,16 +1,18 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ImagePlus, Pencil, Plus, Search, Sparkles, Trash2, X } from 'lucide-react';
-import { EndorsementItem, SharedItem, SharedItemType } from '../shared/schema';
+import { EndorsementItem, FriendConnection, SharedItem, SharedItemType } from '../shared/schema';
 import { renderMarkdown } from '../shared/markdown';
+import { formatFullLocalTime, formatRelativeTime } from '../shared/relativeTime';
 import { MarkdownField } from './MarkdownField';
 import { ItemEdit, ItemEditor } from './ItemEditor';
 import { StudioViewMode, ViewModeToggle, loadViewMode, saveViewMode } from './ViewModeToggle';
 import { ItemFilterType, filterAndSortItems } from './studioFilters';
-import { PostExtrasDraft, PostExtrasFields, formatEventWhen } from './PostExtras';
+import { PostExtrasDraft, PostExtrasFields, formatEventWhen, formatVouchSummary } from './PostExtras';
 
 export interface PostsLibraryViewProps {
   items: SharedItem[];
   endorsements: EndorsementItem[];
+  friends?: FriendConnection[];
   itemType: SharedItemType;
   setItemType: (t: SharedItemType) => void;
   itemCategory: string;
@@ -41,6 +43,12 @@ export interface PostsLibraryViewProps {
   handleDeleteItem: (item: SharedItem) => void;
   mediaSrc: (url: string) => string;
   onPickEditImage: () => Promise<string | null>;
+  openComposeTrigger?: number;
+  engageLocation?: string;
+  setEngageLocation?: (v: string) => void;
+  engageHubName?: string;
+  setEngageHubName?: (v: string) => void;
+  joinedHubNames?: string[];
 }
 
 const TYPE_META: Record<SharedItemType, { label: string; badgeClass: string }> = {
@@ -62,13 +70,14 @@ function itemMeta(item: SharedItem): { label: string; badgeClass: string } {
       ? { label: `Ask${closed}`, badgeClass: 'bg-rose-500/20 text-rose-300 border border-rose-500/30' }
       : { label: `Offer${closed}`, badgeClass: 'bg-lime-500/20 text-lime-300 border border-lime-500/30' };
   }
+  if (item.type === 'post' && item.vouch) {
+    return { label: 'Vouch', badgeClass: 'bg-teal-500/20 text-teal-300 border border-teal-500/30' };
+  }
   return TYPE_META[item.type] || TYPE_META.post;
 }
 
 function formatDate(iso?: string): string {
-  if (!iso) return '';
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  return iso ? formatRelativeTime(iso) : '';
 }
 
 export function PostsLibraryView(props: PostsLibraryViewProps) {
@@ -111,6 +120,12 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
   const [engageOpen, setEngageOpen] = useState(false);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (props.openComposeTrigger) {
+      setEngageOpen(true);
+    }
+  }, [props.openComposeTrigger]);
+
   const changeViewMode = (mode: StudioViewMode) => {
     setViewMode(mode);
     saveViewMode('studio-items-view', mode);
@@ -126,7 +141,21 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
   const onEngageSubmit = async (e: React.FormEvent) => {
     await handleCreateItem(e);
     setEngageOpen(false);
+    props.setEngageLocation?.('');
+    props.setEngageHubName?.('');
   };
+
+  const resolvedPostLocation = useMemo(() => {
+    if (props.engageLocation && props.engageLocation.trim()) return props.engageLocation.trim();
+    const tags = itemTags
+      .split(',')
+      .map((t) => t.trim().replace(/^#/, ''))
+      .filter(Boolean);
+    const wgTag = tags.find((t) => /^wg-/i.test(t));
+    if (wgTag) return `#${wgTag} (Group Feed)`;
+    if (itemType === 'comment' && itemAuthorName.trim()) return `Reply to ${itemAuthorName.trim()}`;
+    return 'Your Social Site Feed';
+  }, [props.engageLocation, itemTags, itemType, itemAuthorName]);
 
   return (
     <div className="max-w-5xl mx-auto space-y-5">
@@ -142,7 +171,11 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
           <ViewModeToggle mode={viewMode} onChange={changeViewMode} ariaLabel="Posts view mode" />
           <button
             type="button"
-            onClick={() => setEngageOpen(true)}
+            onClick={() => {
+              props.setEngageLocation?.('');
+              props.setEngageHubName?.('');
+              setEngageOpen(true);
+            }}
             className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs inline-flex items-center gap-1.5 shadow shadow-indigo-600/25"
           >
             <Plus className="w-4 h-4" />
@@ -234,7 +267,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                 </button>
                 <div className="flex items-center gap-3 text-[11px] text-slate-500 shrink-0">
                   {commentCount > 0 && <span className="text-emerald-400">💬 {commentCount}</span>}
-                  <span>{formatDate(item.createdAt)}</span>
+                  <span title={formatFullLocalTime(item.createdAt)}>{formatDate(item.createdAt)}</span>
                   <button
                     type="button"
                     onClick={() => {
@@ -285,7 +318,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                     <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-full ${meta.badgeClass}`}>
                       {meta.label}
                     </span>
-                    <span className="text-[11px] text-slate-500">{formatDate(item.createdAt)}</span>
+                    <span className="text-[11px] text-slate-500" title={formatFullLocalTime(item.createdAt)}>{formatDate(item.createdAt)}</span>
                   </div>
                   {item.mediaUrl && (
                     <img
@@ -342,7 +375,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                 <span className={`text-[11px] uppercase font-bold px-2.5 py-0.5 rounded-full ${itemMeta(selectedItem).badgeClass}`}>
                   {itemMeta(selectedItem).label}
                 </span>
-                <span className="text-xs text-slate-500">{formatDate(selectedItem.createdAt)}</span>
+                <span className="text-xs text-slate-500" title={formatFullLocalTime(selectedItem.createdAt)}>{formatDate(selectedItem.createdAt)}</span>
                 {selectedItem.updatedAt && <span className="text-[11px] text-slate-500">(edited)</span>}
               </div>
               <div className="flex items-center gap-2">
@@ -382,6 +415,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
             {editingItemId === selectedItem.id ? (
               <ItemEditor
                 item={selectedItem}
+                friends={props.friends}
                 mediaSrc={mediaSrc}
                 onPickImage={onPickEditImage}
                 onSave={async (edit) => {
@@ -399,6 +433,12 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                     {selectedItem.event.url && <p className="break-all">🔗 {selectedItem.event.url}</p>}
                   </div>
                 )}
+                {selectedItem.vouch && (
+                  <div className="rounded-xl border border-teal-500/30 bg-teal-500/10 p-3 text-sm text-slate-200 space-y-1">
+                    <p>🤝 {formatVouchSummary(selectedItem.vouch, props.friends)}</p>
+                    <p className="text-xs text-slate-400 font-mono break-all">{selectedItem.vouch.subjectDid}</p>
+                  </div>
+                )}
                 {selectedItem.targetUrl && selectedItem.targetUrl !== selectedItem.canonicalUrl && (
                   <p className="text-xs text-indigo-400 font-mono break-all">Target: {selectedItem.targetUrl}</p>
                 )}
@@ -409,13 +449,11 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                     className="w-full max-h-80 object-cover rounded-xl bg-slate-950"
                   />
                 )}
-                {selectedItem.type === 'post' ? (
+                {selectedItem.commentary && (
                   <div
                     className="studio-prose text-sm text-slate-200"
                     dangerouslySetInnerHTML={{ __html: renderMarkdown(selectedItem.commentary) }}
                   />
-                ) : (
-                  <p className="text-sm text-slate-200 whitespace-pre-line">{selectedItem.commentary}</p>
                 )}
                 {selectedItem.tags && selectedItem.tags.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 pt-2">
@@ -466,12 +504,42 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
           >
             <div className="flex items-center justify-between gap-3">
               <h3 id="engage-modal-title" className="font-bold text-base flex items-center gap-2 text-white">
-                <Sparkles className="w-4 h-4 text-amber-400" />
-                Create Engagement
+                <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>
+                  Create Engagement for <span className="text-indigo-300">{resolvedPostLocation}</span>
+                  {props.engageHubName?.trim() ? (
+                    <>
+                      {' '}
+                      <span className="text-slate-400 font-normal">on</span>{' '}
+                      <span className="text-emerald-300">{props.engageHubName.trim()}</span>
+                    </>
+                  ) : props.joinedHubNames && props.joinedHubNames.length === 1 ? (
+                    <>
+                      {' '}
+                      <span className="text-slate-400 font-normal">·</span>{' '}
+                      <span className="text-emerald-300">{props.joinedHubNames[0]}</span>
+                    </>
+                  ) : props.joinedHubNames && props.joinedHubNames.length > 1 ? (
+                    <>
+                      {' '}
+                      <span className="text-slate-400 font-normal">·</span>{' '}
+                      <span
+                        className="text-emerald-300"
+                        title={`Syncs to: ${props.joinedHubNames.join(', ')}`}
+                      >
+                        {props.joinedHubNames.length} Webring Hubs
+                      </span>
+                    </>
+                  ) : null}
+                </span>
               </h3>
               <button
                 type="button"
-                onClick={() => setEngageOpen(false)}
+                onClick={() => {
+                  setEngageOpen(false);
+                  props.setEngageLocation?.('');
+                  props.setEngageHubName?.('');
+                }}
                 className="p-1 rounded-lg text-slate-400 hover:bg-slate-800"
                 aria-label="Close"
               >
@@ -515,6 +583,7 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                   <PostExtrasFields
                     draft={props.itemExtras}
                     onChange={props.setItemExtras}
+                    friends={props.friends}
                     fieldClass="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
                     labelClass="block text-xs text-slate-400 mb-1"
                   />
@@ -684,12 +753,12 @@ export function PostsLibraryView(props: PostsLibraryViewProps) {
                       <label className="block text-xs text-slate-400 mb-1">
                         {itemType === 'comment' ? 'Comment / Reply *' : 'Commentary / Notes'}
                       </label>
-                      <textarea
-                        rows={3}
+                      <MarkdownField
+                        rows={4}
                         required={itemType === 'comment'}
                         value={itemCommentary}
-                        onChange={(e) => setItemCommentary(e.target.value)}
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        onChange={setItemCommentary}
+                        placeholder={itemType === 'comment' ? 'Write your reply (Markdown & code blocks supported)…' : 'Add notes or code examples in Markdown…'}
                       />
                     </div>
                     <div>

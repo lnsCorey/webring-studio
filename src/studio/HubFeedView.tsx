@@ -16,6 +16,7 @@ import {
 import { normalizeSiteUrl, SharedItemType } from '../shared/schema';
 import { friendAvatarSrc } from '../shared/avatar';
 import { renderMarkdown } from '../shared/markdown';
+import { formatFullLocalTime, formatRelativeTime } from '../shared/relativeTime';
 import { HubFeedEntryView, WebringHubApi, WebringHubView } from './WebringHubPanels';
 
 const ESTIMATED_ROW_HEIGHT = 240;
@@ -519,8 +520,8 @@ export const HubFeedView: React.FC<HubFeedViewProps> = ({
                             {entry.authorSiteUrl}
                           </button>
                           <span>·</span>
-                          <span className="font-sans text-slate-500">
-                            {new Date(entry.publishedAt).toLocaleString()}
+                          <span className="font-sans text-slate-500" title={formatFullLocalTime(entry.publishedAt)}>
+                            {formatRelativeTime(entry.publishedAt)}
                           </span>
                         </div>
                       </div>

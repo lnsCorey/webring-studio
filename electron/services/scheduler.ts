@@ -40,13 +40,29 @@ export interface JobSchedule {
 export const AUTO_PUBLISH_DELAYS_SECONDS = [30, 120, 600, 3600] as const;
 export type AutoPublishDelaySeconds = (typeof AUTO_PUBLISH_DELAYS_SECONDS)[number];
 
+export type AutoPublishTriggerKey =
+  | 'posts'
+  | 'likesShares'
+  | 'friendsWebrings'
+  | 'media'
+  | 'profile';
+
+export interface AutoPublishTriggers {
+  posts: boolean;
+  likesShares: boolean;
+  friendsWebrings: boolean;
+  media: boolean;
+  profile: boolean;
+}
+
 /**
  * Sync and publish automatically a short while after a local change (a post, like, share,
- * photo import, new friend or ring). Uses the publish job's destination.
+ * photo import, new friend, ring, or profile edit). Uses the publish job's destination.
  */
 export interface AutoPublishSettings {
   enabled: boolean;
   delaySeconds: AutoPublishDelaySeconds;
+  triggers: AutoPublishTriggers;
 }
 
 export interface PersonaSchedule {
@@ -55,8 +71,41 @@ export interface PersonaSchedule {
   autoPublish: AutoPublishSettings;
 }
 
+export function defaultAutoPublishTriggers(): AutoPublishTriggers {
+  return {
+    posts: true,
+    likesShares: true,
+    friendsWebrings: true,
+    media: true,
+    profile: true,
+  };
+}
+
 export function defaultAutoPublish(): AutoPublishSettings {
-  return { enabled: false, delaySeconds: 120 };
+  return { enabled: false, delaySeconds: 120, triggers: defaultAutoPublishTriggers() };
+}
+
+export function normalizeAutoPublishTriggers(value: unknown): AutoPublishTriggers {
+  const input = (value && typeof value === 'object' ? value : {}) as Partial<AutoPublishTriggers>;
+  const defaults = defaultAutoPublishTriggers();
+  return {
+    posts: typeof input.posts === 'boolean' ? input.posts : defaults.posts,
+    likesShares: typeof input.likesShares === 'boolean' ? input.likesShares : defaults.likesShares,
+    friendsWebrings:
+      typeof input.friendsWebrings === 'boolean' ? input.friendsWebrings : defaults.friendsWebrings,
+    media: typeof input.media === 'boolean' ? input.media : defaults.media,
+    profile: typeof input.profile === 'boolean' ? input.profile : defaults.profile,
+  };
+}
+
+export function autoPublishTriggerForReason(reason: string): AutoPublishTriggerKey | null {
+  const r = String(reason || '').trim().toLowerCase();
+  if (r === 'post' || r === 'comment' || r === 'deleted item') return 'posts';
+  if (r === 'like' || r === 'share' || r === 'recommendation') return 'likesShares';
+  if (r === 'friend' || r === 'webring' || r === 'ring') return 'friendsWebrings';
+  if (r === 'album' || r === 'photo' || r === 'photos' || r === 'media') return 'media';
+  if (r === 'profile' || r === 'now') return 'profile';
+  return null;
 }
 
 export function normalizeAutoPublish(value: unknown): AutoPublishSettings {
@@ -67,6 +116,7 @@ export function normalizeAutoPublish(value: unknown): AutoPublishSettings {
     delaySeconds: (AUTO_PUBLISH_DELAYS_SECONDS as readonly number[]).includes(delay)
       ? (delay as AutoPublishDelaySeconds)
       : defaultAutoPublish().delaySeconds,
+    triggers: normalizeAutoPublishTriggers(input.triggers),
   };
 }
 
@@ -243,7 +293,9 @@ export class Scheduler {
     patch: {
       sync?: Partial<Pick<JobSchedule, 'enabled' | 'preset' | 'jitterMinutes'>>;
       publish?: Partial<Pick<PersonaSchedule['publish'], 'enabled' | 'preset' | 'destination' | 'syncFirst' | 'jitterMinutes'>>;
-      autoPublish?: Partial<AutoPublishSettings>;
+      autoPublish?: Partial<Omit<AutoPublishSettings, 'triggers'>> & {
+        triggers?: Partial<AutoPublishTriggers>;
+      };
     }
   ): PersonaSchedule {
     const config = this.loadConfig();
@@ -268,7 +320,14 @@ export class Scheduler {
     config.personas[personaId] = {
       sync: apply<JobSchedule>(current.sync, patch.sync),
       publish: apply<PersonaSchedule['publish']>(current.publish, patch.publish),
-      autoPublish: normalizeAutoPublish({ ...current.autoPublish, ...(patch.autoPublish || {}) }),
+      autoPublish: normalizeAutoPublish({
+        ...current.autoPublish,
+        ...(patch.autoPublish || {}),
+        triggers: {
+          ...current.autoPublish.triggers,
+          ...(patch.autoPublish?.triggers || {}),
+        },
+      }),
     };
     this.saveConfig(config);
     return config.personas[personaId];

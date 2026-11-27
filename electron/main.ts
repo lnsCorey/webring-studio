@@ -925,6 +925,13 @@ function registerIpcHandlers() {
     if (updates && typeof updates === 'object' && ('avatarUrl' in updates || 'bannerUrl' in updates)) {
       cleanUpLibrary(ctx.db, ctx.mediaLibrary);
     }
+    if (
+      updates &&
+      typeof updates === 'object' &&
+      Object.keys(updates).some((k) => k !== 'publishSettings')
+    ) {
+      noteActiveChange('profile');
+    }
     return profile;
   });
 
@@ -943,7 +950,9 @@ function registerIpcHandlers() {
       file = result.filePaths[0];
     }
     const ctx = personaManager.getActiveContext();
-    return { url: await setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file) };
+    const url = await setProfileImageFromFile(ctx.db, ctx.mediaLibrary, kind, file);
+    noteActiveChange('profile');
+    return { url };
   });
 
   ipcMain.handle('studio:create-album', (_e, input) => {
@@ -1536,6 +1545,15 @@ function registerIpcHandlers() {
   ipcMain.handle('studio:publish-github', async (_e, settings, options?: { includeAgentChanges?: boolean }) =>
     publishWithSettings('github', settings, options?.includeAgentChanges === true)
   );
+
+  ipcMain.handle('studio:unpublish-old-host', async (_e, method: 'github' | 'remote') => {
+    const ctx = personaManager.getActiveContext();
+    const settings = ctx.db.withStoredCredentials(ctx.db.getProfile().publishSettings);
+    if (method === 'github') {
+      return ctx.sitePublisher.unpublishGitHubPages(settings);
+    }
+    return ctx.sitePublisher.unpublishRemoteHost(settings);
+  });
 
   // Guided setup (shared with the MCP tools through setupService)
   ipcMain.handle('studio:setup-status', (_e, options?: { checkGitHub?: boolean }) =>

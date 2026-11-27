@@ -170,8 +170,18 @@ html[data-theme="light"] .studio-prose a {
 }
 
 html[data-theme="light"] .studio-prose code,
-html[data-theme="light"] .studio-prose pre {
+html[data-theme="light"] .studio-prose pre,
+html[data-theme="light"] .studio-prose .code-block {
   background: rgba(15, 23, 42, 0.06);
+}
+
+html[data-theme="light"] .studio-prose .code-block,
+html[data-theme="light"] .studio-prose .code-block-head {
+  border-color: #cbd5e1;
+}
+
+html[data-theme="light"] .studio-prose .code-lang {
+  color: #475569;
 }
 
 html[data-theme="light"] .studio-prose th,

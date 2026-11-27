@@ -1,4 +1,10 @@
-import type { JobResult, PersonaSchedule, PublishDestination, SchedulerConfig } from './scheduler';
+import {
+  autoPublishTriggerForReason,
+  type JobResult,
+  type PersonaSchedule,
+  type PublishDestination,
+  type SchedulerConfig,
+} from './scheduler';
 
 /**
  * Auto-publish: a short while after a local change (a post, like, share, photo import, new friend
@@ -176,6 +182,12 @@ export class AutoPublisher {
         this.emit(personaId);
       }
       return null;
+    }
+    if (!options?.fromAgent) {
+      const triggerKey = autoPublishTriggerForReason(reason);
+      if (triggerKey && settings.triggers && settings.triggers[triggerKey] === false) {
+        return null;
+      }
     }
     entry.reasons.add(reason);
     const now = this.now();

@@ -3678,7 +3678,7 @@ describe('Site Design (look & feel, page layout)', () => {
           expect(page.html).toContain('<a href="https://news.example" target="_blank" rel="noopener noreferrer">the write-up</a>');
           expect(page.html).toContain('<ul><li>one</li><li>two</li></ul>');
           expect(page.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-          expect(page.html).toContain('Plain **notes**'); // only wall posts are Markdown
+          expect(page.html).toContain('Plain <strong>notes</strong>'); // all item commentaries render Markdown
         }
         db.close();
       }

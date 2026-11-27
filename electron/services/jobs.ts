@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import { requireUsableProxy } from '../security/proxyAgent';
 import * as path from 'path';
+import { isHostSwitchPending } from '../db/database';
 import { ActivePersonaContext } from './personaManager';
 import { PublishResult } from './publisher';
 import { CrawlSiteResult } from './ringCrawler';
@@ -91,6 +92,25 @@ export async function publishTo(
 ): Promise<PublishResult> {
   const result = await publishToDestination(ctx, destination, paths, overrides);
   if (result.success) {
+    if (destination === 'github' || destination === 'remote') {
+      const profile = ctx.db.getProfile();
+      const ps = profile.publishSettings;
+      const label =
+        destination === 'github'
+          ? `${(ps.githubOwner || '').trim()}/${(ps.githubRepo || '').trim()} (${(ps.githubBranch || 'gh-pages').trim()})`
+          : `${ps.protocol || 'sftp'}://${(ps.host || '').trim()}${(ps.remotePath || '/').trim()}`;
+      ctx.db.updateProfile({
+        publishSettings: {
+          deployMethod: destination,
+          lastDeployedTarget: {
+            method: destination,
+            siteUrl: profile.siteUrl || '',
+            label,
+            publishedAt: new Date().toISOString(),
+          },
+        },
+      });
+    }
     ctx.webringHubService.markPublished(ctx.db.getPublishedManifestUpdatedAt());
     try {
       await ctx.webringHubService.emitPublishPings();
@@ -150,6 +170,18 @@ export async function runScheduledPublish(
   // An agent's changes wait for the user's review: no scheduled or automatic publish includes them
   if (ctx.db.getHeldAgentChanges().length > 0) {
     return { at: new Date().toISOString(), status: 'held', message: 'Agent changes awaiting review' };
+  }
+  // If the user switched deployment host (GitHub Pages <-> Web Host), hold automatic publishes
+  // until they complete one manual publish and choose whether to remove the old site.
+  if (
+    (destination === 'github' || destination === 'remote') &&
+    isHostSwitchPending(ctx.db.getProfile().publishSettings, destination)
+  ) {
+    return {
+      at: new Date().toISOString(),
+      status: 'held',
+      message: 'Deployment host switched — publish manually once in Deploy Site to confirm migration.',
+    };
   }
   if (syncFirst) {
     await runSyncAll(ctx);

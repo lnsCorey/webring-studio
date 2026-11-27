@@ -127,8 +127,8 @@ describe('compose form helpers', () => {
 
   it('handles all-day events, asks and validation errors', () => {
     expect(extrasToFields({ ...EMPTY_POST_EXTRAS, kind: 'event', allDay: true, startsAt: '2026-12-05' }).event).toEqual({ startsAt: '2026-12-05T00:00:00Z', allDay: true });
-    expect(extrasToFields({ ...EMPTY_POST_EXTRAS, kind: 'ask' })).toEqual({ event: null, listing: { kind: 'ask', status: 'open' } });
-    expect(extrasToFields(EMPTY_POST_EXTRAS)).toEqual({ event: null, listing: null });
+    expect(extrasToFields({ ...EMPTY_POST_EXTRAS, kind: 'ask' })).toEqual({ event: null, listing: { kind: 'ask', status: 'open' }, vouch: null });
+    expect(extrasToFields(EMPTY_POST_EXTRAS)).toEqual({ event: null, listing: null, vouch: null });
     expect(() => extrasToFields({ ...EMPTY_POST_EXTRAS, kind: 'event' })).toThrow(/start date/);
     expect(() => extrasToFields({ ...EMPTY_POST_EXTRAS, kind: 'event', startsAt: '2026-12-05T18:00', url: 'meet.example' })).toThrow(/http/);
   });
