@@ -5,6 +5,7 @@ import { StudioDatabase } from '../db/database';
 import { MediaLibrary } from './mediaLibrary';
 import { makeFaviconImages } from './imagePipeline';
 import { markdownToPlainText, renderMarkdown } from '../../src/shared/markdown';
+import { formatRelativeTime } from '../../src/shared/relativeTime';
 import { AVATAR_PAGE_SCRIPT } from '../../src/shared/avatar';
 import { renderTemplatePage, TEMPLATE_CONFIG, TEMPLATE_CSS, templateBodyClasses } from './siteTemplates';
 import { ENHANCEMENTS_CSS, installPageEnhancements } from './pageEnhancements';
@@ -476,6 +477,10 @@ export class StaticSiteGenerator {
     .prose-block code { background: rgba(0, 0, 0, 0.25); padding: 0.1rem 0.35rem; border-radius: 0.25rem; font-size: 0.9em; }
     .prose-block pre { background: rgba(0, 0, 0, 0.3); padding: 0.75rem 1rem; border-radius: 0.5rem; overflow-x: auto; margin: 0.75rem 0; }
     .prose-block pre code { background: none; padding: 0; }
+    .prose-block .code-block { margin: 0.75rem 0; border: 1px solid rgba(148, 163, 184, 0.3); border-radius: 0.5rem; overflow: hidden; background: rgba(0, 0, 0, 0.3); }
+    .prose-block .code-block-head { display: flex; align-items: center; justify-content: space-between; padding: 0.25rem 0.75rem; background: rgba(148, 163, 184, 0.12); border-bottom: 1px solid rgba(148, 163, 184, 0.25); }
+    .prose-block .code-lang { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.8; }
+    .prose-block .code-block pre { margin: 0; border-radius: 0; background: transparent; }
     .prose-block table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.95em; }
     .prose-block th, .prose-block td { border: 1px solid rgba(148, 163, 184, 0.35); padding: 0.4rem 0.65rem; text-align: left; }
     .prose-block th { font-weight: 700; background: rgba(148, 163, 184, 0.12); }
@@ -552,6 +557,15 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
 
       const renderMarkdown = ${markdownSource};
       const markdownToPlainText = ${plainTextSource};
+      const formatRelativeTime = ${formatRelativeTime.toString()};
+      function relTimeTag(iso) {
+        if (!iso) return '';
+        const rel = formatRelativeTime(String(iso));
+        if (!rel) return '';
+        const d = new Date(iso);
+        const full = isNaN(d.getTime()) ? '' : d.toLocaleString();
+        return '<time class="rel-time" data-iso="' + esc(iso) + '" datetime="' + esc(iso) + '" title="' + esc(full) + '">' + esc(rel) + '</time>';
+      }
       const DEFAULT_LAYOUT = ${JSON.stringify(DEFAULT_LAYOUT)};
 
       // Look & feel (also set on <body> at publish; re-applied in case live profile.json differs)
@@ -867,8 +881,8 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
       }
 
       function renderAlbumPost(album) {
-        const d = album.createdAt ? new Date(album.createdAt) : null;
-        const when = d && !isNaN(d.getTime()) ? ' · ' + esc(d.toLocaleDateString()) : '';
+        const whenHtml = relTimeTag(album.createdAt);
+        const when = whenHtml ? ' · ' + whenHtml : '';
         return '<div class="card-surface rounded-xl p-4 md:col-span-2 album-post">' +
           '<p class="text-xs opacity-70 mb-2">' + esc(profile.displayName) + ' posted an album' + when + '</p>' +
           albumPeek(album) +
@@ -928,11 +942,28 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
           (ev.url ? '<p>🔗 <a href="' + safeUrl(ev.url) + '" target="_blank" rel="noopener noreferrer" class="underline">Event link</a></p>' : '') +
           '</div>';
       }
+      function vouchBlock(item) {
+        var v = item.type === 'post' && item.vouch && typeof item.vouch === 'object' ? item.vouch : null;
+        if (!v || !v.subjectDid || !v.subjectSiteUrl) return '';
+        var name = v.subjectName || '';
+        if (!name && Array.isArray(connections && connections.friends)) {
+          var f = connections.friends.find(function (c) { return c.did === v.subjectDid || String(c.siteUrl || '').replace(/[/]+$/, '') === String(v.subjectSiteUrl).replace(/[/]+$/, ''); });
+          if (f && f.displayName) name = f.displayName;
+        }
+        if (!name) {
+          try { name = new URL(v.subjectSiteUrl).hostname; } catch (e) { name = v.subjectDid; }
+        }
+        var detail = v.kind === 'skill' ? 'skill: ' + (v.skill || '') : v.kind === 'worked-with' ? 'worked with' : 'met';
+        return '<div class="item-vouch text-sm rounded-lg px-3 py-2 mb-3 bg-teal-500/10 border border-teal-500/30">' +
+          '<p>🤝 Vouches for <a href="' + safeUrl(v.subjectSiteUrl) + '" target="_blank" rel="noopener noreferrer" class="underline font-semibold">' + esc(name) + '</a>: ' + esc(detail) + '</p>' +
+          '</div>';
+      }
       function postLabel(item) {
         if (item.type === 'post' && item.event) return '📅 Event';
         if (item.type === 'post' && item.listing) {
           return (item.listing.kind === 'ask' ? '🙋 Ask' : '🎁 Offer') + (item.listing.status === 'closed' ? ' · closed' : '');
         }
+        if (item.type === 'post' && item.vouch) return '🤝 Vouch';
         return item.type === 'post' ? '📝 Wall Post' : String(item.type);
       }
 
@@ -957,7 +988,7 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
             <div>
               <div class="flex items-center justify-between gap-2 mb-2">
                 <span class="text-xs uppercase tracking-wider font-bold px-2.5 py-0.5 rounded-full \${badgeColor}">\${esc(postLabel(item))}</span>
-                <span class="text-xs opacity-60">\${esc(item.category)} \${item.rating && item.type !== 'post' && item.type !== 'comment' ? '• ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : ''}\${editedNote(item)}</span>
+                <span class="text-xs opacity-60">\${relTimeTag(item.createdAt)}\${item.createdAt && item.category ? ' · ' : ''}\${esc(item.category)} \${item.rating && item.type !== 'post' && item.type !== 'comment' ? '• ' + '★'.repeat(Math.min(5, Math.max(1, Number(item.rating) || 5))) : ''}\${editedNote(item)}</span>
               </div>
               \${item.mediaUrl ? \`<img src="\${safeUrl(item.mediaUrl)}" class="w-full \${item.type === 'post' ? 'max-h-80' : 'h-40'} object-cover rounded-lg mb-3" />\` : ''}
               \${titleIsOpeningHeading(item) ? '' : \`<h4 class="font-bold text-base mb-1">
@@ -965,9 +996,8 @@ ${TEMPLATE_CSS}${appearance.interactions === 'off' ? '' : ENHANCEMENTS_CSS}
               </h4>\`}
               \${item.targetAuthorName ? \`<p class="text-xs opacity-70 mb-2">\${item.type === 'comment' ? 'Replying to' : 'Source'}: <a href="\${safeUrl(item.targetAuthorUrl || item.targetUrl)}" target="_blank" rel="noopener noreferrer" class="underline">\${esc(item.targetAuthorName)}</a></p>\` : ''}
               \${eventBlock(item)}
-              \${item.type === 'post'
-                ? (item.commentary ? \`<div class="prose-block post-body text-sm opacity-90 mb-3">\${renderMarkdown(item.commentary)}</div>\` : '')
-                : \`<p class="text-sm opacity-90 mb-3 whitespace-pre-line">\${esc(item.commentary || '')}</p>\`}
+              \${vouchBlock(item)}
+              \${item.commentary ? \`<div class="prose-block post-body text-sm opacity-90 mb-3">\${renderMarkdown(item.commentary)}</div>\` : ''}
               <div class="flex flex-wrap gap-1.5 mb-3">
                 \${(item.tags || []).map(t => \`<span class="text-xs px-2 py-0.5 rounded bg-white/5 opacity-75">#\${esc(t)}</span>\`).join('')}
               </div>
@@ -1206,13 +1236,23 @@ ${AVATAR_PAGE_SCRIPT}
           footerHtml;
       }
 
+      if (typeof window !== 'undefined' && typeof setInterval === 'function') {
+        setInterval(function () {
+          document.querySelectorAll('time.rel-time[data-iso]').forEach(function (el) {
+            const iso = el.getAttribute('data-iso') || '';
+            const rel = formatRelativeTime(iso);
+            if (rel && el.textContent !== rel) el.textContent = rel;
+          });
+        }, 60000);
+      }
+
       if (window.__WEBRING_ALBUM_ID__) {
         root.innerHTML = renderAlbumPage(allAlbums.find(a => a.id === window.__WEBRING_ALBUM_ID__));
       } else if (template.shell !== 'stack') {
         root.innerHTML = renderTemplatePage({
           shell: template.shell, profile, albums: allAlbums, items: allItems, friends: allFriends,
           endorsementCount: (connections.endorsements || []).length, layout: visibleBlocks,
-          blockRenderers, section, emptyNote, albumHref, albumCover, albumShownExpanded, albumPhotoTotal, albumPhotosLabel, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText,
+          blockRenderers, section, emptyNote, albumHref, albumCover, albumShownExpanded, albumPhotoTotal, albumPhotosLabel, albumPeek, renderAlbumPost, timelineEntries, esc, safeUrl, buildDeepLink, getEndorsementsFor, getCommentsFor, renderMarkdown, markdownToPlainText, relTimeTag,
           hasLiveProvider: Boolean(commentCfg.provider && commentCfg.provider !== 'none'),
           webringBars, headerAdHtml, inFeedAdHtml, footerAdHtml, footerHtml, olderPostsHtml, archiveView, webringLogoUrl
         });
@@ -1250,6 +1290,7 @@ ${AVATAR_PAGE_SCRIPT}
           </div>
           \${stackHasBody ? \`<div class="px-5 sm:px-8 pb-6">
             \${profile.bio ? \`<p class="text-base leading-relaxed max-w-3xl mb-4 whitespace-pre-line">\${esc(profile.bio)}</p>\` : ''}
+            \${profile.now && profile.now.text ? \`<p class="text-sm rounded-lg px-3 py-1.5 mb-4 inline-block bg-indigo-500/10 border border-indigo-500/30"><strong>Now:</strong> \${esc(profile.now.text)}</p>\` : ''}
             \${(profile.interests || []).length ? \`<div class="flex flex-wrap gap-2 mb-4">\${(profile.interests || []).map(tag => \`<span class="text-xs px-3 py-1 rounded-full bg-white/10 font-medium">#\${esc(tag)}</span>\`).join('')}</div>\` : ''}
             \${stackHasMeta ? \`<div class="flex flex-wrap gap-4 text-xs opacity-80 pt-3 border-t border-white/10">
               \${profile.location ? \`<span>📍 \${esc(profile.location)}</span>\` : ''}

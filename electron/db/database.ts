@@ -43,6 +43,8 @@ import {
   normalizeSiteUrl,
   PhotoItem,
   ProfileDocument,
+  ProfileNow,
+  ProfileNowSchema,
   ProfileTheme,
   SharedItem,
   SharedItemType,
@@ -50,6 +52,8 @@ import {
   ItemEventSchema,
   ItemListing,
   ItemListingSchema,
+  ItemVouch,
+  ItemVouchSchema,
   signDocument,
   siteUrlToDidWeb,
   verifyKeyRotationChain,
@@ -293,6 +297,43 @@ export interface SftpHostKeyMismatch {
   at: string;
 }
 
+export type DeployMethod = 'github' | 'remote';
+
+export interface LastDeployedTarget {
+  method: DeployMethod;
+  siteUrl: string;
+  label: string;
+  publishedAt: string;
+}
+
+/**
+ * Resolves the active Deploy Site method for a persona.
+ * Defaults to `'github'`, except for existing personas that already have an SFTP/FTP host
+ * configured without a GitHub Pages repo.
+ */
+export function resolveDeployMethod(settings?: Partial<PublishSettings> | null): DeployMethod {
+  if (settings?.deployMethod === 'github' || settings?.deployMethod === 'remote') {
+    return settings.deployMethod;
+  }
+  const hasRemote = Boolean(settings?.host?.trim());
+  const hasGithub = Boolean(settings?.githubOwner?.trim() || settings?.githubRepo?.trim());
+  if (hasRemote && !hasGithub) return 'remote';
+  return 'github';
+}
+
+/**
+ * True when the persona was previously published to a different host method than `targetMethod`.
+ */
+export function isHostSwitchPending(
+  settings?: Partial<PublishSettings> | null,
+  targetMethod?: DeployMethod
+): boolean {
+  const prev = settings?.lastDeployedTarget?.method;
+  if (!prev) return false;
+  const next = targetMethod ?? resolveDeployMethod(settings);
+  return prev !== next;
+}
+
 export interface PublishSettings {
   exportPath: string;
   protocol: 'sftp' | 'ftp';
@@ -344,6 +385,10 @@ export interface PublishSettings {
   legacyHubMigrated?: boolean;
   /** Set once sample content seeded by earlier versions has been cleaned up. */
   legacyDemoContentRemoved?: boolean;
+  /** Active mutually-exclusive Deploy Site method ('github' | 'remote'). */
+  deployMethod?: DeployMethod;
+  /** Snapshot of the last remote/GitHub target actually published, for host-switch detection. */
+  lastDeployedTarget?: LastDeployedTarget;
   // Snapshot bookkeeping: when the static site was last generated and what it contained
   lastPublishedAt?: string;
   lastPublishedCounts?: PublishedCounts;
@@ -689,6 +734,25 @@ function validateItemListing(type: SharedItemType, value: unknown): ItemListing 
   const parsed = ItemListingSchema.safeParse(value);
   if (!parsed.success) throw new Error('An ask or offer needs kind "ask" or "offer" and status "open" or "closed".');
   return parsed.data;
+}
+
+/** Validates vouch details for a post (null/undefined = none). */
+function validateItemVouch(type: SharedItemType, value: unknown): ItemVouch | null {
+  if (value === undefined || value === null) return null;
+  if (type !== 'post') throw new Error('Only posts can be vouches.');
+  const parsed = ItemVouchSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new Error(`Vouch details are not valid: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+  }
+  const v = parsed.data;
+  const skill = v.kind === 'skill' && v.skill ? v.skill.trim().slice(0, 60) : undefined;
+  return {
+    subjectDid: v.subjectDid.trim(),
+    subjectSiteUrl: v.subjectSiteUrl.trim().replace(/\/+$/, ''),
+    ...(v.subjectName && v.subjectName.trim() ? { subjectName: v.subjectName.trim().slice(0, 120) } : {}),
+    kind: v.kind,
+    ...(skill ? { skill } : {}),
+  };
 }
 
 function parseStoredJson<T>(raw: unknown, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): T | undefined {
@@ -1467,6 +1531,24 @@ export class StudioDatabase {
           if (!cols.some((c) => c.name === 'listing_json')) this.db.exec('ALTER TABLE items ADD COLUMN listing_json TEXT;');
         },
       },
+      {
+        // Posts can carry a signed vouch about another member (`vouch` field in items.json).
+        version: 8,
+        name: 'item_vouch',
+        up: () => {
+          const cols = this.db.prepare('PRAGMA table_info(items)').all() as Array<{ name: string }>;
+          if (!cols.some((c) => c.name === 'vouch_json')) this.db.exec('ALTER TABLE items ADD COLUMN vouch_json TEXT;');
+        },
+      },
+      {
+        // Profiles can carry a short "Now" status (`now: { text, updatedAt }` in profile.json).
+        version: 9,
+        name: 'profile_now',
+        up: () => {
+          const cols = this.db.prepare('PRAGMA table_info(profile)').all() as Array<{ name: string }>;
+          if (!cols.some((c) => c.name === 'now_json')) this.db.exec('ALTER TABLE profile ADD COLUMN now_json TEXT;');
+        },
+      },
     ];
   }
 
@@ -2048,6 +2130,10 @@ export class StudioDatabase {
       avatarUrl: String(row.avatar_url || ''),
       bannerUrl: String(row.banner_url || ''),
       interests: JSON.parse(String(row.interests_json || '[]')),
+      ...((() => {
+        const now = parseStoredJson<ProfileNow>(row.now_json, ProfileNowSchema);
+        return now ? { now } : {};
+      })()),
       customLinks: JSON.parse(String(row.custom_links_json || '[]')),
       theme: ProfileThemeSchema.catch('neo-webring').parse(row.theme),
       ...readDesign(row),
@@ -2148,7 +2234,7 @@ export class StudioDatabase {
   }
 
   public updateProfile(
-    updates: Partial<ProfileDocument> & { publishSettings?: Partial<PublishSettings> },
+    updates: Partial<Omit<ProfileDocument, 'now'>> & { now?: ProfileNow | null; publishSettings?: Partial<PublishSettings> },
     options: { allowPlaintext?: boolean } = {}
   ): ProfileDocument {
     assertAllowedMediaReference(updates.avatarUrl, 'profile picture');
@@ -2176,6 +2262,14 @@ export class StudioDatabase {
       }
     }
 
+    let nextNow: ProfileNow | null = current.now ?? null;
+    if (updates.now === null) {
+      nextNow = null;
+    } else if (updates.now !== undefined) {
+      const text = String(updates.now.text || '').trim().slice(0, 140);
+      nextNow = text ? { text, updatedAt: updates.now.updatedAt || now } : null;
+    }
+
     this.db
       .prepare(
         `UPDATE profile SET
@@ -2194,6 +2288,7 @@ export class StudioDatabase {
           publish_settings_json = ?,
           appearance_json = ?,
           layout_json = ?,
+          now_json = ?,
           updated_at = ?
         WHERE id = 1`
       )
@@ -2220,10 +2315,22 @@ export class StudioDatabase {
           : current.layout
             ? JSON.stringify(current.layout)
             : '',
+        nextNow ? JSON.stringify(nextNow) : null,
         now
       );
 
     return this.getProfile();
+  }
+
+  /** Sets or clears the short "Now" status on the profile (<=140 chars). */
+  public setNow(text: string | null): ProfileDocument {
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (trimmed.length > 140) {
+      throw new Error('Now status must be 140 characters or fewer.');
+    }
+    return this.updateProfile({
+      now: trimmed ? { text: trimmed, updatedAt: new Date().toISOString() } : null,
+    });
   }
 
   public getAlbums(): AlbumItem[] {
@@ -2681,6 +2788,10 @@ export class StudioDatabase {
           const listing = r.type === 'post' ? parseStoredJson<ItemListing>(r.listing_json, ItemListingSchema) : undefined;
           return listing ? { listing } : {};
         })()),
+        ...((() => {
+          const vouch = r.type === 'post' ? parseStoredJson<ItemVouch>(r.vouch_json, ItemVouchSchema) : undefined;
+          return vouch ? { vouch } : {};
+        })()),
       };
     });
   }
@@ -2699,10 +2810,12 @@ export class StudioDatabase {
     tags?: string[];
     event?: ItemEvent | null;
     listing?: ItemListing | null;
+    vouch?: ItemVouch | null;
   }): SharedItem {
     assertAllowedMediaReference(input.mediaUrl);
     const event = validateItemEvent(input.type, input.event);
     const listing = validateItemListing(input.type, input.listing);
+    const vouch = validateItemVouch(input.type, input.vouch);
     const id = `item-${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     const profile = this.getProfile();
@@ -2717,8 +2830,8 @@ export class StudioDatabase {
       .prepare(
         `INSERT INTO items (
           id, type, title, target_url, target_author_url, target_author_name,
-          via_url, category, commentary, media_url, rating, tags_json, created_at, event_json, listing_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          via_url, category, commentary, media_url, rating, tags_json, created_at, event_json, listing_json, vouch_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -2735,7 +2848,8 @@ export class StudioDatabase {
         JSON.stringify(input.tags || []),
         now,
         event ? JSON.stringify(event) : null,
-        listing ? JSON.stringify(listing) : null
+        listing ? JSON.stringify(listing) : null,
+        vouch ? JSON.stringify(vouch) : null
       );
 
     return this.getItems().find((i) => i.id === id)!;
@@ -2761,6 +2875,8 @@ export class StudioDatabase {
       event?: ItemEvent | null;
       /** New ask/offer details (e.g. status "closed"), or null to remove them. */
       listing?: ItemListing | null;
+      /** New vouch details, or null to remove them. */
+      vouch?: ItemVouch | null;
     }
   ): SharedItem {
     const current = this.getItems().find((i) => i.id === itemId);
@@ -2768,6 +2884,7 @@ export class StudioDatabase {
     assertAllowedMediaReference(updates.mediaUrl);
     const event = updates.event === undefined ? current.event ?? null : validateItemEvent(current.type, updates.event);
     const listing = updates.listing === undefined ? current.listing ?? null : validateItemListing(current.type, updates.listing);
+    const vouch = updates.vouch === undefined ? current.vouch ?? null : validateItemVouch(current.type, updates.vouch);
     const text = (value: string | undefined, fallback: string) => (value === undefined ? fallback : value.trim());
     const commentary = text(updates.commentary, current.commentary);
     const targetAuthorName = text(updates.targetAuthorName, current.targetAuthorName || '');
@@ -2787,7 +2904,7 @@ export class StudioDatabase {
     this.db
       .prepare(
         `UPDATE items SET title = ?, target_url = ?, target_author_url = ?, target_author_name = ?, category = ?,
-          commentary = ?, media_url = ?, rating = ?, tags_json = ?, updated_at = ?, event_json = ?, listing_json = ? WHERE id = ?`
+          commentary = ?, media_url = ?, rating = ?, tags_json = ?, updated_at = ?, event_json = ?, listing_json = ?, vouch_json = ? WHERE id = ?`
       )
       .run(
         title,
@@ -2802,6 +2919,7 @@ export class StudioDatabase {
         new Date().toISOString(),
         event ? JSON.stringify(event) : null,
         listing ? JSON.stringify(listing) : null,
+        vouch ? JSON.stringify(vouch) : null,
         itemId
       );
     return this.getItems().find((i) => i.id === itemId)!;
@@ -5333,6 +5451,7 @@ export class StudioDatabase {
       avatarUrl: rawProfile.avatarUrl,
       bannerUrl: rawProfile.bannerUrl,
       interests: rawProfile.interests,
+      ...(rawProfile.now ? { now: rawProfile.now } : {}),
       customLinks: rawProfile.customLinks,
       theme: rawProfile.theme,
       ...(rawProfile.appearance && Object.keys(rawProfile.appearance).length ? { appearance: rawProfile.appearance } : {}),

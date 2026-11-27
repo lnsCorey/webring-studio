@@ -26,6 +26,8 @@ import { SiteDesignPanel } from './SiteDesignPanel';
 import { ItemEdit, ItemEditor } from './ItemEditor';
 import { HorizontalTabs } from './HorizontalTabs';
 import { DataSettingsApi, DataSettingsView } from './DataSettingsView';
+import { AdvancedSettingsView, AutoPublishTriggersView } from './AdvancedSettingsView';
+import { HostSwitchModal } from './HostSwitchModal';
 import { MediaLibraryView } from './MediaLibraryView';
 import { PostsLibraryView } from './PostsLibraryView';
 import { EMPTY_POST_EXTRAS, PostExtrasDraft, extrasToFields } from './PostExtras';
@@ -93,6 +95,7 @@ import {
   Repeat2,
   Server,
   ShieldCheck,
+  Sliders,
   Sparkles,
   Sun,
   Pencil,
@@ -145,6 +148,13 @@ interface PublishSettingsState {
   githubBranch?: string;
   githubToken?: string;
   githubCustomDomain?: string;
+  deployMethod?: 'github' | 'remote';
+  lastDeployedTarget?: {
+    method: 'github' | 'remote';
+    siteUrl: string;
+    label: string;
+    publishedAt: string;
+  };
   lastPublishedAt?: string;
   lastPublishedCounts?: {
     albumCount: number;
@@ -292,6 +302,7 @@ const AUTO_PUBLISH_DELAYS: Array<{ seconds: 30 | 120 | 600 | 3600; label: string
 interface AutoPublishSettingsView {
   enabled: boolean;
   delaySeconds: 30 | 120 | 600 | 3600;
+  triggers?: AutoPublishTriggersView;
 }
 
 interface AutoPublishStatusView {
@@ -702,6 +713,12 @@ declare global {
         filesPublished: number;
         message: string;
       }>;
+      unpublishOldHost?: (method: 'github' | 'remote') => Promise<{
+        success: boolean;
+        method: 'github' | 'remote';
+        removedFiles: number;
+        message: string;
+      }>;
       getSetupStatus?: SetupApi['getSetupStatus'];
       githubLoginAvailable?: SetupApi['githubLoginAvailable'];
       githubLoginStart?: SetupApi['githubLoginStart'];
@@ -816,7 +833,8 @@ type StudioTab =
   | 'publish'
   | 'mcp'
   | 'help'
-  | 'data';
+  | 'data'
+  | 'advanced';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<StudioTab>('feed');
@@ -870,7 +888,7 @@ export const App: React.FC = () => {
         ? 'social'
         : activeTab === 'help'
           ? 'help'
-          : activeTab === 'data'
+          : activeTab === 'data' || activeTab === 'advanced'
             ? 'settings'
             : 'site';
     setOpenSidebarSections((prev) => (prev[section] ? prev : { ...prev, [section]: true }));
@@ -883,8 +901,7 @@ export const App: React.FC = () => {
     | 'hubs'
     | 'preflight'
     | 'local'
-    | 'sftp'
-    | 'github'
+    | 'deploy-site'
     | 'comments'
     | 'analytics'
     | 'adsense'
@@ -962,6 +979,7 @@ export const App: React.FC = () => {
   const [handle, setHandle] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [tagline, setTagline] = useState('');
+  const [nowText, setNowText] = useState('');
   const [bio, setBio] = useState('');
   const [location, setLocation] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
@@ -1046,6 +1064,9 @@ export const App: React.FC = () => {
   const [itemTags, setItemTags] = useState('');
   const [itemExtras, setItemExtras] = useState<PostExtrasDraft>(EMPTY_POST_EXTRAS);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
+  const [openComposeTrigger, setOpenComposeTrigger] = useState(0);
+  const [engageLocation, setEngageLocation] = useState('');
+  const [engageHubName, setEngageHubName] = useState('');
 
   // New Friend & Webring state
   const [friendSiteUrl, setFriendSiteUrl] = useState('');
@@ -1103,6 +1124,16 @@ export const App: React.FC = () => {
   } | null>(null);
   const [githubChecking, setGithubChecking] = useState(false);
   const [githubDeploying, setGithubDeploying] = useState(false);
+  const [pendingHostSwitch, setPendingHostSwitch] = useState<{
+    previousMethod: 'github' | 'remote';
+    previousLabel: string;
+    previousSiteUrl: string;
+    nextMethod: 'github' | 'remote';
+    nextLabel: string;
+    nextSiteUrl: string;
+  } | null>(null);
+  const [hostSwitchBusy, setHostSwitchBusy] = useState(false);
+  const [hostSwitchError, setHostSwitchError] = useState<string | null>(null);
 
   // Local Test Export & Live HTTP Server Preview state
   const [testExportResult, setTestExportResult] = useState<TestExportPreviewState | null>(null);
@@ -1442,6 +1473,7 @@ export const App: React.FC = () => {
     setHandle(p.handle);
     setDisplayName(p.displayName);
     setTagline(p.tagline);
+    setNowText(p.now?.text || '');
     setBio(p.bio);
     setLocation(p.location);
     setAvatarUrl(p.avatarUrl);
@@ -1667,29 +1699,56 @@ export const App: React.FC = () => {
       setRingHubUrl(action.targetUrl);
       setActiveTab('friends');
       notify(`Deep Link: Ready to join webring "${action.title || action.targetUrl}". Review it, then click Request to Join.`);
+    } else if (action.action === 'post') {
+      setItemType('post');
+      setItemExtras(EMPTY_POST_EXTRAS);
+      setItemTitle(action.title || '');
+      setItemTargetUrl('');
+      setItemAuthorUrl('');
+      setItemAuthorName('');
+      setItemMediaUrl(webImage);
+      setItemCategory('status');
+      setItemTags((action.tags || []).join(', '));
+      const wgTag = (action.tags || []).find((t) => /^wg-/i.test(t));
+      setEngageLocation(
+        action.postLocation || (wgTag ? `#${wgTag} (Group Feed)` : 'Your Social Site Feed')
+      );
+      setEngageHubName(action.hubName || '');
+      setOpenComposeTrigger((n) => n + 1);
+      setActiveTab('items');
+      const tagNote = action.tags && action.tags.length ? ` with tag #${action.tags.join(', #')}` : '';
+      notify(`Deep Link: Ready to compose a post${tagNote}.`);
     } else {
       const mappedType: SharedItemType =
         action.action === 'like'
           ? 'like'
           : action.action === 'comment'
           ? 'comment'
+          : action.action === 'recommendation'
+          ? 'recommendation'
           : 'share';
       setItemType(mappedType);
       setItemTargetUrl(action.targetUrl);
       setItemTitle(
         action.action === 'comment'
           ? `Re: ${action.title || 'Post'}`
-          : action.title || 'Shared via Webring'
+          : action.title || (action.targetUrl ? 'Shared via Webring' : '')
       );
       setItemAuthorUrl(action.authorUrl || '');
       setItemAuthorName(action.authorName || '');
       setItemMediaUrl(action.action === 'comment' ? '' : webImage);
       setItemCategory(action.action === 'comment' ? 'comment' : action.category || 'general');
+      setItemTags((action.tags || []).join(', '));
+      setEngageLocation(action.postLocation || '');
+      setEngageHubName(action.hubName || '');
+      setOpenComposeTrigger((n) => n + 1);
       setActiveTab('items');
       notify(
-        `webring:// Deep Link intercepted! Ready to ${action.action.toUpperCase()} "${
-          action.title || action.targetUrl
-        }"`
+        action.targetUrl
+          ? `webring:// Deep Link intercepted! Ready to ${action.action.toUpperCase()} "${
+              action.title || action.targetUrl
+            }"`
+          : `Deep Link: Ready to create a ${mappedType}${action.postLocation ? ` for ${action.postLocation}` : ''}.`
       );
     }
   };
@@ -1723,6 +1782,7 @@ export const App: React.FC = () => {
       displayName,
       tagline,
       bio,
+      now: nowText.trim() ? { text: nowText.trim().slice(0, 140), updatedAt: new Date().toISOString() } : null,
       location,
       avatarUrl,
       bannerUrl,
@@ -1952,7 +2012,7 @@ export const App: React.FC = () => {
     } else {
       if (!itemTitle.trim() || !itemTargetUrl.trim()) return;
     }
-    let postFields: ReturnType<typeof extrasToFields> = { event: null, listing: null };
+    let postFields: ReturnType<typeof extrasToFields> = { event: null, listing: null, vouch: null };
     if (itemType === 'post') {
       try {
         postFields = extrasToFields(itemExtras);
@@ -1968,7 +2028,7 @@ export const App: React.FC = () => {
 
     try {
       await window.studioApi.createItem({
-      ...(itemType === 'post' ? { event: postFields.event, listing: postFields.listing } : {}),
+      ...(itemType === 'post' ? { event: postFields.event, listing: postFields.listing, vouch: postFields.vouch } : {}),
       type: itemType,
       title: itemTitle.trim(),
       targetUrl: itemTargetUrl.trim(),
@@ -1987,7 +2047,7 @@ export const App: React.FC = () => {
       notify(err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err));
       return;
     }
-    const createdKind = itemType === 'post' && postFields.event ? 'Event' : itemType === 'post' && postFields.listing ? (postFields.listing.kind === 'ask' ? 'Ask' : 'Offer') : null;
+    const createdKind = itemType === 'post' && postFields.event ? 'Event' : itemType === 'post' && postFields.listing ? (postFields.listing.kind === 'ask' ? 'Ask' : 'Offer') : itemType === 'post' && postFields.vouch ? 'Vouch' : null;
     setItemExtras(EMPTY_POST_EXTRAS);
     setItemTitle('');
     setItemTargetUrl('');
@@ -2437,7 +2497,9 @@ export const App: React.FC = () => {
       | {
           sync?: Partial<ScheduleJob>;
           publish?: Partial<PersonaScheduleView['schedule']['publish']>;
-          autoPublish?: Partial<AutoPublishSettingsView>;
+          autoPublish?: Partial<Omit<AutoPublishSettingsView, 'triggers'>> & {
+            triggers?: Partial<AutoPublishTriggersView>;
+          };
         }
       | { app: Partial<ScheduleOverview['app']> }
   ) => {
@@ -2706,19 +2768,60 @@ export const App: React.FC = () => {
   } | null>(null);
   const [sftpKeyRefresh, setSftpKeyRefresh] = useState(0);
 
-  const handlePublishRemote = async (e?: React.FormEvent) => {
-    e?.preventDefault();
+  const activeDeployMethod: 'github' | 'remote' =
+    publishSettings.deployMethod === 'github' || publishSettings.deployMethod === 'remote'
+      ? publishSettings.deployMethod
+      : publishSettings.host?.trim() && !(publishSettings.githubOwner?.trim() || publishSettings.githubRepo?.trim())
+        ? 'remote'
+        : 'github';
+
+  const handleSelectDeployMethod = async (method: 'github' | 'remote') => {
+    const nextSettings: PublishSettingsState = { ...publishSettings, deployMethod: method };
+    setPublishSettings(nextSettings);
+    if (window.studioApi) {
+      await saveProfile({ publishSettings: nextSettings });
+      await handleSetSchedule({ publish: { destination: method } });
+    }
+    notify(
+      method === 'github'
+        ? 'Active Deploy Method set to Via GitHub Pages (Auto-Publish destination updated).'
+        : 'Active Deploy Method set to Via Web Host (Auto-Publish destination updated).'
+    );
+  };
+
+  const executePublishRemote = async (settingsToUse: PublishSettingsState) => {
     if (!window.studioApi) return;
-    await saveProfile({ publishSettings });
+    await saveProfile({ publishSettings: settingsToUse });
     const options = await confirmPublishWithHeldChanges();
     if (!options) return;
-    notify(`Saved settings & connecting to ${publishSettings.protocol.toUpperCase()} host ${publishSettings.host}...`);
-    const res = await window.studioApi.publishRemote(publishSettings, options);
+    notify(`Saved settings & connecting to ${settingsToUse.protocol.toUpperCase()} host ${settingsToUse.host}...`);
+    const res = await window.studioApi.publishRemote(settingsToUse, options);
     void refreshSecurityStatus();
     await refreshStudioData();
     setSftpKeyRefresh((n) => n + 1);
     if (res.hostKeyMismatch) setHostKeyMismatch(res.hostKeyMismatch);
     notify(res.message);
+  };
+
+  const handlePublishRemote = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!window.studioApi) return;
+    const nextSettings: PublishSettingsState = { ...publishSettings, deployMethod: 'remote' };
+    setPublishSettings(nextSettings);
+    const prev = publishSettings.lastDeployedTarget;
+    if (prev && prev.method !== 'remote') {
+      setHostSwitchError(null);
+      setPendingHostSwitch({
+        previousMethod: prev.method,
+        previousLabel: prev.label,
+        previousSiteUrl: prev.siteUrl,
+        nextMethod: 'remote',
+        nextLabel: `${nextSettings.protocol || 'sftp'}://${nextSettings.host}${nextSettings.remotePath || '/'}`,
+        nextSiteUrl: bundle?.profile.siteUrl || siteUrl || '',
+      });
+      return;
+    }
+    await executePublishRemote(nextSettings);
   };
 
   const handleSaveGithubSettings = async () => {
@@ -2764,21 +2867,67 @@ export const App: React.FC = () => {
     }
   };
 
-  const handlePublishGithub = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const executePublishGithub = async (settingsToUse: PublishSettingsState) => {
     if (!window.studioApi) return;
-    await saveProfile({ publishSettings });
+    await saveProfile({ publishSettings: settingsToUse });
     const options = await confirmPublishWithHeldChanges();
     if (!options) return;
-    notify(`Saved settings & deploying to github.com/${publishSettings.githubOwner}/${publishSettings.githubRepo}...`);
+    notify(`Saved settings & deploying to github.com/${settingsToUse.githubOwner}/${settingsToUse.githubRepo}...`);
     setGithubDeploying(true);
     try {
-      const res = await window.studioApi.publishGithub(publishSettings, options);
+      const res = await window.studioApi.publishGithub(settingsToUse, options);
       void refreshSecurityStatus();
       await refreshStudioData();
       notify(res.message);
     } finally {
       setGithubDeploying(false);
+    }
+  };
+
+  const handlePublishGithub = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!window.studioApi) return;
+    const nextSettings: PublishSettingsState = { ...publishSettings, deployMethod: 'github' };
+    setPublishSettings(nextSettings);
+    const prev = publishSettings.lastDeployedTarget;
+    if (prev && prev.method !== 'github') {
+      setHostSwitchError(null);
+      setPendingHostSwitch({
+        previousMethod: prev.method,
+        previousLabel: prev.label,
+        previousSiteUrl: prev.siteUrl,
+        nextMethod: 'github',
+        nextLabel: `${(nextSettings.githubOwner || '').trim()}/${(nextSettings.githubRepo || '').trim()} (${(nextSettings.githubBranch || 'gh-pages').trim()})`,
+        nextSiteUrl: bundle?.profile.siteUrl || siteUrl || '',
+      });
+      return;
+    }
+    await executePublishGithub(nextSettings);
+  };
+
+  const handleHostSwitchDecision = async (deleteOldFirst: boolean) => {
+    if (!pendingHostSwitch || !window.studioApi) return;
+    setHostSwitchBusy(true);
+    setHostSwitchError(null);
+    try {
+      if (deleteOldFirst && window.studioApi.unpublishOldHost) {
+        const clean = await window.studioApi.unpublishOldHost(pendingHostSwitch.previousMethod);
+        if (!clean.success) {
+          setHostSwitchError(clean.message);
+          return;
+        }
+        notify(clean.message);
+      }
+      const nextMethod = pendingHostSwitch.nextMethod;
+      const nextSettings: PublishSettingsState = { ...publishSettings, deployMethod: nextMethod };
+      setPendingHostSwitch(null);
+      if (nextMethod === 'github') {
+        await executePublishGithub(nextSettings);
+      } else {
+        await executePublishRemote(nextSettings);
+      }
+    } finally {
+      setHostSwitchBusy(false);
     }
   };
 
@@ -2982,6 +3131,11 @@ export const App: React.FC = () => {
       label: 'Data',
       icon: <Database className="w-4 h-4 shrink-0" />,
       alert: dbLimitLevel !== 'ok' ? 'Database size is approaching or over its configured limit' : undefined,
+    },
+    {
+      id: 'advanced',
+      label: 'Advanced',
+      icon: <Sliders className="w-4 h-4 shrink-0" />,
     },
   ];
   const settingsHasAlert = settingsNavItems.some((i) => Boolean(i.alert));
@@ -3500,6 +3654,20 @@ export const App: React.FC = () => {
                   />
                 </div>
 
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                    Now Status (optional, up to 140 characters)
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={140}
+                    value={nowText}
+                    onChange={(e) => setNowText(e.target.value)}
+                    placeholder="What are you working on, reading, or building right now?"
+                    className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <ProfileImagePicker
                     kind="avatar"
@@ -3710,6 +3878,16 @@ export const App: React.FC = () => {
             <PostsLibraryView
               items={bundle.items.items}
               endorsements={allEndorsements}
+              friends={bundle.connections.friends}
+              openComposeTrigger={openComposeTrigger}
+              engageLocation={engageLocation}
+              setEngageLocation={setEngageLocation}
+              engageHubName={engageHubName}
+              setEngageHubName={setEngageHubName}
+              joinedHubNames={webringHubs
+                .filter((h) => h.state === 'listed' || h.listMe)
+                .map((h) => (h.title || h.url).trim())
+                .filter(Boolean)}
               itemType={itemType}
               setItemType={setItemType}
               itemCategory={itemCategory}
@@ -5771,8 +5949,7 @@ export const App: React.FC = () => {
                   { id: 'hubs', label: 'Webring Hubs', badge: webringHubs.length },
                   { id: 'preflight', label: 'Preflight Setup' },
                   { id: 'local', label: 'Local Folder Export' },
-                  { id: 'sftp', label: 'SFTP / FTP Web Host' },
-                  { id: 'github', label: 'GitHub Pages Deploy' },
+                  { id: 'deploy-site', label: 'Deploy Site' },
                   { id: 'comments', label: 'Real-Time Comments' },
                   { id: 'analytics', label: 'Google Analytics' },
                   { id: 'adsense', label: 'Google AdSense' },
@@ -6007,6 +6184,13 @@ export const App: React.FC = () => {
                           </option>
                         ))}
                       </select>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('advanced')}
+                        className="text-indigo-300 hover:underline ml-2"
+                      >
+                        Choose which changes trigger auto-publish →
+                      </button>
                     </div>
                     {activeSchedule.autoPublishStatus?.lastResult && (
                       <p
@@ -6273,328 +6457,437 @@ export const App: React.FC = () => {
               </div>
               )}
 
-              {/* Option 2: Built-in SFTP / FTP Uploader */}
-              {publishSubTab === 'sftp' && (
-              <form
-                onSubmit={handlePublishRemote}
-                className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h3 className="font-bold text-lg flex items-center gap-2">
-                      <Server className="w-5 h-5 text-indigo-400" />
-                      2. Direct SFTP / FTP Web Host Uploader
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Connection settings are stored in this persona’s isolated SQLite database so
-                      each persona can publish to its own web host.
-                    </p>
-                  </div>
-                  {(publishSettings.host || publishSettings.username || publishSettings.password) && (
-                    <span className="text-[11px] px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-medium flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      Stored for Persona: {personas.find((p) => p.id === activePersonaId)?.label || 'Primary'}
+              {/* Deploy Site: mutually exclusive Via GitHub Pages (default) vs Via Web Host */}
+              {publishSubTab === 'deploy-site' && (
+                <div className="space-y-4">
+                  <div className="rounded-2xl bg-slate-900/70 border border-slate-800 px-4 py-3 text-xs text-slate-300 flex flex-wrap items-center justify-between gap-2">
+                    <span>
+                      Choose one active deployment method for this persona. Auto-Publish and scheduled
+                      publishes use the enabled method so you don&apos;t accidentally host duplicate copies
+                      with conflicting <code className="text-slate-100">did:web</code> identities.
                     </span>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Protocol</label>
-                    <select
-                      value={publishSettings.protocol}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({
-                          ...prev,
-                          protocol: e.target.value as 'sftp' | 'ftp',
-                          port: e.target.value === 'sftp' ? 22 : 21,
-                        }))
-                      }
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    >
-                      <option value="sftp">SFTP (SSH File Transfer)</option>
-                      <option value="ftp">FTP (Standard)</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Host / Server Address</label>
-                    <input
-                      type="text"
-                      required
-                      value={publishSettings.host}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, host: e.target.value }))
-                      }
-                      placeholder="sftp.myhost.example.com"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Port</label>
-                    <input
-                      type="number"
-                      value={publishSettings.port}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, port: Number(e.target.value) }))
-                      }
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Username</label>
-                    <input
-                      type="text"
-                      required
-                      value={publishSettings.username}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, username: e.target.value }))
-                      }
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                    />
-                  </div>
-                  {(publishSettings.protocol === 'ftp' || authMethodOf(publishSettings) === 'password') && (
-                    <div>
-                      <label className="block text-xs text-slate-400 mb-1">Password</label>
-                      <input
-                        type="password"
-                        value={publishSettings.password || ''}
-                        onChange={(e) =>
-                          setPublishSettings((prev) => ({ ...prev, password: e.target.value }))
-                        }
-                        className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
-                      />
-                    </div>
-                  )}
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Remote Web Root Path</label>
-                    <input
-                      type="text"
-                      required
-                      value={publishSettings.remotePath}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, remotePath: e.target.value }))
-                      }
-                      placeholder="/var/www/html"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                    />
-                  </div>
-                </div>
-
-                <SftpSecurityControls
-                  settings={publishSettings}
-                  onChange={(changes) => setPublishSettings((prev) => ({ ...prev, ...changes }))}
-                  api={window.studioApi}
-                  askConfirm={askConfirm}
-                  notify={notify}
-                  refreshKey={sftpKeyRefresh}
-                />
-
-                <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <button
-                      type="button"
-                      onClick={handleSaveRemoteSettings}
-                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition"
-                    >
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      Save SFTP / FTP Settings
-                    </button>
-                    <button
-                      type="submit"
-                      className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow flex items-center gap-2 transition"
-                    >
-                      <UploadCloud className="w-4 h-4" />
-                      Save & Upload to Remote Host
-                    </button>
-                  </div>
-
-                  {(publishSettings.host ||
-                    publishSettings.username ||
-                    publishSettings.password ||
-                    (publishSettings.remotePath &&
-                      publishSettings.remotePath !== '/var/www/html')) && (
-                    <button
-                      type="button"
-                      onClick={handleClearRemoteSettings}
-                      className="px-3.5 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 font-semibold text-xs flex items-center gap-1.5 transition"
-                      title="Delete the stored SFTP/FTP server credentials from this persona's SQLite database"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      Delete Stored SFTP / FTP Info
-                    </button>
-                  )}
-                </div>
-              </form>
-              )}
-
-              {/* Option 3: GitHub Pages Deploy */}
-              {publishSubTab === 'github' && (
-              <form
-                onSubmit={handlePublishGithub}
-                className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h3 className="font-bold text-lg flex items-center gap-2">
-                      <Globe className="w-5 h-5 text-slate-200" />
-                      3. GitHub Pages Deploy
-                    </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      Pushes the generated site straight to a repo branch via the GitHub API and
-                      enables Pages for it. Stored in this persona's SQLite database, same as the
-                      SFTP/FTP credentials above.
-                    </p>
-                    <p className="text-xs text-slate-300 mt-1.5">
-                      {GITHUB_TOKEN_GUIDANCE}{' '}
-                      <button
-                        type="button"
-                        onClick={() => window.studioApi?.openExternal(GITHUB_NEW_TOKEN_URL)}
-                        className="text-indigo-300 hover:text-indigo-200 font-semibold underline"
-                      >
-                        Create token on GitHub
-                      </button>
-                    </p>
-                  </div>
-                  {(publishSettings.githubOwner || publishSettings.githubRepo) && (
-                    <span className="text-[11px] px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-medium flex items-center gap-1.5">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      Stored for Persona: {personas.find((p) => p.id === activePersonaId)?.label || 'Primary'}
+                    <span className="px-2.5 py-1 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-200 font-semibold shrink-0">
+                      Active: {activeDeployMethod === 'github' ? 'Via GitHub Pages' : 'Via Web Host'}
                     </span>
-                  )}
-                </div>
+                  </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Repo Owner (user or org)</label>
-                    <input
-                      type="text"
-                      required
-                      value={publishSettings.githubOwner || ''}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, githubOwner: e.target.value }))
-                      }
-                      placeholder="octocat"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Repository Name</label>
-                    <input
-                      type="text"
-                      required
-                      value={publishSettings.githubRepo || ''}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, githubRepo: e.target.value }))
-                      }
-                      placeholder="octocat.github.io"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">Branch</label>
-                    <input
-                      type="text"
-                      value={publishSettings.githubBranch || 'gh-pages'}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, githubBranch: e.target.value }))
-                      }
-                      placeholder="gh-pages"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                    />
-                  </div>
-                </div>
+                  {publishSettings.lastDeployedTarget &&
+                    publishSettings.lastDeployedTarget.method !== activeDeployMethod && (
+                      <div className="rounded-xl bg-amber-500/10 border border-amber-500/35 px-4 py-3 text-xs text-amber-200 flex items-start gap-2.5">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="font-semibold">
+                            Switched from{' '}
+                            {publishSettings.lastDeployedTarget.method === 'github'
+                              ? 'Via GitHub Pages'
+                              : 'Via Web Host'}{' '}
+                            to {activeDeployMethod === 'github' ? 'Via GitHub Pages' : 'Via Web Host'}
+                          </p>
+                          <p className="text-amber-100/85 mt-0.5">
+                            Background auto-publish is held until you complete your first manual deploy
+                            below, where you&apos;ll be given the option to remove your old site (
+                            <code className="text-amber-100">{publishSettings.lastDeployedTarget.label}</code>
+                            ).
+                          </p>
+                        </div>
+                      </div>
+                    )}
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">
-                      Personal Access Token
-                    </label>
-                    <input
-                      type="password"
-                      required
-                      value={publishSettings.githubToken || ''}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, githubToken: e.target.value }))
-                      }
-                      placeholder="ghp_..."
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-slate-400 mb-1">
-                      Custom Domain (optional — writes <code>CNAME</code>)
-                    </label>
-                    <input
-                      type="text"
-                      value={publishSettings.githubCustomDomain || ''}
-                      onChange={(e) =>
-                        setPublishSettings((prev) => ({ ...prev, githubCustomDomain: e.target.value }))
-                      }
-                      placeholder="yourdomain.com"
-                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
-                    />
-                  </div>
-                </div>
-
-                {githubCheckResult && (
-                  <div
-                    className={`p-3 rounded-xl text-xs border ${
-                      githubCheckResult.success
-                        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
-                        : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                  {/* Panel 1: Via GitHub Pages (Default) */}
+                  <form
+                    onSubmit={handlePublishGithub}
+                    className={`bg-slate-900 rounded-2xl p-6 space-y-4 transition border ${
+                      activeDeployMethod === 'github'
+                        ? 'border-indigo-500/60 ring-1 ring-indigo-500/30'
+                        : 'border-slate-800 opacity-70'
                     }`}
                   >
-                    {githubCheckResult.message}
-                  </div>
-                )}
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <h3 className="font-bold text-lg flex items-center gap-2">
+                          <Globe className="w-5 h-5 text-slate-200" />
+                          Via GitHub Pages
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          Pushes the generated site straight to a repo branch via the GitHub API and
+                          enables Pages for it. Stored in this persona&apos;s isolated SQLite database.
+                        </p>
+                        <p className="text-xs text-slate-300 mt-1.5">
+                          {GITHUB_TOKEN_GUIDANCE}{' '}
+                          <button
+                            type="button"
+                            onClick={() => window.studioApi?.openExternal(GITHUB_NEW_TOKEN_URL)}
+                            className="text-indigo-300 hover:text-indigo-200 font-semibold underline"
+                          >
+                            Create token on GitHub
+                          </button>
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {(publishSettings.githubOwner || publishSettings.githubRepo) && (
+                          <span className="text-[11px] px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-medium flex items-center gap-1.5">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Configured
+                          </span>
+                        )}
+                        <label
+                          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-semibold cursor-pointer select-none transition ${
+                            activeDeployMethod === 'github'
+                              ? 'bg-indigo-600/20 border-indigo-400 text-indigo-200'
+                              : 'bg-slate-950 border-slate-700 text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="deploy-site-method"
+                            checked={activeDeployMethod === 'github'}
+                            onChange={() => void handleSelectDeployMethod('github')}
+                            className="accent-indigo-500"
+                          />
+                          Enable
+                        </label>
+                      </div>
+                    </div>
 
-                <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <button
-                      type="button"
-                      onClick={handleCheckGithubRepo}
-                      disabled={githubChecking}
-                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition disabled:opacity-50"
-                    >
-                      <RefreshCw className={`w-4 h-4 text-indigo-400 ${githubChecking ? 'animate-spin' : ''}`} />
-                      {githubChecking ? 'Checking...' : 'Check Repo Access'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleSaveGithubSettings}
-                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition"
-                    >
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      Save GitHub Settings
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={githubDeploying}
-                      className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow flex items-center gap-2 transition disabled:opacity-50"
-                    >
-                      <UploadCloud className={`w-4 h-4 ${githubDeploying ? 'animate-pulse' : ''}`} />
-                      {githubDeploying ? 'Deploying...' : 'Save & Deploy to GitHub Pages'}
-                    </button>
-                  </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Repo Owner (user or org)</label>
+                        <input
+                          type="text"
+                          required
+                          value={publishSettings.githubOwner || ''}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, githubOwner: e.target.value }))
+                          }
+                          placeholder="octocat"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Repository Name</label>
+                        <input
+                          type="text"
+                          required
+                          value={publishSettings.githubRepo || ''}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, githubRepo: e.target.value }))
+                          }
+                          placeholder="octocat.github.io"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Branch</label>
+                        <input
+                          type="text"
+                          value={publishSettings.githubBranch || 'gh-pages'}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, githubBranch: e.target.value }))
+                          }
+                          placeholder="gh-pages"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                        />
+                      </div>
+                    </div>
 
-                  {(publishSettings.githubOwner ||
-                    publishSettings.githubRepo ||
-                    publishSettings.githubToken) && (
-                    <button
-                      type="button"
-                      onClick={handleClearGithubSettings}
-                      className="px-3.5 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 font-semibold text-xs flex items-center gap-1.5 transition"
-                      title="Delete the stored GitHub owner, repo, branch, token, and custom domain from this persona's SQLite database"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      Delete Stored GitHub Info
-                    </button>
-                  )}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Personal Access Token
+                        </label>
+                        <input
+                          type="password"
+                          required
+                          value={publishSettings.githubToken || ''}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, githubToken: e.target.value }))
+                          }
+                          placeholder="ghp_..."
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Custom Domain (optional — writes <code>CNAME</code>)
+                        </label>
+                        <input
+                          type="text"
+                          value={publishSettings.githubCustomDomain || ''}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, githubCustomDomain: e.target.value }))
+                          }
+                          placeholder="yourdomain.com"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    {githubCheckResult && (
+                      <div
+                        className={`p-3 rounded-xl text-xs border ${
+                          githubCheckResult.success
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                            : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                        }`}
+                      >
+                        {githubCheckResult.message}
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={handleCheckGithubRepo}
+                          disabled={githubChecking}
+                          className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition disabled:opacity-50"
+                        >
+                          <RefreshCw className={`w-4 h-4 text-indigo-400 ${githubChecking ? 'animate-spin' : ''}`} />
+                          {githubChecking ? 'Checking...' : 'Check Repo Access'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleSaveGithubSettings}
+                          className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition"
+                        >
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          Save GitHub Settings
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={githubDeploying || activeDeployMethod !== 'github'}
+                          title={
+                            activeDeployMethod !== 'github'
+                              ? 'Select Enable on Via GitHub Pages above to deploy here'
+                              : undefined
+                          }
+                          className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow flex items-center gap-2 transition disabled:opacity-50"
+                        >
+                          <UploadCloud className={`w-4 h-4 ${githubDeploying ? 'animate-pulse' : ''}`} />
+                          {githubDeploying ? 'Deploying...' : 'Save & Deploy to GitHub Pages'}
+                        </button>
+                      </div>
+
+                      {(publishSettings.githubOwner ||
+                        publishSettings.githubRepo ||
+                        publishSettings.githubToken) && (
+                        <button
+                          type="button"
+                          onClick={handleClearGithubSettings}
+                          className="px-3.5 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 font-semibold text-xs flex items-center gap-1.5 transition"
+                          title="Delete the stored GitHub owner, repo, branch, token, and custom domain from this persona's SQLite database"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          Delete Stored GitHub Info
+                        </button>
+                      )}
+                    </div>
+                  </form>
+
+                  {/* Panel 2: Via Web Host (SFTP / FTP) */}
+                  <form
+                    onSubmit={handlePublishRemote}
+                    className={`bg-slate-900 rounded-2xl p-6 space-y-4 transition border ${
+                      activeDeployMethod === 'remote'
+                        ? 'border-indigo-500/60 ring-1 ring-indigo-500/30'
+                        : 'border-slate-800 opacity-70'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <h3 className="font-bold text-lg flex items-center gap-2">
+                          <Server className="w-5 h-5 text-indigo-400" />
+                          Via Web Host
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          Direct SFTP / FTP uploader. Connection settings are stored in this persona&apos;s
+                          isolated SQLite database so each persona can publish to its own web host.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {(publishSettings.host || publishSettings.username || publishSettings.password) && (
+                          <span className="text-[11px] px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-medium flex items-center gap-1.5">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Configured
+                          </span>
+                        )}
+                        <label
+                          className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-semibold cursor-pointer select-none transition ${
+                            activeDeployMethod === 'remote'
+                              ? 'bg-indigo-600/20 border-indigo-400 text-indigo-200'
+                              : 'bg-slate-950 border-slate-700 text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="deploy-site-method"
+                            checked={activeDeployMethod === 'remote'}
+                            onChange={() => void handleSelectDeployMethod('remote')}
+                            className="accent-indigo-500"
+                          />
+                          Enable
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Protocol</label>
+                        <select
+                          value={publishSettings.protocol}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({
+                              ...prev,
+                              protocol: e.target.value as 'sftp' | 'ftp',
+                              port: e.target.value === 'sftp' ? 22 : 21,
+                            }))
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        >
+                          <option value="sftp">SFTP (SSH File Transfer)</option>
+                          <option value="ftp">FTP (Standard)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Host / Server Address</label>
+                        <input
+                          type="text"
+                          required
+                          value={publishSettings.host}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, host: e.target.value }))
+                          }
+                          placeholder="sftp.myhost.example.com"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Port</label>
+                        <input
+                          type="number"
+                          value={publishSettings.port}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, port: Number(e.target.value) }))
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Username</label>
+                        <input
+                          type="text"
+                          required
+                          value={publishSettings.username}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, username: e.target.value }))
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                        />
+                      </div>
+                      {(publishSettings.protocol === 'ftp' || authMethodOf(publishSettings) === 'password') && (
+                        <div>
+                          <label className="block text-xs text-slate-400 mb-1">Password</label>
+                          <input
+                            type="password"
+                            value={publishSettings.password || ''}
+                            onChange={(e) =>
+                              setPublishSettings((prev) => ({ ...prev, password: e.target.value }))
+                            }
+                            className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm"
+                          />
+                        </div>
+                      )}
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Remote Web Root Path</label>
+                        <input
+                          type="text"
+                          required
+                          value={publishSettings.remotePath}
+                          onChange={(e) =>
+                            setPublishSettings((prev) => ({ ...prev, remotePath: e.target.value }))
+                          }
+                          placeholder="/var/www/html"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    <SftpSecurityControls
+                      settings={publishSettings}
+                      onChange={(changes) => setPublishSettings((prev) => ({ ...prev, ...changes }))}
+                      api={window.studioApi}
+                      askConfirm={askConfirm}
+                      notify={notify}
+                      refreshKey={sftpKeyRefresh}
+                    />
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={handleSaveRemoteSettings}
+                          className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs flex items-center gap-1.5 transition"
+                        >
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          Save SFTP / FTP Settings
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={activeDeployMethod !== 'remote'}
+                          title={
+                            activeDeployMethod !== 'remote'
+                              ? 'Select Enable on Via Web Host above to upload here'
+                              : undefined
+                          }
+                          className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow flex items-center gap-2 transition disabled:opacity-50"
+                        >
+                          <UploadCloud className="w-4 h-4" />
+                          Save &amp; Upload to Remote Host
+                        </button>
+                      </div>
+
+                      {(publishSettings.host ||
+                        publishSettings.username ||
+                        publishSettings.password ||
+                        (publishSettings.remotePath &&
+                          publishSettings.remotePath !== '/var/www/html')) && (
+                        <button
+                          type="button"
+                          onClick={handleClearRemoteSettings}
+                          className="px-3.5 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-rose-300 font-semibold text-xs flex items-center gap-1.5 transition"
+                          title="Delete the stored SFTP/FTP server credentials from this persona's SQLite database"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          Delete Stored SFTP / FTP Info
+                        </button>
+                      )}
+                    </div>
+                  </form>
                 </div>
-              </form>
+              )}
+
+              {pendingHostSwitch && (
+                <HostSwitchModal
+                  previousMethod={pendingHostSwitch.previousMethod}
+                  previousLabel={pendingHostSwitch.previousLabel}
+                  previousSiteUrl={pendingHostSwitch.previousSiteUrl}
+                  nextMethod={pendingHostSwitch.nextMethod}
+                  nextLabel={pendingHostSwitch.nextLabel}
+                  nextSiteUrl={pendingHostSwitch.nextSiteUrl}
+                  busy={hostSwitchBusy}
+                  errorMessage={hostSwitchError}
+                  onDeleteAndPublish={() => void handleHostSwitchDecision(true)}
+                  onKeepAndPublish={() => void handleHostSwitchDecision(false)}
+                  onCancel={() => {
+                    if (!hostSwitchBusy) {
+                      setPendingHostSwitch(null);
+                      setHostSwitchError(null);
+                    }
+                  }}
+                />
               )}
 
               {/* Option 4: Real-Time Static Site Comments (Optional Third-Party Provider) */}
@@ -7592,6 +7885,25 @@ export const App: React.FC = () => {
               activePersonaId={activePersonaId}
               onDatabaseRestored={refreshStudioData}
               onLimitStatusChange={setDbLimitLevel}
+            />
+          )}
+
+          {/* TAB 12: SETTINGS -> ADVANCED */}
+          {activeTab === 'advanced' && activeSchedule && (
+            <AdvancedSettingsView
+              personaLabel={activeSchedule.label || bundle?.profile.displayName || 'Current Persona'}
+              destination={activeSchedule.schedule.publish.destination}
+              autoPublish={activeSchedule.schedule.autoPublish}
+              autoPublishStatus={activeSchedule.autoPublishStatus}
+              paused={Boolean(scheduleOverview?.app.paused)}
+              onUpdateAutoPublish={(patch) => handleSetSchedule({ autoPublish: patch })}
+              onUpdateDestination={(destination) => handleSetSchedule({ publish: { destination } })}
+              onPublishNow={() => void handleAutoPublishNow()}
+              onCancelPending={() => void handleAutoPublishCancel()}
+              onOpenPublishSettings={() => {
+                setPublishSubTab('deploy-site');
+                setActiveTab('publish');
+              }}
             />
           )}
 

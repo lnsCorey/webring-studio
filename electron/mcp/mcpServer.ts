@@ -36,6 +36,7 @@ import {
   SharedItemType,
   ItemEvent,
   ItemListing,
+  ItemVouch,
   ProfileThemeSchema,
 } from '../../src/shared/schema';
 
@@ -193,6 +194,7 @@ export const MCP_TOOL_TIERS: Record<string, McpToolTier> = {
   webring_switch_persona: 'outward',
   // Can change the site address (and so the DID), comments, analytics and ad ids
   webring_update_profile: 'outward',
+  webring_set_now: 'outward',
   // Add third-party scripts to the published site
   webring_configure_analytics_addon: 'outward',
   webring_configure_ads_addon: 'outward',
@@ -602,6 +604,22 @@ export class WebringMcpServer {
         },
       },
       {
+        name: 'webring_set_now',
+        description:
+          'Set or clear your short "Now" status (up to 140 characters) on your profile. Shown on your site and on Webring Hubs that display a Now wall. Pass empty string or null to clear.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            personaId: personaIdProp,
+            text: {
+              type: ['string', 'null'],
+              description: 'What you are up to right now (up to 140 characters), or "" / null to clear.',
+            },
+          },
+          required: ['text'],
+        },
+      },
+      {
         name: 'webring_update_profile',
         description:
           'Update profile metadata (displayName, siteUrl, tagline, bio, theme, interests, customLinks, atprotoHandle), Site Design (appearance, layout) and/or Social Graph Privacy Shield & Comment settings.',
@@ -728,6 +746,19 @@ export class WebringMcpServer {
               },
               required: ['kind'],
             },
+            vouch: {
+              type: 'object',
+              description:
+                'Makes the post a signed vouch for another member. kind is "met", "skill" (requires skill, up to 60 chars) or "worked-with".',
+              properties: {
+                subjectDid: { type: 'string', description: 'The subject member\'s did:web: identifier.' },
+                subjectSiteUrl: { type: 'string', description: 'The subject member\'s http(s) site URL.' },
+                subjectName: { type: 'string', description: 'Optional display name for the subject.' },
+                kind: { type: 'string', enum: ['met', 'skill', 'worked-with'] },
+                skill: { type: 'string', description: 'Required when kind is "skill" (up to 60 characters).' },
+              },
+              required: ['subjectDid', 'subjectSiteUrl', 'kind'],
+            },
           },
           required: ['commentary'],
         },
@@ -807,6 +838,10 @@ export class WebringMcpServer {
             listing: {
               type: ['object', 'null'],
               description: 'Wall posts only: { kind: "ask" | "offer", status: "open" | "closed" }, or null to remove. Use status "closed" when an ask or offer is sorted.',
+            },
+            vouch: {
+              type: ['object', 'null'],
+              description: 'Wall posts only: { subjectDid, subjectSiteUrl, kind: "met"|"skill"|"worked-with", skill? }, or null to remove.',
             },
           },
           required: ['itemId'],
@@ -1795,6 +1830,15 @@ export class WebringMcpServer {
           break;
         }
 
+        case 'webring_set_now': {
+          const ctx = this.resolveContext(args);
+          const raw = args.text === null || args.text === undefined ? null : String(args.text);
+          const updated = ctx.db.setNow(raw);
+          resultData = { now: updated.now ?? null };
+          summary = updated.now ? `Updated Now status: "${updated.now.text}"` : 'Cleared Now status.';
+          break;
+        }
+
         case 'webring_update_profile': {
           const ctx = this.resolveContext(args);
           const current = ctx.db.getProfile();
@@ -1904,12 +1948,15 @@ export class WebringMcpServer {
             tags: Array.isArray(args.tags) ? args.tags.map(String) : ['wall', 'webring'],
             event: args.event && typeof args.event === 'object' ? (args.event as ItemEvent) : undefined,
             listing: args.listing && typeof args.listing === 'object' ? (args.listing as ItemListing) : undefined,
+            vouch: args.vouch && typeof args.vouch === 'object' ? (args.vouch as ItemVouch) : undefined,
           });
           resultData = created;
           summary = created.event
             ? `Published event "${created.title}"`
             : created.listing
             ? `Published ${created.listing.kind} "${created.title}"`
+            : created.vouch
+            ? `Published vouch "${created.title}"`
             : `Published Wall Post "${created.title}"`;
           break;
         }
@@ -1953,6 +2000,7 @@ export class WebringMcpServer {
             tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
             event: args.event === null ? null : args.event && typeof args.event === 'object' ? (args.event as ItemEvent) : undefined,
             listing: args.listing === null ? null : args.listing && typeof args.listing === 'object' ? (args.listing as ItemListing) : undefined,
+            vouch: args.vouch === null ? null : args.vouch && typeof args.vouch === 'object' ? (args.vouch as ItemVouch) : undefined,
           });
           cleanUpLibrary(ctx.db, ctx.mediaLibrary);
           resultData = updated;

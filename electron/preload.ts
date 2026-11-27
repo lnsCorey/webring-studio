@@ -145,6 +145,8 @@ contextBridge.exposeInMainWorld('studioApi', {
     ipcRenderer.invoke('studio:publish-remote', settings, options),
   publishGithub: (settings: unknown, options?: { includeAgentChanges?: boolean }) =>
     ipcRenderer.invoke('studio:publish-github', settings, options),
+  unpublishOldHost: (method: 'github' | 'remote') =>
+    ipcRenderer.invoke('studio:unpublish-old-host', method),
   checkGithubRepo: (settings: unknown) => ipcRenderer.invoke('studio:check-github-repo', settings),
   getSetupStatus: (options?: { checkGitHub?: boolean }) => ipcRenderer.invoke('studio:setup-status', options),
   githubLoginAvailable: () => ipcRenderer.invoke('studio:github-login-available'),

@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { ImagePlus, Trash2 } from 'lucide-react';
-import { SharedItem } from '../shared/schema';
+import { FriendConnection, ItemEvent, ItemListing, ItemVouch, SharedItem } from '../shared/schema';
 import { MarkdownField } from './MarkdownField';
-import { ItemEvent, ItemListing } from '../shared/schema';
 import { PostExtrasDraft, PostExtrasFields, extrasFromItem, extrasToFields } from './PostExtras';
 
 /** The fields of a post or shared item that can be edited after publishing. */
@@ -20,6 +19,8 @@ export interface ItemEdit {
   event?: ItemEvent | null;
   /** Posts only: ask/offer details, or null for none. */
   listing?: ItemListing | null;
+  /** Posts only: vouch details, or null for none. */
+  vouch?: ItemVouch | null;
 }
 
 const fieldClass = 'w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm focus:border-indigo-500 focus:outline-none';
@@ -31,6 +32,7 @@ const labelClass = 'block text-[11px] text-slate-400 mb-1';
  */
 export function ItemEditor(props: {
   item: SharedItem;
+  friends?: FriendConnection[];
   mediaSrc: (url: string) => string;
   onPickImage: () => Promise<string | null>;
   onSave: (edit: ItemEdit) => Promise<void>;
@@ -59,7 +61,7 @@ export function ItemEditor(props: {
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isPost && !draft.commentary.trim() && !draft.title.trim()) return;
-    let postFields: { event: ItemEvent | null; listing: ItemListing | null } | null = null;
+    let postFields: { event: ItemEvent | null; listing: ItemListing | null; vouch: ItemVouch | null } | null = null;
     if (isPost) {
       try {
         postFields = extrasToFields(extras);
@@ -96,7 +98,7 @@ export function ItemEditor(props: {
 
   return (
     <form onSubmit={save} className="space-y-3">
-      {isPost && <PostExtrasFields draft={extras} onChange={setExtras} fieldClass={fieldClass} labelClass={labelClass} />}
+      {isPost && <PostExtrasFields draft={extras} onChange={setExtras} friends={props.friends} fieldClass={fieldClass} labelClass={labelClass} />}
       {error && <p role="alert" className="text-xs text-rose-300">{error}</p>}
       <div>
         <label className={labelClass}>Title</label>
@@ -110,16 +112,7 @@ export function ItemEditor(props: {
       </div>
       <div>
         <label className={labelClass}>{isPost ? 'Post' : isComment ? 'Your comment' : 'Your notes'}</label>
-        {isPost ? (
-          <MarkdownField value={draft.commentary} onChange={(commentary) => set({ commentary })} rows={6} />
-        ) : (
-          <textarea
-            rows={3}
-            value={draft.commentary}
-            onChange={(e) => set({ commentary: e.target.value })}
-            className={fieldClass}
-          />
-        )}
+        <MarkdownField value={draft.commentary} onChange={(commentary) => set({ commentary })} rows={isPost ? 6 : 4} />
       </div>
       {!isPost && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
